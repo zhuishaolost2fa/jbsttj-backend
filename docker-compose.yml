@@ -1,0 +1,50 @@
+# 本地开发用：RabbitMQ（Celery broker）+ Redis（result backend / 去重指纹集合）
+# 前提：本机已装 Docker Desktop（Windows 走 WSL2 后端）。
+#
+# 启动：   docker compose up -d
+# 查看：   docker compose ps
+# 日志：   docker compose logs -f rabbitmq
+# 停止：   docker compose down          # 加 -v 可清空数据卷（含已入队的任务与去重集合）
+#
+# 默认账号（与 .env 的 CELERY_BROKER_URL 对应）：
+#   RabbitMQ  AMQP 127.0.0.1:5672   管理后台 http://localhost:15672  (dm / dm123456)
+#   Redis     127.0.0.1:6379        db0=result backend, db1=去重集合
+#
+# 如果你用原生安装（非 Docker）的 RabbitMQ，把 .env 的 broker 改回
+#   CELERY_BROKER_URL=amqp://guest:guest@127.0.0.1:5672//
+# 原生安装时 guest 仅允许本机连接，恰好满足需求。
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: jbs-rabbitmq
+    ports:
+      - "5672:5672" # AMQP —— Celery broker
+      - "15672:15672" # 管理后台
+    environment:
+      RABBITMQ_DEFAULT_USER: dm
+      RABBITMQ_DEFAULT_PASS: dm123456
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  redis:
+    image: redis:7-alpine
+    container_name: jbs-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - redis_data:/data
+
+volumes:
+  rabbitmq_data:
+  redis_data:

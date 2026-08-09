@@ -1,0 +1,32 @@
+# ---- Web 框架 ----
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# ---- 配置与校验 ----
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+email-validator>=2.2.0
+
+# ---- 鉴权 (Supabase JWT: HS256 legacy secret / ES256-RS256 JWKS) ----
+PyJWT[crypto]>=2.9.0
+
+# ---- 阿里云 OSS (V2 SDK，自带 V4 签名) ----
+alibabacloud-oss-v2>=1.0.0
+# ---- 阿里云 STS (AssumeRole 临时凭证接入，OSS_USE_STS=true 时必装) ----
+alibabacloud-sts20150401>=1.0.0
+
+# ---- HTTP 客户端 (Supabase PostgREST / GoTrue / JWKS) ----
+httpx>=0.27.0
+
+# ---- DM 主持人手册 RAG 流水线 ----
+# 异步任务框架：四阶段流水线跑在 Celery worker 上（broker=RabbitMQ / backend=Redis）
+celery>=5.5.0
+# 去重指纹（SimHash）的跨 shard / 跨 worker 全局集合放在 Redis（与 celery result backend 同源）
+redis>=5.0.0
+# PDF 结构化提取（标题/正文/页眉页脚识别），1.24.3 起官方包名为 pymupdf
+pymupdf>=1.24.3
+# 粗分块用 RecursiveCharacterTextSplitter（不引入 langchain-experimental，避免依赖冲突）
+langchain-text-splitters>=1.0.0
+# 阿里云 OCR（文字识别）：处理扫描件 / 图片型 PDF，复用 OSS 的 AccessKey
+alibabacloud-ocr-api20210707>=3.1.2

@@ -1,0 +1,15 @@
+# 本地密钥 / 虚拟环境 / 缓存 —— 绝不进镜像
+.env
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+
+# 版本控制 / 平台相关多余物
+.git
+node_modules
+docker-compose.yml
+.workbuddy
+
+# 临时探查脚本（如仍有残留）
+_t_*.py

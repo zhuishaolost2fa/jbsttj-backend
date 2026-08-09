@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>分片上传 · 演示</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e3e6ea; --text: #1f2328;
+    --muted: #6b7280; --accent: #2563eb; --ok: #15803d; --err: #b91c1c; --warn: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+         font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=text], input[type=password], input[type=email] {
+    flex: 1; min-width: 180px; padding: 8px 10px; border: 1px solid var(--border);
+    border-radius: 6px; font-size: 13px; background: #fff; color: var(--text); }
+  button { padding: 8px 14px; border: 1px solid var(--border); border-radius: 6px;
+           background: #fff; color: var(--text); font-size: 13px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #c3c8ce; background: #fafbfc; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .drop { border: 2px dashed var(--border); border-radius: 10px; padding: 32px;
+          text-align: center; color: var(--muted); cursor: pointer; transition: .15s; }
+  .drop.over { border-color: var(--accent); background: #eff6ff; color: var(--accent); }
+  .item { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+  .item-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .name { font-weight: 500; word-break: break-all; }
+  .bar { height: 6px; background: #eef0f3; border-radius: 3px; overflow: hidden; margin: 8px 0 6px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .item.done .bar > i { background: var(--ok); }
+  .item.error .bar > i { background: var(--err); }
+  .st { font-size: 12px; color: var(--muted); }
+  .st.ok { color: var(--ok); } .st.err { color: var(--err); } .st.warn { color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+         background: #eef2ff; color: #3730a3; }
+  .hide { display: none; }
+  code { background: #f1f3f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="panel">
+    <h1>OSS 分片上传演示</h1>
+    <p class="muted" style="margin:6px 0 14px">
+      浏览器切片后凭预签名地址直传 OSS，文件数据不经过应用服务器。
+    </p>
+    <div class="row">
+      <input type="text" id="apiBase" placeholder="服务地址，留空表示同源">
+      <button id="btnToggleLogin">登录 / 切换账号</button>
+      <span id="authState" class="muted">未登录</span>
+    </div>
+    <div id="loginBox" class="row hide" style="margin-top:10px">
+      <input type="email" id="email" placeholder="邮箱">
+      <input type="password" id="password" placeholder="密码">
+      <button class="primary" id="btnLogin">登录</button>
+      <button id="btnRegister">注册</button>
+      <input type="text" id="tokenInput" placeholder="或直接粘贴 access_token">
+      <button id="btnUseToken">使用此 token</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>上传</h2>
+    <div class="row" style="margin-bottom:12px">
+      <label class="muted">并发数
+        <input type="text" id="concurrency" value="4" style="width:52px;min-width:52px;margin-left:6px">
+      </label>
+      <label class="muted" style="margin-left:12px">
+        <input type="checkbox" id="proxyMode"> 走服务端中转（OSS 未开 CORS 时使用）
+      </label>
+      <label class="muted" style="margin-left:12px" title="勾选后对象写入 temp/ 前缀，可被 OSS 生命周期规则自动过期清理">
+        <input type="checkbox" id="tempMode"> 临时文件（自动过期清理）
+      </label>
+    </div>
+    <div class="drop" id="drop">
+      点击选择文件，或把文件拖到这里<br>
+      <span class="muted">支持多选 · 大文件自动分片 · 断网后重选同一文件可续传</span>
+    </div>
+    <input type="file" id="picker" multiple class="hide">
+    <div id="list" style="margin-top:14px"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <h2 style="margin:0">我的文件</h2>
+      <div class="row">
+        <input type="text" id="kw" placeholder="按文件名搜索" style="min-width:150px">
+        <button id="btnRefresh">刷新</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>文件名</th><th style="width:90px">大小</th><th style="width:150px">上传时间</th><th style="width:130px">操作</th></tr></thead>
+      <tbody id="files"><tr><td colspan="4" class="muted">登录后查看</td></tr></tbody>
+    </table>
+  </div>
+
+</div>
+
+<script>
+const S = {
+  api: localStorage.getItem('upload_api') || '',
+  token: localStorage.getItem('upload_token') || '',
+};
+
+const $ = id => document.getElementById(id);
+const fmtSize = n => {
+  if (!n) return '0 B';
+  const u = ['B','KB','MB','GB','TB']; let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(2)) + ' ' + u[i];
+};
+const fmtTime = s => s ? new Date(s).toLocaleString('zh-CN', { hour12: false }) : '-';
+
+// ---------------------------------------------------------------- 请求封装
+async function api(method, path, body, opts = {}) {
+  const headers = { 'Accept': 'application/json' };
+  if (S.token) headers['Authorization'] = 'Bearer ' + S.token;
+  if (body !== undefined && !(body instanceof FormData)) headers['Content-Type'] = 'application/json';
+  const resp = await fetch(`${S.api}/api/v1${path}`, {
+    method, headers,
+    body: body === undefined ? undefined : (body instanceof FormData ? body : JSON.stringify(body)),
+    signal: opts.signal,
+  });
+  if (resp.status === 204) return null;
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const e = data.error || {};
+    const err = new Error(e.message || `请求失败 (${resp.status})`);
+    err.code = e.code; err.details = e.details; err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------- 内容指纹
+// 大文件全量哈希太慢，这里对 头部/中部/尾部 各取 2MB 加上体积与文件名做 SHA-256，
+// 足以作为秒传与断点续传的匹配键；对安全性要求高的场景请改为全量哈希。
+async function fingerprint(file) {
+  const SAMPLE = 2 * 1024 * 1024;
+  if (!crypto?.subtle) {
+    return `fallback-${file.size}-${file.lastModified}-${encodeURIComponent(file.name)}`.slice(0, 128);
+  }
+  const blobs = file.size <= SAMPLE * 3
+    ? [file]
+    : [file.slice(0, SAMPLE),
+       file.slice(Math.floor(file.size / 2), Math.floor(file.size / 2) + SAMPLE),
+       file.slice(file.size - SAMPLE)];
+  const bufs = await Promise.all(blobs.map(b => b.arrayBuffer()));
+  const meta = new TextEncoder().encode(`${file.size}:${file.name}`);
+  const total = bufs.reduce((n, b) => n + b.byteLength, 0) + meta.byteLength;
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const b of bufs) { merged.set(new Uint8Array(b), off); off += b.byteLength; }
+  merged.set(meta, off);
+  const digest = await crypto.subtle.digest('SHA-256', merged);
+  return [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+// ---------------------------------------------------------------- 上传器
+class Uploader {
+  constructor(file) {
+    this.file = file;
+    this.paused = false;
+    this.aborted = false;
+    this.xhrs = new Set();
+    this.uploadedBytes = 0;
+    this.done = new Map();      // partNumber -> {etag, size}
+    this.pendingReport = [];
+    this.ui = this.render();
+  }
+
+  render() {
+    const el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = `
+      <div class="item-head">
+        <span class="name"></span>
+        <span class="muted" style="white-space:nowrap"></span>
+      </div>
+      <div class="bar"><i></i></div>
+      <div class="row" style="justify-content:space-between">
+        <span class="st">等待中</span>
+        <span class="row">
+          <button data-act="pause" class="hide">暂停</button>
+          <button data-act="resume" class="hide">继续</button>
+          <button data-act="cancel">取消</button>
+        </span>
+      </div>`;
+    el.querySelector('.name').textContent = this.file.name;
+    el.querySelector('.item-head > .muted').textContent = fmtSize(this.file.size);
+    el.querySelector('[data-act=pause]').onclick = () => this.pause();
+    el.querySelector('[data-act=resume]').onclick = () => this.start(true);
+    el.querySelector('[data-act=cancel]').onclick = () => this.cancel();
+    $('list').prepend(el);
+    return {
+      el,
+      bar: el.querySelector('.bar > i'),
+      st: el.querySelector('.st'),
+      pause: el.querySelector('[data-act=pause]'),
+      resume: el.querySelector('[data-act=resume]'),
+      cancel: el.querySelector('[data-act=cancel]'),
+    };
+  }
+
+  status(text, kind = '') { this.ui.st.className = 'st ' + kind; this.ui.st.textContent = text; }
+  progress() {
+    const pct = Math.min(100, this.uploadedBytes / this.file.size * 100);
+    this.ui.bar.style.width = pct.toFixed(1) + '%';
+    return pct;
+  }
+  buttons({ pause = false, resume = false, cancel = false }) {
+    this.ui.pause.classList.toggle('hide', !pause);
+    this.ui.resume.classList.toggle('hide', !resume);
+    this.ui.cancel.classList.toggle('hide', !cancel);
+  }
+
+  async start(isResume = false) {
+    if (!S.token) return this.status('请先登录', 'err');
+    this.paused = false; this.aborted = false;
+    this.ui.el.classList.remove('error');
+    this.buttons({ pause: true, cancel: true });
+
+    try {
+      if (!this.hash) {
+        this.status('计算文件指纹…');
+        this.hash = await fingerprint(this.file);
+      }
+
+      this.status(isResume ? '正在恢复…' : '初始化…');
+      const init = await api('POST', '/uploads/init', {
+        filename: this.file.name,
+        file_size: this.file.size,
+        content_type: this.file.type || undefined,
+        file_hash: this.hash,
+        // 勾选「临时文件」则写入 temp/ 前缀，受 OSS 生命周期规则过期清理
+        upload_type: $('tempMode').checked ? 'temporary' : 'permanent',
+      });
+
+      if (init.instant) {
+        this.uploadedBytes = this.file.size;
+        this.progress();
+        this.ui.el.classList.add('done');
+        this.status('秒传完成（服务端已存在相同文件）', 'ok');
+        this.buttons({});
+        refreshFiles();
+        return;
+      }
+
+      this.taskId = init.task_id;
+      this.chunkSize = init.chunk_size;
+      this.totalParts = init.total_parts;
+      for (const p of init.uploaded_parts || []) this.done.set(p.part_number, p);
+      this.uploadedBytes = [...this.done.values()].reduce((n, p) => n + (p.size || 0), 0);
+      this.progress();
+
+      if (init.resumed && this.done.size) {
+        this.status(`断点续传：已完成 ${this.done.size}/${this.totalParts} 片`, 'warn');
+      }
+
+      await this.uploadParts();
+      if (this.paused || this.aborted) return;
+
+      this.status('合并分片…');
+      const res = await api('POST', `/uploads/${this.taskId}/complete`, {
+        parts: [...this.done.entries()].map(([n, p]) => ({ part_number: n, etag: p.etag, size: p.size })),
+      });
+      this.uploadedBytes = this.file.size;
+      this.progress();
+      this.ui.el.classList.add('done');
+      this.status(`上传完成 · ${res.file.object_key}`, 'ok');
+      this.buttons({});
+      refreshFiles();
+    } catch (err) {
+      if (this.paused || this.aborted) return;
+      this.ui.el.classList.add('error');
+      const extra = err.details?.missing_count ? `（缺失 ${err.details.missing_count} 片）` : '';
+      this.status('失败：' + err.message + extra, 'err');
+      this.buttons({ resume: true, cancel: true });
+    }
+  }
+
+  async uploadParts() {
+    const pending = [];
+    for (let n = 1; n <= this.totalParts; n++) if (!this.done.has(n)) pending.push(n);
+    if (!pending.length) return;
+
+    const concurrency = Math.max(1, Math.min(10, parseInt($('concurrency').value) || 4));
+    const proxy = $('proxyMode').checked;
+    const BATCH = 100;
+
+    for (let i = 0; i < pending.length; i += BATCH) {
+      if (this.paused || this.aborted) return;
+      const batch = pending.slice(i, i + BATCH);
+      let urls = {};
+
+      if (!proxy) {
+        const signed = await api('POST', `/uploads/${this.taskId}/presign`, { part_numbers: batch });
+        for (const p of signed.parts) urls[p.part_number] = p.url;
+      }
+
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < batch.length && !this.paused && !this.aborted) {
+          const n = batch[cursor++];
+          await this.uploadOne(n, urls[n], proxy);
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, worker));
+
+      if (this.pendingReport.length && !this.aborted) {
+        const parts = this.pendingReport.splice(0);
+        await api('POST', `/uploads/${this.taskId}/parts/callback`, { parts }).catch(() => {});
+      }
+    }
+  }
+
+  uploadOne(partNumber, url, proxy, retry = 0) {
+    const start = (partNumber - 1) * this.chunkSize;
+    // 关键：浏览器对 Blob/File 会自动附带 Content-Type，而 V2 SDK 预签名不签名该头，
+    // 只要带任何 Content-Type 就会 403（SignatureDoesNotMatch）。这里强制用空类型 Blob，
+    // 让 XHR 不发送 Content-Type，与预签名一致；最终对象类型已在 init 时设定。
+    const raw = this.file.slice(start, Math.min(start + this.chunkSize, this.file.size));
+    const blob = new Blob([raw], { type: '' });
+    let lastLoaded = 0;
+
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      this.xhrs.add(xhr);
+      const target = proxy
+        ? `${S.api}/api/v1/uploads/${this.taskId}/parts/${partNumber}`
+        : url;
+      xhr.open('PUT', target, true);
+      // 直传分片不要设置 Content-Type（见上方说明），否则 OSS 返回 403。
+      if (proxy && S.token) xhr.setRequestHeader('Authorization', 'Bearer ' + S.token);
+
+      xhr.upload.onprogress = e => {
+        this.uploadedBytes += e.loaded - lastLoaded;
+        lastLoaded = e.loaded;
+        const pct = this.progress();
+        this.status(`上传中 ${pct.toFixed(1)}% · ${this.done.size}/${this.totalParts} 片`);
+      };
+
+      xhr.onload = async () => {
+        this.xhrs.delete(xhr);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          let etag = '';
+          if (proxy) {
+            try { etag = JSON.parse(xhr.responseText).etag; } catch { etag = ''; }
+          } else {
+            etag = (xhr.getResponseHeader('ETag') || '').replaceAll('"', '');
+          }
+          if (!etag) {
+            // 读不到 ETag 基本都是 Bucket CORS 没暴露该响应头
+            return reject(new Error('无法读取分片 ETag，请检查 OSS 跨域规则是否暴露了 ETag'));
+          }
+          this.uploadedBytes += blob.size - lastLoaded;
+          this.done.set(partNumber, { etag, size: blob.size });
+          if (!proxy) this.pendingReport.push({ part_number: partNumber, etag, size: blob.size });
+          this.progress();
+          resolve();
+        } else {
+          this.uploadedBytes -= lastLoaded;
+          if (retry < 2 && !this.paused && !this.aborted) {
+            setTimeout(() => this.uploadOne(partNumber, url, proxy, retry + 1).then(resolve, reject), 800 * (retry + 1));
+          } else {
+            reject(new Error(`分片 ${partNumber} 上传失败 (HTTP ${xhr.status})`));
+          }
+        }
+      };
+      xhr.onerror = () => {
+        this.xhrs.delete(xhr);
+        this.uploadedBytes -= lastLoaded;
+        if (this.paused || this.aborted) return resolve();
+        if (retry < 2) {
+          setTimeout(() => this.uploadOne(partNumber, url, proxy, retry + 1).then(resolve, reject), 800 * (retry + 1));
+        } else {
+          reject(new Error(`分片 ${partNumber} 网络错误`));
+        }
+      };
+      xhr.onabort = () => { this.xhrs.delete(xhr); this.uploadedBytes -= lastLoaded; resolve(); };
+      xhr.send(blob);
+    });
+  }
+
+  pause() {
+    this.paused = true;
+    for (const x of this.xhrs) x.abort();
+    this.xhrs.clear();
+    this.progress();
+    this.status(`已暂停 · 完成 ${this.done.size}/${this.totalParts} 片`, 'warn');
+    this.buttons({ resume: true, cancel: true });
+  }
+
+  async cancel() {
+    this.aborted = true; this.paused = true;
+    for (const x of this.xhrs) x.abort();
+    this.xhrs.clear();
+    if (this.taskId) await api('DELETE', `/uploads/${this.taskId}`).catch(() => {});
+    this.status('已取消', 'err');
+    this.buttons({});
+  }
+}
+
+// ---------------------------------------------------------------- 文件列表
+async function refreshFiles() {
+  const tbody = $('files');
+  if (!S.token) { tbody.innerHTML = '<tr><td colspan="4" class="muted">登录后查看</td></tr>'; return; }
+  try {
+    const kw = $('kw').value.trim();
+    const data = await api('GET', `/files?limit=20${kw ? '&keyword=' + encodeURIComponent(kw) : ''}`);
+    if (!data.items.length) { tbody.innerHTML = '<tr><td colspan="4" class="muted">暂无文件</td></tr>'; return; }
+    tbody.innerHTML = '';
+    for (const f of data.items) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td class="name"></td><td>${fmtSize(f.file_size)}</td>
+        <td class="muted">${fmtTime(f.created_at)}</td>
+        <td class="row"><button data-dl>下载</button><button data-rm>删除</button></td>`;
+      tr.querySelector('.name').textContent = f.filename;
+      tr.querySelector('[data-dl]').onclick = async () => {
+        const r = await api('GET', `/files/${f.id}/download-url`);
+        window.open(r.url, '_blank');
+      };
+      tr.querySelector('[data-rm]').onclick = async () => {
+        if (!confirm(`确定删除「${f.filename}」？`)) return;
+        await api('DELETE', `/files/${f.id}`);
+        refreshFiles();
+      };
+      tbody.appendChild(tr);
+    }
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4" class="st err"></td></tr>`;
+    tbody.querySelector('td').textContent = '加载失败：' + err.message;
+  }
+}
+
+// ---------------------------------------------------------------- 交互绑定
+function setToken(token, email) {
+  S.token = token || '';
+  localStorage.setItem('upload_token', S.token);
+  $('authState').textContent = S.token ? `已登录${email ? '：' + email : ''}` : '未登录';
+  $('authState').className = S.token ? 'st ok' : 'muted';
+  refreshFiles();
+}
+
+$('apiBase').value = S.api;
+$('apiBase').onchange = e => {
+  S.api = e.target.value.trim().replace(/\/$/, '');
+  localStorage.setItem('upload_api', S.api);
+};
+$('btnToggleLogin').onclick = () => $('loginBox').classList.toggle('hide');
+$('btnLogin').onclick = async () => {
+  try {
+    const r = await api('POST', '/auth/login', { email: $('email').value, password: $('password').value });
+    setToken(r.access_token, $('email').value);
+    $('loginBox').classList.add('hide');
+  } catch (e) { alert('登录失败：' + e.message); }
+};
+$('btnRegister').onclick = async () => {
+  try {
+    const r = await api('POST', '/auth/register', { email: $('email').value, password: $('password').value });
+    if (r.access_token) { setToken(r.access_token, $('email').value); alert('注册成功并已登录'); }
+    else alert('注册成功，请前往邮箱完成验证后再登录');
+  } catch (e) { alert('注册失败：' + e.message); }
+};
+$('btnUseToken').onclick = () => {
+  const t = $('tokenInput').value.trim();
+  if (t) { setToken(t); $('loginBox').classList.add('hide'); }
+};
+$('btnRefresh').onclick = refreshFiles;
+$('kw').onkeydown = e => { if (e.key === 'Enter') refreshFiles(); };
+
+const drop = $('drop'), picker = $('picker');
+drop.onclick = () => picker.click();
+picker.onchange = e => { handle(e.target.files); picker.value = ''; };
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); handle(e.dataTransfer.files); };
+
+function handle(files) {
+  if (!S.token) { alert('请先登录'); return; }
+  for (const f of files) new Uploader(f).start();
+}
+
+setToken(S.token);
+</script>
+</body>
+</html>
