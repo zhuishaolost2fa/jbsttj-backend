@@ -219,3 +219,96 @@ class DMGuideStatus(BaseModel):
     total_qa: int = Field(default=0, description="问答对数")
     version: int = Field(default=0, description="当前版本号")
     job: Optional[JobProgress] = Field(default=None, description="最近一次任务的进度")
+
+
+# ------------------------------------------------------------
+# 统一导入进度（上传 → 解析 → 可问答）
+# ------------------------------------------------------------
+class ImportPhase(BaseModel):
+    """导入流程里的一个阶段，供前端按阶段渲染进度条。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    key: str = Field(description="阶段标识：upload / parse / ready")
+    label: str = Field(description="阶段中文名，如「上传手册」「解析入库」「可问答」")
+    # pending 未开始 / active 进行中 / done 完成 / failed 失败 / cancelled 已取消 / skipped 复用
+    status: str = Field(description="阶段状态")
+    progress: float = Field(default=0.0, description="阶段进度，0~100")
+    detail: Optional[Dict[str, Any]] = Field(default=None, description="阶段补充数据（如计数）")
+
+
+class ImportStatus(BaseModel):
+    """剧本导入整体进度，前端轮询这一个接口即可感知「上传 → 解析 → 可问答」全流程。
+
+    设计取舍：手册 PDF 往往 400 页、解析要十几分钟，用户上传后最关心的不是
+    「文件字节传到哪了」（那是秒级完成的传输），而是「我的剧本什么时候能问答」。
+    所以这个接口把「上传手册 / 解析入库 / 可问答」三个语义阶段归一，前端不必
+    分别轮询上传接口和解析接口。
+
+    实时字节级上传进度（传输中的那几秒）由 `GET /api/v1/uploads/{task_id}`
+    负责；本接口的 `upload` 字段可借可选 `uploadTaskId` 参数把那个进度一并带出来，
+    实现「一个接口看全部」。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    script_id: str = Field(description="剧本 ID")
+    title: Optional[str] = Field(default=None, description="剧本名")
+    # uploading 上传中 / parsing 解析中 / ready 可问答 / failed 失败 / no_guide 未传手册 / pending 待开始
+    overall_status: str = Field(description="整体状态")
+    phases: List[ImportPhase] = Field(default_factory=list, description="三阶段进度明细")
+    upload: Optional[Dict[str, Any]] = Field(
+        default=None, description="上传阶段明细（含实时进度，需传 uploadTaskId）"
+    )
+    dm_guide: Dict[str, Any] = Field(default_factory=dict, description="DM 手册状态快照")
+
+
+# ------------------------------------------------------------
+# 问答（RAG 生成答案）
+# ------------------------------------------------------------
+class AskRequest(BaseModel):
+    """基于手册内容向 LLM 提问，返回带引用的答案。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    question: str = Field(min_length=1, max_length=500, description="主持人的问题，自然语言描述")
+    mode: str = Field(
+        default="hybrid",
+        pattern="^(chunk|qa|hybrid)$",
+        description="检索模式：chunk=原文块 / qa=问答对 / hybrid=两者都用（默认）",
+    )
+    top_k: int = Field(default=6, ge=1, le=30, alias="topK", description="参与回答的参考条数上限")
+    min_similarity: Optional[float] = Field(
+        default=None, ge=0, le=1, alias="minSimilarity", description="相似度下限，不传用服务端默认值"
+    )
+    category: Optional[str] = Field(
+        default=None, description="只看某一类问答，仅对 qa / hybrid 模式生效"
+    )
+
+
+class AskSource(BaseModel):
+    """回答引用的一条来源，前端可据此展示出处（章节、页码）。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    type: str = Field(description="来源类型：qa / chunk")
+    similarity: float = Field(default=0.0, description="与问题的相似度")
+    question: Optional[str] = Field(default=None, description="问答对的「问」（type=qa 时）")
+    answer: Optional[str] = Field(default=None, description="问答对的「答」（type=qa 时）")
+    content: Optional[str] = Field(default=None, description="原文块正文（type=chunk 时）")
+    section_path: List[str] = Field(default_factory=list, description="章节面包屑")
+    page_start: int = Field(default=0, description="起始页")
+    page_end: int = Field(default=0, description="结束页")
+
+
+class AskResponse(BaseModel):
+    """问答结果：LLM 合成的答案为 `answer`，`sources` 是其引用的手册出处。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    question: str = Field(description="原始问题")
+    answer: str = Field(description="基于手册内容生成的答案")
+    sources: List[AskSource] = Field(default_factory=list, description="引用来源（qa 优先）")
+    mode: str = Field(description="实际使用的检索模式")
+    document_id: Optional[str] = Field(default=None, description="命中的文档 ID")
+    took_ms: int = Field(default=0, description="耗时（毫秒，含检索与生成）")

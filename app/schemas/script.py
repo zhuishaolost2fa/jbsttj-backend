@@ -243,6 +243,9 @@ class ScriptItem(BaseModel):
     status: str = Field(default="published", description="状态")
     source: Optional[str] = Field(default=None, description="数据来源说明")
     extra: Dict[str, Any] = Field(default_factory=dict, description="扩展字段")
+    # 是否挂了 DM 主持人手册（extra.dmGuide.objectKey 存在即视为已上传手册），
+    # 供 H5「我的导入」列表直接判断该剧本是否进入了解析流程，免去逐条再查进度接口
+    has_guide: bool = Field(default=False, description="是否已关联 DM 主持人手册（PDF/Word）")
 
     created_at: Optional[str] = Field(default=None, description="创建时间")
     updated_at: Optional[str] = Field(default=None, description="更新时间")

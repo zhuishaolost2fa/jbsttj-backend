@@ -25,9 +25,14 @@ from fastapi.concurrency import run_in_threadpool
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ConfigError, ConflictError, NotFoundError, ValidationError
 from app.schemas.dm_guide import (
+    AskRequest,
+    AskResponse,
+    AskSource,
     ChunkHit,
     DMGuideRef,
     DMGuideStatus,
+    ImportPhase,
+    ImportStatus,
     IngestRequest,
     IngestResponse,
     JobProgress,
@@ -36,10 +41,33 @@ from app.schemas.dm_guide import (
     SearchResult,
 )
 from app.services import dm_store as store_mod
+from app.services.repository import UploadTaskRepository
 
 logger = logging.getLogger("app.dm_service")
 
 SEARCH_MODES = ("chunk", "qa", "hybrid")
+
+# 问答（RAG 生成答案）的提示词。答案必须严格基于手册检索到的内容，
+# 不编造 —— 主持人靠这个带本，瞎编一条规则就是事故。
+_ANSWER_SYSTEM_PROMPT = """你是一名剧本杀主持人（DM）助手，专门依据《主持人手册》回答主持人带本过程中的问题。
+
+硬性规则：
+1. 只能使用下面【手册内容】里提供的参考来作答，严禁编造手册以外的任何规则、数字、人名、道具或页码。
+2. 若【手册内容】不足以回答，明确说明「手册中未找到相关内容」，不要猜测或补全。
+3. 回答要简洁、可直接照着执行，保留原文里的关键数字、时间、人名、道具名。
+4. 用括号标注每条结论的出处，对应【手册内容】里的「参考N」，例如「（见参考2，P12）」。
+5. 不要重复问题，直接给答案。"""
+
+# 解析阶段到整体文案的映射，仅用于 import-status 的友好展示
+_PARSE_STATUSES = {
+    "pending",
+    "downloading",
+    "extracting",
+    "chunking",
+    "generating_qa",
+    "embedding",
+}
+_TERMINAL_DONE = {"completed", "skipped"}
 
 
 class DMGuideService:
@@ -289,6 +317,111 @@ class DMGuideService:
             job=self._to_progress(job_row) if job_row else None,
         )
 
+    async def get_import_status(
+        self, script: Any, *, upload_task_id: Optional[str] = None
+    ) -> ImportStatus:
+        """剧本导入整体进度：上传手册 → 解析入库 → 可问答。
+
+        前端上传完手册、保存剧本后即开始轮询这个接口即可，不必再分别盯
+        `GET /uploads/{task_id}` 和解析进度接口。传 `upload_task_id` 可把
+        传输中的实时字节进度也并入 `upload` 字段（传输通常只有几秒，不传也可）。
+        """
+        script_id = str(getattr(script, "id", "") or "")
+        title = str(getattr(script, "title", "") or "") or None
+
+        status = await self.get_status(script)
+
+        # ---- 上传阶段 ----
+        upload_detail: Optional[Dict[str, Any]] = None
+        upload_status = "done" if status.has_guide else "pending"
+        upload_progress = 100.0 if status.has_guide else 0.0
+        if upload_task_id:
+            repo = UploadTaskRepository()
+            task = await run_in_threadpool(repo.get, upload_task_id)
+            if task:
+                prog = float(task.get("progress") or 0.0)
+                upload_detail = {
+                    "taskId": str(task.get("id")),
+                    "status": task.get("status"),
+                    "progress": round(prog, 1),
+                    "uploadedBytes": int(task.get("uploaded_bytes") or 0),
+                    "totalBytes": int(task.get("file_size") or 0),
+                    "totalParts": int(task.get("total_parts") or 0),
+                    "filename": task.get("filename"),
+                }
+                tstatus = task.get("status")
+                if tstatus == "uploading":
+                    upload_status, upload_progress = "active", prog
+                elif tstatus == "failed":
+                    upload_status, upload_progress = "failed", prog
+
+        # ---- 解析阶段 ----
+        job = status.job
+        parse_status = "pending"
+        parse_progress = 0.0
+        parse_detail: Dict[str, Any] = {}
+        if job is not None:
+            parse_detail = job.model_dump(by_alias=True)
+            jstatus = job.status
+            if jstatus in _TERMINAL_DONE:
+                parse_status, parse_progress = "done", 100.0
+            elif jstatus == "failed":
+                parse_status, parse_progress = "failed", 0.0
+            elif jstatus == "cancelled":
+                parse_status, parse_progress = "cancelled", 0.0
+            else:
+                parse_status = "active"
+                parse_progress = _coarse_progress(job)
+
+        elif status.has_guide and status.indexed:
+            parse_status, parse_progress = "done", 100.0
+
+        # ---- 可问答阶段 ----
+        ready_status = "done" if status.indexed else "pending"
+
+        # ---- 整体状态 ----
+        if upload_status == "active":
+            overall = "uploading"
+        elif upload_status == "failed":
+            overall = "failed"
+        elif not status.has_guide and upload_status != "active":
+            overall = "no_guide"
+        elif parse_status in ("active",):
+            overall = "parsing"
+        elif parse_status == "failed":
+            overall = "failed"
+        elif parse_status == "cancelled":
+            overall = "pending"
+        elif status.indexed:
+            overall = "ready"
+        else:
+            overall = "pending"
+
+        phases = [
+            ImportPhase(
+                key="upload", label="上传手册", status=upload_status,
+                progress=upload_progress, detail=upload_detail,
+            ),
+            ImportPhase(
+                key="parse", label="解析入库", status=parse_status,
+                progress=parse_progress, detail=parse_detail or None,
+            ),
+            ImportPhase(
+                key="ready", label="可问答", status=ready_status,
+                progress=100.0 if ready_status == "done" else 0.0,
+            ),
+        ]
+
+        dm_guide = status.model_dump(by_alias=True)
+        return ImportStatus(
+            script_id=script_id,
+            title=title,
+            overall_status=overall,
+            phases=phases,
+            upload=upload_detail,
+            dm_guide=dm_guide,
+        )
+
     # --------------------------------------------------------
     # 检索
     # --------------------------------------------------------
@@ -381,6 +514,107 @@ class DMGuideService:
             took_ms=took,
         )
 
+    # --------------------------------------------------------
+    # 问答（RAG 生成答案）
+    # --------------------------------------------------------
+    async def ask(
+        self,
+        *,
+        question: str,
+        script: Any,
+        mode: str = "hybrid",
+        top_k: int = 6,
+        min_similarity: Optional[float] = None,
+        category: Optional[str] = None,
+    ) -> AskResponse:
+        """检索手册相关内容，再用 LLM 合成一条带引用的答案。
+
+        与 :meth:`search` 的区别：search 只返回原始命中（前端自己挑），
+        ask 额外走一步 LLM 把命中内容揉成一句直接能照着念的答案，并标注出处。
+        答案**严格**基于检索到的手册内容，模型无法看到的页面不会出现在答案里。
+        """
+        self._require_rag_config()
+        script_id = str(getattr(script, "id", "") or "")
+        if not script_id:
+            raise ValidationError("剧本 ID 缺失", code="script_id_required")
+
+        # 没索引就回答不了 —— 直接告诉前端先等解析完成，不要抛 LLM 空答
+        status = await self.get_status(script)
+        if not status.indexed:
+            raise ConflictError(
+                "该剧本手册尚未完成索引，暂时无法问答",
+                code="dm_not_indexed",
+                details={"hasGuide": status.has_guide, "indexed": False},
+            )
+
+        started = time.perf_counter()
+        result = await self.search(
+            query=question,
+            script_id=script_id,
+            mode=mode,
+            top_k=top_k,
+            min_similarity=min_similarity,
+            category=category,
+        )
+
+        # 组装引用来源：qa 优先，控制单轮上下文体量（避免把整本手册喂给 LLM）
+        qa_cap = min(len(result.qa), top_k)
+        chunk_cap = min(len(result.chunks), max(1, top_k - qa_cap))
+        sources: List[AskSource] = []
+        for h in result.qa[:qa_cap]:
+            sources.append(
+                AskSource(
+                    type="qa",
+                    similarity=h.similarity,
+                    question=h.question,
+                    answer=h.answer,
+                    section_path=h.section_path,
+                    page_start=h.page_start,
+                    page_end=h.page_end,
+                )
+            )
+        for h in result.chunks[:chunk_cap]:
+            sources.append(
+                AskSource(
+                    type="chunk",
+                    similarity=h.similarity,
+                    content=h.content,
+                    section_path=h.section_path,
+                    page_start=h.page_start,
+                    page_end=h.page_end,
+                )
+            )
+
+        context = _format_answer_context(sources)
+        user_prompt = (
+            f"剧本：《{getattr(script, 'title', '') or script_id}》\n\n"
+            f"【手册内容】\n{context}\n\n"
+            f"【问题】\n{question}\n\n"
+            "请基于手册内容回答上面的问题。"
+        )
+        from app.services.llm import get_llm_client
+
+        client = get_llm_client()
+        # chat 是同步阻塞网络调用，丢进线程池避免卡住事件循环
+        answer = await run_in_threadpool(
+            client.chat,
+            [
+                {"role": "system", "content": _ANSWER_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            **{"temperature": 0.3, "max_tokens": 1024},
+        )
+
+        took = int((time.perf_counter() - started) * 1000)
+        return AskResponse(
+            question=question,
+            answer=(answer or "").strip(),
+            sources=sources,
+            mode=result.mode,
+            document_id=result.document_id,
+            took_ms=took,
+        )
+
 
 def _to_chunk_hit(row: Dict[str, Any]) -> ChunkHit:
     raw_path = row.get("section_path")
@@ -410,6 +644,42 @@ def _to_qa_hit(row: Dict[str, Any]) -> QAHit:
         chunk_id=(str(row["chunk_id"]) if row.get("chunk_id") else None),
         similarity=round(float(row.get("similarity") or 0.0), 4),
     )
+
+
+def _coarse_progress(job: "JobProgress") -> float:
+    """把多阶段解析进度收敛成一个 0~100 的粗进度，仅供进度条展示。
+
+    四个阶段耗时差两个数量级，单一百分比本不科学（见 JobProgress 文档），
+    但 import-status 需要一个能填进度条的概数；这里按「哪个计数先到顶」取最大，
+    绝不靠线性插值骗用户。
+    """
+    if job.total_chunks > 0:
+        return min(100.0, round(job.embedded_chunks / job.total_chunks * 100, 1))
+    if job.total_qa > 0:
+        return min(100.0, round(job.embedded_qa / job.total_qa * 100, 1))
+    if job.total_pages > 0:
+        return min(100.0, round(job.processed_pages / job.total_pages * 100, 1))
+    if job.total_shards > 0:
+        return min(100.0, round(job.finished_shards / job.total_shards * 100, 1))
+    return 0.0
+
+
+def _format_answer_context(sources: List[AskSource]) -> str:
+    """把引用来源拼成 LLM 能读懂的【手册内容】文本。"""
+    blocks: List[str] = []
+    for i, s in enumerate(sources, 1):
+        path = " > ".join(s.section_path) if s.section_path else ""
+        page = ""
+        if s.page_start:
+            page = f" P{s.page_start}"
+            if s.page_end and s.page_end != s.page_start:
+                page += f"-{s.page_end}"
+        where = (f"（{path}{page}）" if (path or page) else "")
+        if s.type == "qa":
+            blocks.append(f"[参考{i}]{where}\n问：{s.question}\n答：{s.answer}")
+        else:
+            blocks.append(f"[参考{i}]{where}\n{s.content or ''}")
+    return "\n\n".join(blocks)
 
 
 def _merge_hits_qa_first(

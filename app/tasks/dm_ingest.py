@@ -410,13 +410,17 @@ def extract_shard(
         # OCR 兜底分支依赖 page_start/page_end 表示本片覆盖的页区间
         page_start, page_end = unit_start, unit_end
 
-    # ---- OCR 兜底：图片型 / 扫描件 PDF ----
+    # ---- OCR 兜底：仅对图片型 / 扫描件 PDF ----
     # 某页抽不到文字块、但有图片（PDF 是整页扫描），交给阿里云 OCR 识别后并回块列表。
-    pages_with_text = {b.page for b in result.blocks}
-    need_ocr = [p for p in range(page_start, page_end + 1) if p not in pages_with_text]
+    # docx 自带文字层且无真页码（page_start/page_end 是文本单元序号，不是页），
+    # 套用按页 OCR 会对每个「伪页码」空跑 render_page_png，必须整体跳过。
+    if doc_format == "docx":
+        need_ocr: List[int] = []
+    else:
+        pages_with_text = {b.page for b in result.blocks}
+        need_ocr = [p for p in range(page_start, page_end + 1) if p not in pages_with_text]
     if need_ocr:
         try:
-            from app.core.config import get_settings
             from app.services.ocr import (
                 blocks_from_ocr,
                 get_ocr_client,

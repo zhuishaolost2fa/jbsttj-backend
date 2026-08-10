@@ -13,9 +13,12 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Path, Query, status
 
-from app.core.security import CurrentUser, get_current_user
+from app.core.security import CurrentUser, get_current_user, get_current_user_optional
 from app.schemas.dm_guide import (
+    AskRequest,
+    AskResponse,
     DMGuideStatus,
+    ImportStatus,
     IngestRequest,
     IngestResponse,
     JobProgress,
@@ -73,6 +76,33 @@ async def get_dm_guide_status(
 ) -> DMGuideStatus:
     script = await scripts.get_script(id_or_code)
     return await service.get_status(script)
+
+
+@router.get(
+    "/{id_or_code}/import-status",
+    response_model=ImportStatus,
+    summary="剧本导入整体进度",
+    description=(
+        "把「上传手册 → 解析入库 → 可问答」三个语义阶段归一成一个轮询接口，\n"
+        "用户上传剧本后**只需轮询这一个**就能感知整体进度，不必分别盯上传接口和解析接口。\n\n"
+        "三阶段状态：`pending` 未开始 / `active` 进行中 / `done` 完成 / "
+        "`failed` 失败 / `cancelled` 已取消 / `skipped` 复用旧索引。\n"
+        "`overall_status` 取值：`uploading` 上传中 / `parsing` 解析中 / "
+        "`ready` 可问答 / `failed` 失败 / `no_guide` 未传手册 / `pending` 待开始。\n\n"
+        "实时字节级上传进度（传输中的几秒）由 `GET /api/v1/uploads/{task_id}` 负责；\n"
+        "传 `uploadTaskId` 可把这个实时进度并入 `upload` 字段，实现「一个接口看全部」。"
+    ),
+)
+async def get_import_status(
+    id_or_code: str = Path(description="剧本 UUID 或业务编码"),
+    upload_task_id: Optional[str] = Query(
+        default=None, description="可选：上传任务 ID，传入则把实时字节进度并入 upload 字段"
+    ),
+    scripts: ScriptService = Depends(get_script_service),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> ImportStatus:
+    script = await scripts.get_script(id_or_code)
+    return await service.get_import_status(script, upload_task_id=upload_task_id)
 
 
 @router.get(
@@ -143,4 +173,35 @@ async def search_dm_guide(
         top_k=top_k,
         min_similarity=min_similarity,
         category=category,
+    )
+
+
+@router.post(
+    "/{id_or_code}/dm-guide/ask",
+    response_model=AskResponse,
+    summary="剧本详情问答（RAG 生成答案）",
+    description=(
+        "检索手册相关内容，再用 LLM 合成一条**带引用出处**的答案，供主持人在带本过程中直接照着念。\n\n"
+        "与 `search` 的区别：search 只返回原始命中（前端自己挑），ask 额外走一步 LLM "
+        "把命中内容揉成一句可直接执行的答案，并在 `sources` 里给出每条结论对应的章节与页码。\n"
+        "答案严格基于检索到的手册内容，模型看不到的页面不会出现在答案里。\n\n"
+        "前置条件同检索：剧本手册必须已完成索引（`indexed=true`），否则返回 409。\n"
+        "该接口会消耗 LLM 额度，需登录调用。"
+    ),
+)
+async def ask_dm_guide(
+    payload: AskRequest,
+    id_or_code: str = Path(description="剧本 UUID 或业务编码"),
+    user: CurrentUser = Depends(get_current_user),
+    scripts: ScriptService = Depends(get_script_service),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> AskResponse:
+    script = await scripts.get_script(id_or_code)
+    return await service.ask(
+        question=payload.question,
+        script=script,
+        mode=payload.mode,
+        top_k=payload.top_k,
+        min_similarity=payload.min_similarity,
+        category=payload.category,
     )

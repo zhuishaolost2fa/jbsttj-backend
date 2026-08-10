@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, status
 
-from app.core.security import CurrentUser, get_current_user
+from app.core.security import CurrentUser, get_current_user, get_current_user_optional
+from app.core.exceptions import AuthError
 from app.schemas.common import MessageResponse
 from app.schemas.script import (
     ScriptCreate,
@@ -22,6 +23,7 @@ from app.schemas.script import (
     ScriptSearchByNameResult,
     ScriptUpdate,
 )
+from app.schemas.dm_guide import ImportStatus
 from app.services.dm_service import DMGuideService, get_dm_guide_service
 from app.services.script_service import ScriptService, get_script_service
 
@@ -54,6 +56,10 @@ async def list_scripts(
     ),
     min_rating: Optional[float] = Query(default=None, ge=0, le=10, description="最低评分"),
     recommended_only: bool = Query(default=False, description="只看推荐位剧本"),
+    mine: bool = Query(
+        default=False,
+        description="只看我上传/创建的剧本（需登录，自动按当前用户过滤并包含草稿）",
+    ),
     sort: str = Query(
         default="hot",
         pattern="^(hot|rating|newest|year|title)$",
@@ -61,8 +67,17 @@ async def list_scripts(
     ),
     limit: int = Query(default=20, ge=1, le=100, description="每页条数"),
     offset: int = Query(default=0, ge=0, description="偏移量"),
+    user: Optional[CurrentUser] = Depends(get_current_user_optional),
     service: ScriptService = Depends(get_script_service),
 ) -> ScriptListResult:
+    # 「我的剧本」必须登录；草稿 / 下架记录对 RLS 不可见，所以这里强制带 created_by
+    # 并放开 status 限制（不过滤 published），让本人能看到自己全部的导入记录。
+    created_by = None
+    if mine:
+        if user is None:
+            raise AuthError("查看我的剧本需要先登录", code="login_required")
+        created_by = user.id
+
     return await service.list_scripts(
         keyword=keyword,
         playstyles=playstyle,
@@ -76,6 +91,9 @@ async def list_scripts(
         sort=sort,
         limit=limit,
         offset=offset,
+        created_by=created_by,
+        # mine 时不过滤状态，展示本人全部剧本（含草稿）；非 mine 默认只看已上架
+        status=None if mine else "published",
     )
 
 
@@ -131,6 +149,39 @@ async def search_script_by_name(
 ) -> ScriptSearchByNameResult:
     items, found = await service.search_by_name(name, limit=limit)
     return ScriptSearchByNameResult(found=found, query=name, count=len(items), items=items)
+
+
+@router.get(
+    "/import-status",
+    response_model=Dict[str, ImportStatus],
+    response_model_by_alias=True,
+    summary="批量查询剧本导入进度",
+    description=(
+        "「我的剧本」列表页专用：一次把多个剧本的导入进度（上传 → 解析 → 可问答）"
+        "打包返回，替代列表里每个剧本各发一次 `GET /scripts/{id}/import-status` 轮询，"
+        "把原本 N 次请求压成 1 次。\n\n"
+        "`ids` 为逗号分隔的剧本 ID 或 code（最多 100 个），返回结构以 `scriptId` 为键。"
+        "单个剧本查不到或计算失败时静默跳过，不会拖垮整批。"
+    ),
+)
+async def batch_import_status(
+    ids: str = Query(
+        ..., min_length=1, max_length=4096, description="逗号分隔的剧本 ID 或 code 列表，最多 100 个"
+    ),
+    scripts: ScriptService = Depends(get_script_service),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> Dict[str, ImportStatus]:
+    # 去空白、去重、截断到 100，避免超长参数把后端问垮
+    id_list = [x.strip() for x in ids.split(",") if x.strip()][:100]
+    out: Dict[str, ImportStatus] = {}
+    for id_or_code in id_list:
+        try:
+            script = await scripts.get_script(id_or_code)
+            out[str(script.id)] = await service.get_import_status(script)
+        except Exception:  # noqa: BLE001
+            # 单个剧本异常（已删除 / 内部错误）不应让整批失败
+            continue
+    return out
 
 
 @router.get(

@@ -347,6 +347,7 @@ class ScriptRepository:
         min_rating: Optional[float] = None,
         recommended_only: bool = False,
         status: Optional[str] = "published",
+        created_by: Optional[str] = None,
         sort: str = "hot",
         limit: int = 20,
         offset: int = 0,
@@ -354,6 +355,11 @@ class ScriptRepository:
         filters: Dict[str, str] = {"deleted_at": "is.null"}
         if status:
             filters["status"] = f"eq.{status}"
+        # 「我的剧本」：只返回当前用户创建的记录。
+        # 后端用 service_role 绕过 RLS，这里必须显式带 created_by，否则会漏掉
+        # 草稿 / 下架等 RLS 不可见的记录。
+        if created_by:
+            filters["created_by"] = f"eq.{created_by}"
 
         # 数组维度用 ov（overlap）：命中任意一个即可，符合筛选器多选的直觉
         if playstyles:

@@ -8,6 +8,9 @@ pydantic>=2.9.0
 pydantic-settings>=2.6.0
 email-validator>=2.2.0
 
+# ---- 剧本 code 拼音 slug（中文标题 -> 可读 URL，如 雾都疑影 -> wu-du-yi-ying） ----
+pypinyin>=0.53.0
+
 # ---- 鉴权 (Supabase JWT: HS256 legacy secret / ES256-RS256 JWKS) ----
 PyJWT[crypto]>=2.9.0
 

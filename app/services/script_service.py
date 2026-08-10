@@ -17,6 +17,8 @@ import unicodedata
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from pypinyin import lazy_pinyin
+
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.data import script_options_seed as opt_seed
 from app.schemas.common import Pagination
@@ -31,6 +33,7 @@ from app.schemas.script import (
 )
 from app.services.repository import ScriptRepository
 from app.services.script_option_service import ScriptOptionService, get_script_option_service
+from app.schemas.dm_guide import DMGuideRef
 
 logger = logging.getLogger("app.script")
 
@@ -40,11 +43,14 @@ MAX_PAGE_SIZE = 100
 def slugify(title: str) -> str:
     """把剧本名转成 URL 友好的 slug。
 
-    中文没法直接转拼音（不想为此引入额外依赖），因此策略是：
-    保留 ASCII 字母数字，其余字符丢弃；如果结果为空（纯中文标题的常见情况），
-    调用方会退回到随机短码，反正 code 只要求稳定唯一，不要求可读。
+    中文优先转拼音（pypinyin），英文/数字原样保留，再用连字符规整。
+    例：雾都疑影 -> wu-du-yi-ying；雾都疑影 2nd -> wu-du-yi-ying-2nd。
+    若转拼音后为空（极端情况，如纯符号标题），调用方会退回到随机短码。
     """
-    normalized = unicodedata.normalize("NFKD", title)
+    # 逐词转拼音：中文变拼音，非中文（字母/数字/标点）原样保留
+    tokens = lazy_pinyin(title, errors="default")
+    raw = "-".join(t for t in tokens if t)
+    normalized = unicodedata.normalize("NFKD", raw)
     ascii_only = normalized.encode("ascii", "ignore").decode("ascii").lower()
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_only).strip("-")
     return slug[:48]
@@ -73,6 +79,7 @@ class ScriptService:
         min_rating: Optional[float] = None,
         recommended_only: bool = False,
         status: Optional[str] = "published",
+        created_by: Optional[str] = None,
         sort: str = "hot",
         limit: int = 20,
         offset: int = 0,
@@ -99,6 +106,7 @@ class ScriptService:
             min_rating=min_rating,
             recommended_only=recommended_only,
             status=status,
+            created_by=created_by,
             sort=sort,
             limit=limit,
             offset=offset,
@@ -156,6 +164,9 @@ class ScriptService:
 
         用 `exclude_unset=True` 区分「没传」与「传了 null」：
         没传的字段保持原值，显式传 null 的字段会被清空 —— 这正是 PATCH 该有的语义。
+
+        **code 创建后不可变**：详情页 URL 用 code 拼接，运行时改 code 会让已分享/
+        收藏的旧链接 404。误传了与现有不同的 code 时明确报错，而不是静默放行或忽略。
         """
         existing = await self.repo.get(script_id)
         if existing is None:
@@ -175,11 +186,11 @@ class ScriptService:
         self._check_partial_ranges(existing, data)
         self._check_gender_sum({**existing, **data})
 
-        new_code = data.get("code")
-        if new_code and new_code != existing.get("code"):
-            clash = await self.repo.get_by_code(new_code, include_deleted=True)
-            if clash and clash.get("id") != script_id:
-                raise ConflictError(f"剧本编码已存在: {new_code}", code="script_code_exists")
+        # code 创建后不可变：详情页 URL 用 code 拼接，运行时改 code 会让已分享/
+        # 收藏的旧链接 404。误传不同 code 时明确报错，而不是静默放行或静默忽略。
+        incoming_code = data.pop("code", None)
+        if incoming_code and incoming_code != existing.get("code"):
+            raise ValidationError("剧本编码(code)创建后不可修改", code="code_immutable")
 
         row = await self.repo.update(script_id, data)
         if row is None:
@@ -273,7 +284,7 @@ class ScriptService:
         return {c.code: {o.code: o.label for o in c.options} for c in tree.categories}
 
     async def _generate_code(self, title: str) -> str:
-        """按标题派生 slug；中文标题会退化成随机短码，冲突则追加序号。"""
+        """按标题派生拼音 slug；极端情况下退化为随机短码，冲突则追加序号。"""
         base = slugify(title) or f"script-{uuid.uuid4().hex[:8]}"
         candidate = base
         for suffix in range(2, 12):
@@ -368,6 +379,7 @@ class ScriptService:
             status=row.get("status") or "published",
             source=row.get("source"),
             extra=dict(row.get("extra") or {}),
+            has_guide=bool(DMGuideRef.from_extra(row.get("extra"))),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
         )
