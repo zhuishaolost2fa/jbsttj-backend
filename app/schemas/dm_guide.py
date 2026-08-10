@@ -254,7 +254,7 @@ class ImportStatus(BaseModel):
 
     script_id: str = Field(description="剧本 ID")
     title: Optional[str] = Field(default=None, description="剧本名")
-    # uploading 上传中 / parsing 解析中 / ready 可问答 / failed 失败 / no_guide 未传手册 / pending 待开始
+    # uploading 上传中 / parsing 解析中 / parsed 解析完成(待激活索引/暂不可问答) / ready 可问答 / failed 失败 / no_guide 未传手册 / pending 待开始
     overall_status: str = Field(description="整体状态")
     phases: List[ImportPhase] = Field(default_factory=list, description="三阶段进度明细")
     upload: Optional[Dict[str, Any]] = Field(

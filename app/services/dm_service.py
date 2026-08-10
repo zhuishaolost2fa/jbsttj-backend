@@ -391,6 +391,11 @@ class DMGuideService:
             overall = "failed"
         elif parse_status == "cancelled":
             overall = "pending"
+        elif parse_status == "done":
+            # 解析流水线已结束（job 进入终态 completed/skipped，或 has_guide 且无 job 但已 indexed）。
+            # indexed 为 False 多为「0 chunk 的退化完成」——仍需给前端明确的「解析结束」信号，
+            # 不能落到 pending 与「未开始」混淆；用 parsed 区分「已解析完成、暂不可问答」。
+            overall = "ready" if status.indexed else "parsed"
         elif status.indexed:
             overall = "ready"
         else:
