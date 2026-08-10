@@ -310,7 +310,9 @@ def prepare_document(
         logger.info("force=True，清空文档 %s 的历史 chunk 与 QA", document_id)
         store.purge_document(document_id)
 
-    shards = plan_shards(total_pages, settings.dm_extract_pages_per_shard)
+    # 注意：分片已在上面按格式各自规划好（PDF 按页、Word 按文本单元），
+    # 这里不能再统一重规划——否则 Word 的分片区间会被当成「伪页码」区间，
+    # extract_shard 只会提取前 N 个段落，手册正文几乎全部丢失。
     store.update_job(
         job_id,
         {
