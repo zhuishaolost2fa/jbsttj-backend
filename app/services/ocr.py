@@ -78,6 +78,10 @@ def get_ocr_client(settings) -> "OcrClient":
     # 这里把读超时放宽到 60s、连接超时 10s，避免单页超时把整本 OCR 拖垮。
     config.read_timeout = 60000
     config.connect_timeout = 10000
+    # 扫描件渲染出的 PNG 较大，向阿里云上传识别请求时写超时也会触发
+    # （日志曾出现 'The write operation timed out'）；放宽到 60s 让单页失败快速返回，
+    # 由 extract_shard 的 try/except 吞掉并跳过，而不是把整本 OCR 拖死。
+    config.write_timeout = 60000
     return OcrClient(config)
 
 

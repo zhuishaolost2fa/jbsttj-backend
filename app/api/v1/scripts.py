@@ -90,7 +90,7 @@ async def list_scripts(
         "- `playstyles` / `themes` / `release_type` / `difficulty` 必须是字典里真实存在的编码，"
         "传错会返回 422 并在 `details.allowed` 里列出全部可选值；\n"
         "- 人数与时长必须成对提供上下限；\n"
-        "- `extra.dmGuide.objectKey` 里挂了 PDF 时，会在响应返回后自动触发手册解析入库，"
+        "- `extra.dmGuide.objectKey` 里挂了 PDF 或 Word(.docx) 时，会在响应返回后自动触发手册解析入库，"
         "进度用 `GET /scripts/{id}/dm-guide` 查看。"
     ),
 )
@@ -154,7 +154,7 @@ async def get_script(
         "只提交需要变更的字段，未出现在请求体中的字段保持原值；"
         "显式传 `null` 表示把该字段清空。\n\n"
         "只改区间的一侧（如只传 `player_min`）会被拒绝，避免写出半截区间导致范围查询漏数据。\n\n"
-        "更新后若 `extra.dmGuide.objectKey` 指向了一份尚未建索引的 PDF，会自动触发手册解析。"
+        "更新后若 `extra.dmGuide.objectKey` 指向了一份尚未建索引的 PDF 或 Word(.docx)，会自动触发手册解析。"
     ),
 )
 async def patch_script(

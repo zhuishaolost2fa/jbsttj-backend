@@ -30,3 +30,5 @@ pymupdf>=1.24.3
 langchain-text-splitters>=1.0.0
 # 阿里云 OCR（文字识别）：处理扫描件 / 图片型 PDF，复用 OSS 的 AccessKey
 alibabacloud-ocr-api20210707>=3.1.2
+# Word / Office 文档（.docx）文本提取：自带文字层，无需 OCR，流水线直接复用 PDF 的分块逻辑
+python-docx>=1.1.0

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import tempfile
 import time
@@ -77,6 +78,10 @@ from app.services.pdf_extract import (
     plan_shards,
     probe_page_count,
     strip_noise,
+)
+from app.services.doc_extract import (
+    extract_shard as doc_extract_shard,
+    probe_unit_count as doc_probe_unit_count,
 )
 from app.tasks.celery_app import celery_app, celery_available
 
@@ -119,12 +124,17 @@ def _cache_dir() -> Path:
 
 
 def _cache_name(object_key: str) -> str:
-    """用 object_key 的摘要做缓存文件名。
+    """用 object_key 的摘要做缓存文件名，保留原扩展名。
 
     直接拿 object_key 当文件名会踩两个坑：里面有 `/` 会被当成目录，
     中文文件名在不同 worker 的 locale 下编码还可能不一致。
+    保留扩展名是为了让 python-docx / PyMuPDF 按内容正确识别格式，
+    也方便在缓存目录里人工区分 PDF 与 Word。
     """
-    return hashlib.sha1(object_key.encode("utf-8")).hexdigest() + ".pdf"
+    ext = ".pdf"
+    if "." in object_key:
+        ext = "." + object_key.rsplit(".", 1)[-1].lower()
+    return hashlib.sha1(object_key.encode("utf-8")).hexdigest() + ext
 
 
 def sha256_file(path: str, *, chunk_size: int = 1 << 20) -> str:
@@ -139,9 +149,10 @@ def sha256_file(path: str, *, chunk_size: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
-def ensure_local_pdf(object_key: str, *, expected_size: int = 0) -> Tuple[str, int]:
-    """确保 PDF 已在本地，返回 (路径, 字节数)。
+def ensure_local_file(object_key: str, *, expected_size: int = 0) -> Tuple[str, int]:
+    """确保手册文件已在本地，返回 (路径, 字节数)。
 
+    PDF 与 Word(.docx) 共用同一套缓存与下载逻辑，只靠扩展名区分格式。
     T0 和每个 T1 都会调用它。同机多 worker 时第一个把文件拉下来，
     其余直接命中缓存；跨机部署时各机器各下一份，逻辑无需区分。
 
@@ -155,14 +166,14 @@ def ensure_local_pdf(object_key: str, *, expected_size: int = 0) -> Tuple[str, i
         size = target.stat().st_size
         # 有 expected_size 时校验，防止上次下载中断留下的残缺文件被当成有效缓存
         if size > 0 and (not expected_size or size == expected_size):
-            logger.debug("命中本地 PDF 缓存: %s (%s 字节)", target, size)
+            logger.debug("命中本地文件缓存: %s (%s 字节)", target, size)
             return str(target), size
         logger.warning("本地缓存大小异常(%s != %s)，重新下载", size, expected_size)
         target.unlink(missing_ok=True)
 
     if expected_size and expected_size > settings.dm_max_pdf_bytes:
         raise StorageError(
-            f"PDF 体积 {expected_size} 字节超过上限 {settings.dm_max_pdf_bytes} 字节"
+            f"手册体积 {expected_size} 字节超过上限 {settings.dm_max_pdf_bytes} 字节"
         )
 
     from app.services.oss import get_oss_service
@@ -172,14 +183,14 @@ def ensure_local_pdf(object_key: str, *, expected_size: int = 0) -> Tuple[str, i
     try:
         size = get_oss_service().download_to_file_sync(object_key, str(tmp_path))
         if size > settings.dm_max_pdf_bytes:
-            raise StorageError(f"PDF 体积 {size} 字节超过上限")
+            raise StorageError(f"手册体积 {size} 字节超过上限")
         os.replace(tmp_path, target)
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
 
     logger.info(
-        "PDF 下载完成: %s (%.1f MB, 耗时 %.1fs)",
+        "手册下载完成: %s (%.1f MB, 耗时 %.1fs)",
         object_key, size / 1024 / 1024, time.time() - started,
     )
     return str(target), size
@@ -210,17 +221,34 @@ def prepare_document(
         job_id,
         {
             "status": JOB_DOWNLOADING,
-            "stage_detail": "正在从 OSS 下载 PDF",
+            "stage_detail": "正在从 OSS 下载手册",
             "started_at": "now()",
             "celery_task_id": getattr(request, "id", None),
         },
     )
 
-    local_path, size = ensure_local_pdf(object_key, expected_size=file_size)
+    local_path, size = ensure_local_file(object_key, expected_size=file_size)
     content_hash = sha256_file(local_path)
-    total_pages = probe_page_count(local_path)
-    if total_pages <= 0:
-        raise StorageError("PDF 页数为 0，文件可能已损坏")
+
+    # ---- 按扩展名分支：PDF 按页规划分片，Word(.docx) 按文本单元规划 ----
+    # 两者最终都产出 ShardResult，下游 chunk_and_dedup 等完全复用，无需 OCR。
+    ext = object_key.rsplit(".", 1)[-1].lower() if "." in object_key else ""
+    is_docx = ext == "docx"
+    if is_docx:
+        doc_format = "docx"
+        total_units = doc_probe_unit_count(local_path)
+        if total_units <= 0:
+            raise StorageError("Word 文档未解析出任何文本，文件可能已损坏或为空")
+        # 无真页码，用伪页码（每 blocks_per_page 个单元算一页）做展示与跨片续接
+        total_pages = max(1, math.ceil(total_units / max(1, settings.dm_docx_blocks_per_page)))
+        shards = plan_shards(total_units, settings.dm_extract_blocks_per_shard)
+    else:
+        doc_format = "pdf"
+        total_units = probe_page_count(local_path)
+        if total_units <= 0:
+            raise StorageError("PDF 页数为 0，文件可能已损坏")
+        total_pages = total_units
+        shards = plan_shards(total_units, settings.dm_extract_pages_per_shard)
 
     document = store.upsert_document(
         {
@@ -312,8 +340,9 @@ def prepare_document(
         extract_shard.s(
             object_key=object_key,
             shard_index=i,
-            page_start=start,
-            page_end=end,
+            unit_start=start,
+            unit_end=end,
+            doc_format=doc_format,
             file_size=size,
             job_id=job_id,
         )
@@ -345,23 +374,41 @@ def extract_shard(
     *,
     object_key: str,
     shard_index: int,
-    page_start: int,
-    page_end: int,
+    unit_start: int,
+    unit_end: int,
+    doc_format: str = "pdf",
     file_size: int = 0,
     job_id: str = "",
 ) -> Dict[str, Any]:
-    """提取 [page_start, page_end] 的结构化文本，返回可 JSON 化的分片结果。"""
-    from app.services.pdf_extract import extract_shard as do_extract
+    """提取 [unit_start, unit_end]（1-based，全局单元序号）的结构化文本。
 
-    local_path, _ = ensure_local_pdf(object_key, expected_size=file_size)
+    PDF 的「单元」是页，Word(.docx) 的「单元」是段落+表格行。两者都返回
+    可 JSON 化的 ShardResult，下游合并/分块/向量化逻辑完全复用，无需 OCR。
+    """
+    local_path, _ = ensure_local_file(object_key, expected_size=file_size)
     started = time.time()
 
-    result = do_extract(
-        local_path,
-        shard_index=shard_index,
-        page_start=page_start,
-        page_end=page_end,
-    )
+    if doc_format == "docx":
+        # Word 自带文字层，直接提取，不做 OCR
+        result = doc_extract_shard(
+            local_path,
+            shard_index=shard_index,
+            unit_start=unit_start,
+            unit_end=unit_end,
+            blocks_per_page=get_settings().dm_docx_blocks_per_page,
+        )
+        page_start, page_end = unit_start, unit_end
+    else:
+        from app.services.pdf_extract import extract_shard as do_extract
+
+        result = do_extract(
+            local_path,
+            shard_index=shard_index,
+            page_start=unit_start,
+            page_end=unit_end,
+        )
+        # OCR 兜底分支依赖 page_start/page_end 表示本片覆盖的页区间
+        page_start, page_end = unit_start, unit_end
 
     # ---- OCR 兜底：图片型 / 扫描件 PDF ----
     # 某页抽不到文字块、但有图片（PDF 是整页扫描），交给阿里云 OCR 识别后并回块列表。
@@ -439,7 +486,9 @@ def chunk_and_dedup(
 
     shards = [ShardResult.from_dict(p) for p in shard_payloads if p]
     if not shards:
-        raise AppError("所有提取分片均无结果，PDF 可能是纯扫描件（需要 OCR）")
+        raise AppError(
+            "所有提取分片均无结果，文档可能为空、纯图片扫描件（需 OCR）或损坏"
+        )
 
     blocks, total_pages = merge_shards(shards)
     blocks, dropped_noise = strip_noise(

@@ -85,14 +85,27 @@ class DMGuideService:
 
         if not ref:
             raise ValidationError(
-                "该剧本未关联 DM 主持人手册，请先上传 PDF 并写入 extra.dmGuide",
+                "该剧本未关联 DM 主持人手册，请先上传 PDF / Word 并写入 extra.dmGuide",
                 code="dm_guide_missing",
             )
 
         key = ref.object_key
-        if not key.lower().endswith(".pdf"):
+        # 目前支持 PDF（走 PyMuPDF + 可选 OCR）与 Word(.docx)（python-docx 直接读文字层）。
+        # 老版二进制 .doc 没有现成免费解析库，明确拒绝并提示另存为 .docx。
+        lower = key.lower()
+        if lower.endswith(".docx"):
+            pass
+        elif lower.endswith(".pdf"):
+            pass
+        elif lower.endswith(".doc"):
             raise ValidationError(
-                f"DM 手册目前只支持 PDF，收到：{key}", code="dm_guide_not_pdf"
+                f"不支持旧版二进制 .doc，请用 Word 另存为 .docx 后上传：{key}",
+                code="dm_guide_not_doc",
+            )
+        else:
+            raise ValidationError(
+                f"DM 手册目前只支持 PDF 或 Word(.docx)，收到：{key}",
+                code="dm_guide_not_pdf",
             )
 
         limit = self._settings.dm_max_pdf_bytes

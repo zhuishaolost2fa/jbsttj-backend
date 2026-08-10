@@ -2,7 +2,7 @@
 
 > 本清单与项目现有文件严格对齐：`Dockerfile`（FastAPI API + 4 个 Celery worker，单镜像由 supervisord 编排）、`railway.json`、`supervisord.conf`、`.dockerignore`（已排除 `.env`，**镜像内不含任何密钥**）。
 >
-> 部署目标：把"后端 API + 4 个队列 worker"托管到 Railway；RabbitMQ 与 Redis 用外部 add-on；Supabase / 阿里云 OSS·OCR / SiliconFlow 都是远程服务，直接注入密钥即可。
+> 部署目标：把"后端 API + 4 个队列 worker"托管到 Railway；Celery 队列（broker / backend / 去重）统一用 Railway 自带 Redis；Supabase / 阿里云 OSS·OCR / SiliconFlow 都是远程服务，直接注入密钥即可。
 
 ---
 
@@ -38,20 +38,35 @@
 
 ---
 
-## 第三步：添加两个 add-on（RabbitMQ + Redis）
+## 第三步：添加 Redis add-on（Celery broker + backend + 去重都用它）
 
-本镜像内 **不打包** RabbitMQ/Redis，需外部托管。
+Railway 自带的 Add-on 里**没有 CloudAMQP / RabbitMQ**，而 Celery 支持用 Redis 做消息队列，所以本方案统一用 Redis：
 
-### 3.1 RabbitMQ → 用 CloudAMQP（第三方 add-on）
-1. Railway 项目内 **New → Add-on → CloudAMQP**。
-2. 选 plan（见下方"坑①"关于免费版连接数限制）。
-3. 创建后，在 CloudAMQP 的 Variables / Connection 里拿到 `CLOUDAMQP_URL`（形如 `amqp://user:pass@lionfish.rmq.cloudamqp.com/instancename`）。
+- **broker**：Celery 收发任务（Redis 库 0）
+- **result_backend**：任务结果存储（Redis 库 2）
+- **dedup**：去重集合（Redis 库 1）
 
-### 3.2 Redis → 用 Railway 自带 Redis（推荐，长连接友好）
-1. Railway 项目内 **New → Add-on → Redis**（Railway 官方 Redis，比 Upstash serverless 更适合 Celery 长连接）。
-2. 创建后在 Redis 服务的 Variables 里拿到 `REDIS_URL`（形如 `redis://default:password@containers-us-east-1.railway.app:6379`）。
+### 3.1 创建 Redis
+1. Railway 项目内 **New → Add-on → Redis**（在 Database 分类下，你截图里能直接看到 Redis）。
+2. 选 plan 后创建。
+3. 创建后 Redis service 自身会生成变量 `REDIS_URL`，**不会自动同步到你的 `jbsttj-backend` service**，需要下一步手动做 Variable Reference。
 
-> 若改用 Upstash，注意它是 serverless Redis，Celery worker 保持长连接可能触发连接数/命令限制，生产不推荐。
+### 3.2 把 `REDIS_URL` 透传给后端 service（关键）
+
+Redis 的变量默认只属于 Redis 服务，你的后端读不到。必须做这一步：
+
+**推荐：Variable Reference（Redis 密码/地址变了会自动同步）**
+1. 进入 Redis service 面板 → 上方 **Variables** 标签。
+2. 看到紫色提示条 "Trying to connect this database to a service? Add a Variable Reference" → 点击 **Variable Reference**。
+3. 目标 service 选择 **`jbsttj-backend`**。
+4. 完成后，`jbsttj-backend` 的 Variables 里会出现一个 `REDIS_URL`。
+
+**备选：手动复制**
+- 在 Redis 面板点 `REDIS_URL` 旁的眼睛图标显示完整值，复制后去 `jbsttj-backend` → Variables 里新建同名变量。缺点：Redis 重置密码/迁移后需手动更新。
+
+### 3.3 为什么不单独搞 RabbitMQ
+- Railway 官方 Add-on 没有 RabbitMQ，CloudAMQP 在很多账号/区域已不可见（你截图里 Database 列表就没有）。
+- Redis 作为 broker 对本项目完全够用，且 Railway Redis 是长连接友好型，比 Upstash serverless Redis 更适合 Celery worker。
 
 ---
 
@@ -81,9 +96,9 @@
 | `APP_ENV` | `production` | |
 | `DEBUG` | `false` | |
 | `CELERY_EAGER` | **`false`** | ★**上线最重要的一项**。本地是 `true`（同步跑免 broker）；上 Railway 必须改 `false`，否则 4 个 worker 形同虚设，任务退回 web 进程同步执行。 |
-| `CELERY_BROKER_URL` | CloudAMQP 的 `CLOUDAMQP_URL` | ★不能用 `127.0.0.1` |
-| `CELERY_RESULT_BACKEND` | Railway Redis 的 `REDIS_URL`（库 0） | ★ |
-| `CELERY_REDIS_URL` | 同 `REDIS_URL`（库 1，去重集合） | ★可改写为 `redis://.../1` |
+| `CELERY_BROKER_URL` | `${{REDIS_URL}}/0` | ★不能用 `127.0.0.1`；用 Railway Redis 库 0 当 broker |
+| `CELERY_RESULT_BACKEND` | `${{REDIS_URL}}/2` | ★用 Railway Redis 库 2 存任务结果 |
+| `CELERY_REDIS_URL` | `${{REDIS_URL}}/1` | ★用 Railway Redis 库 1 做去重集合 |
 | `CORS_ORIGINS` | `https://你的vercel域名,http://localhost:5173` | ★必须加 Vercel 前端域名，否则浏览器跨域被拦；生产不要用 `*` |
 
 > 变量名全部来自 `app/core/config.py` 与 `.env.example`，一一对应，无需改代码。
@@ -112,7 +127,7 @@ POST /api/v1/dm/guides/{code}/ingest   # 例如 code=dm-bingjiao-nanhai
 ```
 然后在 Railway 日志看 4 个 worker 是否依次消费 `dm.extract → dm.chunk → dm.qa → dm.embed` 队列。
 
-**方式 B：** 本地把 `.env` 的 `CELERY_EAGER` 临时改 `false`、`CELERY_BROKER_URL` 指向 CloudAMQP，再跑 `scripts/drive_dm_ingest.py --force`——任务会发到云端队列，由 Railway 上的 worker 消费。验证完记得把本地 `.env` 改回 `true` 不影响。
+**方式 B：** 本地把 `.env` 的 `CELERY_EAGER` 临时改 `false`、`CELERY_BROKER_URL` 指向 Railway Redis（`${{REDIS_URL}}/0`），再跑 `scripts/drive_dm_ingest.py --force`——任务会发到云端队列，由 Railway 上的 worker 消费。验证完记得把本地 `.env` 改回 `true` 不影响。
 
 验证通过标志：Supabase 的 `dm_chunks` / `dm_qa_pairs` 新增行，且检索接口能召回。
 
@@ -129,16 +144,65 @@ POST /api/v1/dm/guides/{code}/ingest   # 例如 code=dm-bingjiao-nanhai
 
 ## 常见坑速查
 
-- **坑① CloudAMQP 免费版连接数**：Little Lemur 免费档并发连接受限；本服务共 5 个连接（web×1 + 4 worker）。免费档可能不够 → 升级 CloudAMQP plan，或把 `supervisord.conf` 里部分 worker 并发/数量调低。
+- **坑⚠ 部署后 worker 日志报 `Connection refused ... amqp://guest:**@127.0.0.1:5672//`**：说明 worker 仍在用 `config.py` 的默认值，即 `CELERY_BROKER_URL` **未生效**（最常见原因：漏设、名字拼错成 `BROKER_URL`/`CELERY_BROKER`、或设到了别的 service）。
+  - 修法：Railway 控制台 → 你的项目 → **Variables → New Variable**，Name 必须精确是 `CELERY_BROKER_URL`，Value 填 `${{REDIS_URL}}/0`（指向 Railway Redis 库 0）。保存后 Railway 自动重部署。
+  - 如果日志里变成连 Redis 失败（不再是 amqp 报错），说明 broker 变量已被读到，只是 Redis URL 不对，检查 `REDIS_URL` 是否已注入。
+  - supervisord 默认会继承容器环境，变量设对就能被 worker 读到；**不要**去改 `supervisord.conf` 显式透传这三个变量——变量万一缺失时 `%(ENV_X)s` 无法展开会导致 supervisord 启动失败，整容器挂掉。
+  - 同样要确认 `CELERY_RESULT_BACKEND=${{REDIS_URL}}/2` / `CELERY_REDIS_URL=${{REDIS_URL}}/1` 也已设置。
+- **坑① Redis 连接数**：Railway Redis 默认对连接数有限制，本服务共 5 个常驻连接（web×1 + 4 worker）。如果部署后 worker 频繁断开，先升级到更高 plan；或临时把 `supervisord.conf` 里部分 worker 数量调低。
 - **坑② `CELERY_EAGER` 忘了改 false**：worker 不干活，任务全堆在 web 进程，部署看似成功但队列不动。
 - **坑③ broker 仍写 `127.0.0.1`**：Railway 上连不上，worker 启动即报错退出。
 - **坑④ CORS 没加 Vercel 域名**：前端能打开但请求被浏览器拦截。
 - **坑⑤ 镜像带进 `.env`**：违反 `.dockerignore` 约定，密钥泄露风险；当前已排除，勿手动 COPY。
 - **坑⑥ 改了 embed 模型名**：`BAAI/bge-large-zh-v1.5` 固定 1024 维，若换模型须同步改 `sql/dm_rag.sql` 的 `vector(N)` 与已建索引。
+- **坑⑦ `/ready` 返回 503 且报 `EntityNotExist.Role` / STS AssumeRole 失败**：`OSS_USE_STS=true` 会强制走 STS 临时凭证，需 `AssumeRole` 一个 RAM 角色；若该角色（`OSS_STS_ROLE_ARN`，如 `acs:ram::<uid>:role/ossuploadrole`）在你的阿里云账号里不存在就报 404。后端自身上传用长期 AccessKey 即可，无需 STS → **在 Variables 设 `OSS_USE_STS=false`**（OSS 改走 `StaticCredentialsProvider` 用 `OSS_ACCESS_KEY_ID/SECRET`）。`OSS_STS_*` 变量可保留（被忽略）。仅当未来前端要"浏览器直传 OSS"时才需真正创建该 RAM 角色并挂 OSS 权限。
 
 ---
+
+## 根据你的截图状态：必须修改的变量清单
+
+你的 Railway Variables 目前大量还是 `.env.example` 里的占位符（如 `your-project-ref.supabase.co`、`your-oss-access-key-secret`、`your-bucket-name`、`eyJhbGciOi..anon..`），且缺了 Celery 的三个关键变量。必须按下面四组改：
+
+### A. 必须改成真实值（从本地 `.env` 复制）
+| 变量名 | 当前问题 | 改法 |
+|---|---|---|
+| `SUPABASE_URL` | 示例值 `https://your-project-ref.supabase.co` | 改为本地 `.env` 的真实 Supabase URL |
+| `SUPABASE_ANON_KEY` | 示例值 `eyJhbGciOi..anon..` | 改为本地 `.env` 的真实 anon key |
+| `SUPABASE_SERVICE_ROLE_KEY` | 示例值 `eyJhbGciOi..service_role..` | 改为本地 `.env` 的真实 service_role key |
+| `SUPABASE_JWT_SECRET` | 示例值 `your-super-secret...` | 改为本地 `.env` 的真实 JWT secret；如果用 JWKS 可留空此字段并填 `SUPABASE_JWKS_URL` |
+| `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_ENDPOINT` / `OSS_REGION` / `OSS_BUCKET` | 部分仍是占位符 | 全部改为本地 `.env` 的真实值 |
+| `SILICONFLOW_API_KEY` / `SILICONFLOW_CHAT_MODEL` / `SILICONFLOW_EMBED_MODEL` / `SILICONFLOW_BASE_URL` | 截图里还没出现 | 新增；从本地 `.env` 复制（`sk-phg…` 那个 key） |
+
+### B. 必须改为 add-on 提供的值（不能从本地 `.env` 直接复制）
+| 变量名 | 来源 | 注意 |
+|---|---|---|
+| `CELERY_BROKER_URL` | Railway Redis add-on 的 `REDIS_URL`，末尾加 `/0` | 本地 `.env` 是 `127.0.0.1`，**不能直接复制** |
+| `CELERY_RESULT_BACKEND` | Railway Redis add-on 的 `REDIS_URL`，末尾加 `/2` | 任务结果存库 2 |
+| `CELERY_REDIS_URL` | Railway Redis add-on 的 `REDIS_URL`，末尾加 `/1` | 去重集合用库 1 |
+
+### C. 建议立即改（生产行为）
+- `APP_ENV`：`development` → `production`
+- `DEBUG`：`true` → `false`
+- `CORS_ORIGINS`：在现有 localhost 后面追加你的 Vercel 域名，例如：
+  `http://localhost:5173,http://localhost:3000,http://127.0.0.1:8000,https://你的项目.vercel.app`
+
+### D. 缺失但建议新增的 RAG 相关变量
+截图里还没出现，建议从本地 `.env` 一起新增：
+- `EMBEDDING_MAX_CHARS=480`
+- `EMBEDDING_BATCH_SIZE=32`
+- `LLM_MAX_CONCURRENCY=4`
+- `CELERY_EAGER=false` ★ 否则 worker 不干活
+- `CELERY_TASK_SOFT_TIME_LIMIT=1500`
+- `CELERY_TASK_TIME_LIMIT=1800`
+- `CELERY_WORKER_PREFETCH=1`
+- `OCR_ENDPOINT=ocr-api.cn-hangzhou.aliyuncs.com`
+- `OCR_TYPE=General`
+- `OCR_DPI=130`
+- 各种 `DM_*` 参数（可保留默认值）
+
+> 不要直接上传本地 `.env` 到 Railway。本地 broker/redis 指向 `127.0.0.1`，上云必须指向 Railway Redis。推荐用 Railway Variables 的 **Raw Editor** 批量粘贴，但记得把 broker/backend/dedup 三处 `127.0.0.1` 手动换成 `${{REDIS_URL}}/N`。
 
 ## 当前本地状态备忘
 
 - 本地 `.env` 仍是 `CELERY_EAGER=true`（免 broker 同步模式，便于本地验证）。**上线 Railway 前在 Railway 变量里设 `false` 即可，不必改本地文件。**
-- 检索已优化为"qa 为主"（hybrid 下 qa 满额、chunk 补充），相关配置 `DM_SEARCH_TOP_K` / `DM_SEARCH_MIN_SIMILARITY` / `DM_SEARCH_QA_SUPPLEMENT_K` / `DM_SEARCH_QA_BOOST` 已在 `config.py`。
+- 检索已优化为"qa 为主"（hybrid 下 qa 满额、chunk 补充），相关配置 `DM_SEARCH_TOP_K` / `DM_SEARCH_MIN_SIMILARITY` / `DM_SEARCH_QA_SUPPLEMENT_K` / `DM_SEARCH_QA_BOOST` 已在 `config.py`。`

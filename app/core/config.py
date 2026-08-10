@@ -126,6 +126,12 @@ class Settings(BaseSettings):
     # ---------------- DM 指南 RAG 流水线 ----------------
     # 每个提取任务负责多少页：太小则任务调度开销占比高，太大则单任务耗时长、失败重试代价大
     dm_extract_pages_per_shard: int = 20
+    # Word(.docx) 提取没有「页」概念，分片以文本单元（段落+表格行）为单位。
+    # 每个提取任务负责的单元数；Word 解析是纯文本、无 OCR/渲染，可以比 PDF 的 20 页更大。
+    dm_extract_blocks_per_shard: int = 400
+    # 把 Word 无页码的文本单元映射成「伪页码」：每 N 个单元算一页，
+    # 用于兼容下游基于 page 的跨片续接与检索结果出处展示。
+    dm_docx_blocks_per_page: int = 40
     # 结构化粗分的目标块大小（字符数）与重叠
     dm_chunk_size: int = 800
     dm_chunk_overlap: int = 120
