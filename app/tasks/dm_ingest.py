@@ -660,7 +660,12 @@ def chunk_and_dedup(
                 script_id=script_id,
                 script_title=script_title,
             ),
-            embed_and_store.s(job_id=job_id, document_id=document_id, script_id=script_id),
+            embed_and_store.s(
+                job_id=job_id,
+                document_id=document_id,
+                script_id=script_id,
+                total_chunks=len(kept),
+            ),
         )
         for batch in batches
     ]
@@ -705,7 +710,16 @@ def generate_qa(
     pairs: List[QAPair] = get_llm_client().generate_qa(chunks, script_title=script_title)
 
     if job_id and pairs:
-        get_dm_store().bump_job(job_id, total_qa=len(pairs))
+        store = get_dm_store()
+        row = store.bump_job(job_id, total_qa=len(pairs))
+        # T3 是全流程最慢的一环（每批一次 LLM 调用），必须让 stage_detail
+        # 体现累计进度，否则前端只看到状态长期停在 generating_qa 一动不动。
+        # bump_job 的 RPC 返回累加后的整行，直接取累计值，避免读-改-写竞态。
+        if row:
+            store.bump_job(
+                job_id,
+                stage_detail=f"问答对生成中：已累计 {row.get('total_qa', 0)} 条",
+            )
 
     return {
         "chunks": chunks,
@@ -724,6 +738,7 @@ def embed_and_store(
     job_id: str,
     document_id: str,
     script_id: str,
+    total_chunks: int = 0,
 ) -> Dict[str, Any]:
     """把一批 chunk 与其问答对向量化后写入 Supabase。"""
     chunks: List[Dict[str, Any]] = list(payload.get("chunks") or [])
@@ -794,12 +809,17 @@ def embed_and_store(
         store.insert_qa(qa_rows)
 
     if job_id:
+        # stage_detail 用累计口径：以库内实际行数为准（与 finalize 同一真相源），
+        # 重试不会虚高；也不再出现「每批都只显示本批数量、看起来像卡住」的问题。
+        done_chunks = store.count_chunks(document_id)
+        done_qa = store.count_qa(document_id)
+        total_txt = f"/{total_chunks}" if total_chunks else ""
         store.bump_job(
             job_id,
             status=JOB_EMBEDDING,
             embedded_chunks=len(chunk_rows),
             embedded_qa=len(qa_rows),
-            stage_detail=f"已向量化 {len(chunk_rows)} 块 / {len(qa_rows)} 问答",
+            stage_detail=f"已向量化 {done_chunks}{total_txt} 块 / {done_qa} 问答",
         )
 
     logger.info(
