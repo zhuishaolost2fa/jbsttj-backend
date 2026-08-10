@@ -43,10 +43,12 @@
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import logging
 import math
 import os
+import subprocess
 import tempfile
 import time
 import uuid
@@ -167,7 +169,7 @@ def ensure_local_file(object_key: str, *, expected_size: int = 0) -> Tuple[str, 
         # 有 expected_size 时校验，防止上次下载中断留下的残缺文件被当成有效缓存
         if size > 0 and (not expected_size or size == expected_size):
             logger.debug("命中本地文件缓存: %s (%s 字节)", target, size)
-            return str(target), size
+            return _finalize_local_file(target, settings)
         logger.warning("本地缓存大小异常(%s != %s)，重新下载", size, expected_size)
         target.unlink(missing_ok=True)
 
@@ -193,7 +195,71 @@ def ensure_local_file(object_key: str, *, expected_size: int = 0) -> Tuple[str, 
         "手册下载完成: %s (%.1f MB, 耗时 %.1fs)",
         object_key, size / 1024 / 1024, time.time() - started,
     )
-    return str(target), size
+    return _finalize_local_file(target, settings)
+
+
+# ============================================================
+# 旧版 .doc → .docx 本地转换（LibreOffice 无头模式，离线免费）
+# ============================================================
+def _find_libreoffice() -> str:
+    """探测 LibreOffice 可执行文件；找不到返回空串。"""
+    import shutil
+
+    for name in ("soffice", "libreoffice", "soffice.bin"):
+        path = shutil.which(name)
+        if path:
+            return path
+    candidates = [
+        "/usr/bin/soffice",
+        "/opt/libreoffice/program/soffice",
+        "C:/Program Files/LibreOffice/program/soffice.exe",
+        "C:/Program Files (x86)/LibreOffice/program/soffice.exe",
+    ]
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _convert_doc_to_docx(doc_path: str, *, libreoffice_path: str = "") -> Optional[str]:
+    """用 LibreOffice 无头模式把 .doc 转成 .docx，返回产出的 .docx 路径。
+
+    输出到临时目录后由调用方改名落盘，避免 LibreOffice 对输出文件名不可控的问题。
+    """
+    soffice = libreoffice_path or _find_libreoffice()
+    if not soffice:
+        raise RuntimeError(
+            "未找到 LibreOffice，无法转换 .doc。请安装 LibreOffice，"
+            "或先用 Word 另存为 .docx 后再上传。"
+        )
+    out_dir = tempfile.mkdtemp(prefix="jbs-docconv-")
+    cmd = [soffice, "--headless", "--convert-to", "docx", "--outdir", out_dir, doc_path]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+    except subprocess.CalledProcessError as exc:  # noqa: BLE001
+        raise RuntimeError(f"LibreOffice 转换 .doc 失败: {exc.stderr or exc}") from exc
+    produced = glob.glob(os.path.join(out_dir, "*.docx"))
+    if not produced:
+        raise RuntimeError("LibreOffice 转换 .doc 未产出 .docx 文件")
+    return produced[0]
+
+
+def _finalize_local_file(target: Path, settings) -> Tuple[str, int]:
+    """下载/命中缓存后做收尾：若是旧版 .doc，先本地转成 .docx 再返回。"""
+    if target.suffix.lower() == ".doc":
+        converted = target.with_name(target.name + ".converted.docx")
+        if not converted.exists():
+            try:
+                produced = _convert_doc_to_docx(
+                    str(target), libreoffice_path=settings.libreoffice_path
+                )
+                if produced and os.path.exists(produced):
+                    os.replace(produced, converted)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("自动转换 .doc 失败（将按原文件处理）: %s", exc)
+        if converted.exists():
+            return str(converted), converted.stat().st_size
+    return str(target), target.stat().st_size
 
 
 # ============================================================
@@ -230,10 +296,16 @@ def prepare_document(
     local_path, size = ensure_local_file(object_key, expected_size=file_size)
     content_hash = sha256_file(local_path)
 
-    # ---- 按扩展名分支：PDF 按页规划分片，Word(.docx) 按文本单元规划 ----
+    # ---- 按真实落盘后缀分支：PDF 按页规划分片，Word(.docx) 按文本单元规划 ----
     # 两者最终都产出 ShardResult，下游 chunk_and_dedup 等完全复用，无需 OCR。
-    ext = object_key.rsplit(".", 1)[-1].lower() if "." in object_key else ""
-    is_docx = ext == "docx"
+    # .doc 已在 ensure_local_file 里被 LibreOffice 本地转成 .docx，这里拿到的是 .docx。
+    local_ext = Path(local_path).suffix.lower().lstrip(".")
+    is_docx = local_ext == "docx"
+    if object_key.lower().endswith(".doc") and not is_docx:
+        raise StorageError(
+            "旧版 .doc 需要本地 LibreOffice 才能转成 .docx，但未找到可用的 LibreOffice。"
+            "请安装 LibreOffice，或先用 Word 另存为 .docx 后上传。"
+        )
     if is_docx:
         doc_format = "docx"
         total_units = doc_probe_unit_count(local_path)
@@ -422,33 +494,34 @@ def extract_shard(
         pages_with_text = {b.page for b in result.blocks}
         need_ocr = [p for p in range(page_start, page_end + 1) if p not in pages_with_text]
     if need_ocr:
-        try:
-            from app.services.ocr import (
-                blocks_from_ocr,
-                get_ocr_client,
-                ocr_image,
-                render_page_png,
-            )
+        from app.services.ocr import blocks_from_ocr, ocr_image, render_page_png
 
-            settings = get_settings()
-            client = get_ocr_client(settings)
-            ocr_hits = 0
-            for pno in need_ocr:
-                try:
-                    png = render_page_png(local_path, pno, settings.ocr_dpi)
-                    text = ocr_image(client, png, settings.ocr_type)
-                except Exception as exc:  # noqa: BLE001 - 单页失败不中断整本
-                    logger.warning("OCR 第 %s 页失败，跳过：%s", pno, exc)
-                    continue
-                if text:
-                    result.blocks.extend(blocks_from_ocr(text, pno))
-                    ocr_hits += 1
-            if ocr_hits:
-                logger.info("分片 %s OCR 兜底识别了 %s 页", shard_index, ocr_hits)
-        except Exception as exc:  # noqa: BLE001 - 客户端构建失败等整体异常
-            logger.warning(
-                "OCR 客户端不可用（可能未开通阿里云文字识别服务或缺少密钥）：%s", exc
-            )
+        settings = get_settings()
+        engine = (settings.ocr_engine or "aliyun").lower()
+        # 本地免费引擎不需要 aliyun client；只有 aliyun 才去构建客户端，
+        # 拿不到密钥时整段跳过，不再把扫描件当纯噪声丢进噪声统计。
+        client = None
+        if engine == "aliyun":
+            try:
+                from app.services.ocr import get_ocr_client
+
+                client = get_ocr_client(settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("阿里云 OCR 客户端不可用，跳过 OCR 兜底：%s", exc)
+                need_ocr = []
+        ocr_hits = 0
+        for pno in need_ocr:
+            try:
+                png = render_page_png(local_path, pno, settings.ocr_dpi)
+                text = ocr_image(client, png, settings.ocr_type, engine=engine)
+            except Exception as exc:  # noqa: BLE001 - 单页失败不中断整本
+                logger.warning("OCR 第 %s 页失败，跳过：%s", pno, exc)
+                continue
+            if text:
+                result.blocks.extend(blocks_from_ocr(text, pno))
+                ocr_hits += 1
+        if ocr_hits:
+            logger.info("分片 %s OCR 兜底识别了 %s 页（引擎=%s）", shard_index, ocr_hits, engine)
 
     elapsed = time.time() - started
     logger.info(

@@ -126,13 +126,12 @@ class DMGuideService:
         elif lower.endswith(".pdf"):
             pass
         elif lower.endswith(".doc"):
-            raise ValidationError(
-                f"不支持旧版二进制 .doc，请用 Word 另存为 .docx 后上传：{key}",
-                code="dm_guide_not_doc",
-            )
+            # 旧版二进制 .doc 不再拒绝：流水线用本地 LibreOffice 无头转成 .docx 后照常解析，
+            # 全程离线、不依赖任何付费 OCR / 转换服务。
+            pass
         else:
             raise ValidationError(
-                f"DM 手册目前只支持 PDF 或 Word(.docx)，收到：{key}",
+                f"DM 手册目前只支持 PDF / Word(.doc/.docx)，收到：{key}",
                 code="dm_guide_not_pdf",
             )
 

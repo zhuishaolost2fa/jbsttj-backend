@@ -14,7 +14,7 @@ OCR 文本没有字号、加粗、精确坐标，这里给标题行赋一个**�
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.services.pdf_extract import TextBlock, _is_heading_like
 
@@ -112,12 +112,109 @@ def render_page_png(path: str, page_no: int, dpi: int = 130) -> bytes:
         doc.close()
 
 
-def ocr_image(client, image_bytes: bytes, ocr_type: str = "General") -> str:
+# ============================================================
+# 本地免费 OCR 引擎（替代阿里云，离线运行，零成本）
+# ============================================================
+# 引擎实例缓存：rapid / paddle 首次调用会加载模型，之后复用，避免逐页重载。
+_LOCAL_ENGINES: Dict[str, Any] = {}
+
+
+def _local_engine(engine: str):
+    """惰性创建并缓存本地 OCR 引擎实例。仅导入对应库，缺失时给出清晰报错。"""
+    key = engine.lower()
+    if key in _LOCAL_ENGINES:
+        return _LOCAL_ENGINES[key]
+    if key == "rapid":
+        from rapidocr_onnxruntime import RapidOCR
+
+        _LOCAL_ENGINES[key] = RapidOCR()
+    elif key == "paddle":
+        from paddleocr import PaddleOCR
+
+        _LOCAL_ENGINES[key] = PaddleOCR(
+            use_angle_cls=True, lang="ch", show_log=False, use_gpu=False
+        )
+    elif key == "tesseract":
+        import pytesseract
+
+        _LOCAL_ENGINES[key] = pytesseract
+    else:
+        raise OcrUnavailable(f"不支持的本地 OCR 引擎: {engine}")
+    return _LOCAL_ENGINES[key]
+
+
+def local_ocr_available(engine: str) -> bool:
+    """仅检查依赖是否安装（不加载模型），供调用方提前判断能否走本地 OCR。"""
+    try:
+        if engine.lower() == "rapid":
+            import rapidocr_onnxruntime  # noqa: F401
+        elif engine.lower() == "paddle":
+            import paddleocr  # noqa: F401
+        elif engine.lower() == "tesseract":
+            import pytesseract  # noqa: F401
+        else:
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ocr_image_local(image_bytes: bytes, engine: str) -> str:
+    """本地免费引擎识别单张图片，返回整页文本。复用上游的 render_page_png 输入。"""
+    from io import BytesIO
+
+    from PIL import Image
+
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    key = engine.lower()
+
+    if key == "rapid":
+        import numpy as np
+
+        result, _ = _local_engine("rapid")(np.array(img))
+        if not result:
+            return ""
+        return "\n".join(line[1] for line in result if line and len(line) > 1)
+
+    if key == "paddle":
+        result = _local_engine("paddle")(img) or []
+        lines: List[str] = []
+        for item in result:
+            if item and len(item) >= 2 and item[1] and len(item[1]) >= 2:
+                lines.append(item[1][0])
+        return "\n".join(lines)
+
+    if key == "tesseract":
+        return _local_engine("tesseract").image_to_string(img, lang="chi_sim+eng")
+
+    raise OcrUnavailable(f"不支持的本地 OCR 引擎: {engine}")
+
+
+def ocr_image(client, image_bytes: bytes, ocr_type: str = "General", *, engine: Optional[str] = None) -> str:
     """识别单张图片的二进制内容，返回识别文本。
 
-    `RecognizeAllText` 的 `Url` 与 `body` 二选一；这里走 `body` 直接传二进制，
+    引擎由 ``OCR_ENGINE`` 配置决定（默认 aliyun，行为不变）：
+
+      - ``aliyun``  → 走阿里云 ``RecognizeAllText``（付费，需 ``client``）；
+      - ``rapid`` / ``paddle`` / ``tesseract`` → 本地离线免费引擎，
+        不再需要 ``client``，也不产生任何对外请求。
+
+    `RecognizeAllText` 的 `Url` 与 `body` 二选一；aliyun 路径走 `body` 直接传二进制，
     省去先把页面上传到公网 URL 的环节。
     """
+    if engine is None:
+        from app.core.config import get_settings
+
+        engine = (get_settings().ocr_engine or "aliyun").lower()
+    if engine == "aliyun":
+        if client is None:
+            raise OcrUnavailable("未提供阿里云 OCR 客户端（本地引擎未启用）")
+        return _ocr_image_aliyun(client, image_bytes, ocr_type)
+    return _ocr_image_local(image_bytes, engine)
+
+
+def _ocr_image_aliyun(client, image_bytes: bytes, ocr_type: str = "General") -> str:
+    """（原 ocr_image）阿里云 RecognizeAllText 实现。"""
     req = ocr_models.RecognizeAllTextRequest(type=ocr_type)
     req.body = image_bytes
     runtime = util_models.RuntimeOptions()
