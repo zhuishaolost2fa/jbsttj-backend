@@ -126,6 +126,64 @@ def test_parse_cancelled_falls_to_pending():
     assert overall == "pending", overall
 
 
+def test_embedding_at_cap_maps_to_done_and_ready():
+    """向量化块到达上限（embedded==total）即使 job 仍 embedding，也算解析完成。"""
+    overall, out = asyncio.run(
+        _overall(
+            has_guide=True,
+            indexed=True,
+            job=_job("embedding", total_chunks=10, embedded_chunks=10),
+        )
+    )
+    assert overall == "ready", overall
+    by_key = {p.key: (p.status, p.progress) for p in out.phases}
+    assert by_key["parse"] == ("done", 100.0), by_key
+    assert by_key["ready"] == ("done", 100.0), by_key
+
+
+def test_embedding_overshoot_maps_to_done():
+    """重试导致 embedded > total（+= 虚高）时同样判完成。"""
+    overall, out = asyncio.run(
+        _overall(
+            has_guide=True,
+            indexed=True,
+            job=_job("embedding", total_chunks=10, embedded_chunks=12),
+        )
+    )
+    assert overall == "ready", overall
+    by_key = {p.key: p.status for p in out.phases}
+    assert by_key["parse"] == "done"
+
+
+def test_embedding_at_cap_without_index_maps_to_parsed():
+    """到上限但尚未激活索引（indexed=False）时整体落 parsed，不谎称 ready。"""
+    overall, out = asyncio.run(
+        _overall(
+            has_guide=True,
+            indexed=False,
+            job=_job("embedding", total_chunks=10, embedded_chunks=10),
+        )
+    )
+    assert overall == "parsed", overall
+    by_key = {p.key: p.status for p in out.phases}
+    assert by_key["parse"] == "done"
+    assert by_key["ready"] == "pending"
+
+
+def test_embedding_below_cap_stays_parsing():
+    """未到上限仍是 parsing。"""
+    overall, out = asyncio.run(
+        _overall(
+            has_guide=True,
+            indexed=True,
+            job=_job("embedding", total_chunks=10, embedded_chunks=9),
+        )
+    )
+    assert overall == "parsing", overall
+    by_key = {p.key: p.status for p in out.phases}
+    assert by_key["parse"] == "active"
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

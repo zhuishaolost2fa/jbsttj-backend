@@ -369,8 +369,16 @@ class DMGuideService:
             elif jstatus == "cancelled":
                 parse_status, parse_progress = "cancelled", 0.0
             else:
-                parse_status = "active"
-                parse_progress = _coarse_progress(job)
+                # 向量化计数到达上限即视为解析完成：embed_and_store 每批都是在
+                # chunk 与 QA 都入库后才累加 embedded_chunks，所以 embedded >= total
+                # 时全部内容实际已写完，只差 finalize 落终态的一瞬；
+                # 若仍报 active，前端会看到「进度 100% 却迟迟不完」。
+                # 用 >= 兼容重试导致计数器 += 虚高（超过 total）的情况。
+                if job.total_chunks > 0 and job.embedded_chunks >= job.total_chunks:
+                    parse_status, parse_progress = "done", 100.0
+                else:
+                    parse_status = "active"
+                    parse_progress = _coarse_progress(job)
 
         elif status.has_guide and status.indexed:
             parse_status, parse_progress = "done", 100.0
@@ -392,7 +400,8 @@ class DMGuideService:
         elif parse_status == "cancelled":
             overall = "pending"
         elif parse_status == "done":
-            # 解析流水线已结束（job 进入终态 completed/skipped，或 has_guide 且无 job 但已 indexed）。
+            # 解析流水线已结束（job 终态 completed/skipped；或向量化计数到达上限；
+            # 或 has_guide 且无 job 但已 indexed）。
             # indexed 为 False 多为「0 chunk 的退化完成」——仍需给前端明确的「解析结束」信号，
             # 不能落到 pending 与「未开始」混淆；用 parsed 区分「已解析完成、暂不可问答」。
             overall = "ready" if status.indexed else "parsed"
