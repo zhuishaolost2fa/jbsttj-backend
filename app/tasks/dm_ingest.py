@@ -809,17 +809,24 @@ def embed_and_store(
         store.insert_qa(qa_rows)
 
     if job_id:
-        # stage_detail 用累计口径：以库内实际行数为准（与 finalize 同一真相源），
-        # 重试不会虚高；也不再出现「每批都只显示本批数量、看起来像卡住」的问题。
+        # 进度计数用**绝对值回写**而非 bump_job 的 += 自增：
+        # ① += 一旦某批上报失败（bump_job 只记 warning 就跳过），自增量永久丢失，
+        #    计数器会一直落后于真实行数（如真值 34 而 embedded_chunks 停在 28），
+        #    import-status 的「到上限判完成」就不会触发；绝对值回写在下一批自动补回。
+        # ② 重试重复执行也不会虚高——库内行数是唯一真相（与 finalize 同源）。
+        # 多批并行写同一行按「计数单调递增、后写覆盖」是安全的：
+        # 最后完成的批次看到的行数必然最全。
         done_chunks = store.count_chunks(document_id)
         done_qa = store.count_qa(document_id)
         total_txt = f"/{total_chunks}" if total_chunks else ""
-        store.bump_job(
+        store.update_job(
             job_id,
-            status=JOB_EMBEDDING,
-            embedded_chunks=len(chunk_rows),
-            embedded_qa=len(qa_rows),
-            stage_detail=f"已向量化 {done_chunks}{total_txt} 块 / {done_qa} 问答",
+            {
+                "status": JOB_EMBEDDING,
+                "embedded_chunks": done_chunks,
+                "embedded_qa": done_qa,
+                "stage_detail": f"已向量化 {done_chunks}{total_txt} 块 / {done_qa} 问答",
+            },
         )
 
     logger.info(

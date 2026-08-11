@@ -64,14 +64,17 @@ def test_embed_stage_detail_is_cumulative():
             total_chunks=24,
         )
 
-    assert store.bump_job.call_count == 1
-    kwargs = store.bump_job.call_args.kwargs
-    assert kwargs["status"] == m.JOB_EMBEDDING
-    # 本批只有 2 块 / 1 问答，但文案必须展示累计 12/24 块 / 20 问答
-    assert kwargs["stage_detail"] == "已向量化 12/24 块 / 20 问答", kwargs["stage_detail"]
-    # 计数增量仍走 +=（防并发丢更新），语义不变
-    assert kwargs["embedded_chunks"] == 2
-    assert kwargs["embedded_qa"] == 1
+    # 计数不再走 bump_job 的 +=（自增丢失会导致计数器落后真值），
+    # 而是用库内实际行数做绝对值回写
+    assert store.bump_job.call_count == 0
+    assert store.update_job.call_count == 1
+    job_id, patch = store.update_job.call_args.args
+    assert job_id == "j1"
+    assert patch["status"] == m.JOB_EMBEDDING
+    # 本批只有 2 块 / 1 问答，但回写与文案都必须是累计真值 12/24 块 / 20 问答
+    assert patch["embedded_chunks"] == 12
+    assert patch["embedded_qa"] == 20
+    assert patch["stage_detail"] == "已向量化 12/24 块 / 20 问答", patch["stage_detail"]
 
 
 def test_embed_stage_detail_without_total():
@@ -82,8 +85,10 @@ def test_embed_stage_detail_without_total():
          mock.patch.object(m, "get_llm_client", return_value=_fake_llm()):
         m.embed_and_store(payload, job_id="j1", document_id="d1", script_id="s1")
 
-    kwargs = store.bump_job.call_args.kwargs
-    assert kwargs["stage_detail"] == "已向量化 7 块 / 9 问答", kwargs["stage_detail"]
+    _, patch = store.update_job.call_args.args
+    assert patch["stage_detail"] == "已向量化 7 块 / 9 问答", patch["stage_detail"]
+    assert patch["embedded_chunks"] == 7
+    assert patch["embedded_qa"] == 9
 
 
 def test_generate_qa_reports_cumulative_progress():
