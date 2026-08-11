@@ -105,15 +105,24 @@ async def _load_profile(db: SupabaseClient, user_id: str) -> Optional[Dict[str, 
         return None
 
 
-def _profile_response(user: CurrentUser, profile: Optional[Dict[str, Any]]) -> ProfileResponse:
+async def _resolve_email_verified(auth: SupabaseAuth, user: CurrentUser) -> bool:
+    """实时邮箱验证状态：以 GoTrue 管理接口的 email_confirmed_at 为准，
+    token claim 作为接口不可用时的兜底。"""
+    return await auth.get_email_verified(user.id) or bool(user.claims.get("email_verified"))
+
+
+def _profile_response(
+    user: CurrentUser,
+    profile: Optional[Dict[str, Any]],
+    email_verified: bool,
+) -> ProfileResponse:
     """把鉴权身份与 profiles 行拼成统一的 ProfileResponse。"""
-    claims = user.claims or {}
     return ProfileResponse(
         id=user.id,
         email=user.email,
         role=user.role,
         is_service=user.is_service,
-        email_verified=bool(claims.get("email_verified")),
+        email_verified=email_verified,
         nickname=profile.get("nickname") if profile else None,
         avatar_url=profile.get("avatar_url") if profile else None,
         avatar_color=int(profile.get("avatar_color") or 0) if profile else 0,
@@ -130,9 +139,11 @@ def _profile_response(user: CurrentUser, profile: Optional[Dict[str, Any]]) -> P
 async def me(
     user: CurrentUser = Depends(get_current_user),
     db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
 ) -> ProfileResponse:
     profile = await _load_profile(db, user.id)
-    return _profile_response(user, profile)
+    email_verified = await _resolve_email_verified(auth, user)
+    return _profile_response(user, profile, email_verified)
 
 
 @router.patch("/me", response_model=ProfileResponse, summary="编辑个人资料")
@@ -141,6 +152,7 @@ async def update_me(
     request: Request,
     user: CurrentUser = Depends(get_current_user),
     db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
 ) -> ProfileResponse:
     """部分更新当前用户的个人资料。
 
@@ -175,7 +187,8 @@ async def update_me(
     rows = await db.upsert("profiles", data, on_conflict="id")
     profile = rows[0] if rows else {**(current or {}), **data}
 
-    return _profile_response(user, profile)
+    email_verified = await _resolve_email_verified(auth, user)
+    return _profile_response(user, profile, email_verified)
 
 
 @router.post("/me/avatar", response_model=ProfileResponse, summary="上传并更新头像")
@@ -185,12 +198,16 @@ async def upload_avatar(
     user: CurrentUser = Depends(get_current_user),
     db: SupabaseClient = Depends(get_supabase),
     oss: OSSService = Depends(get_oss_service),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
 ):
     """上传头像图片（裁剪由前端完成），服务端只负责存储与落库。
 
     - 校验格式（JPG/PNG/WEBP）、大小（≤2MB），并嗅探文件头防伪装。
-    - 以稳定 key ``avatars/{user_id}`` 覆盖写入，URL 长期不变。
-    - 头像通过后端代理地址返回，避免依赖 bucket 公开读权限。
+    - 以稳定 key ``avatars/{user_id}`` 覆盖写入 OSS，该对象落在永久前缀下
+      （非 ``temp/`` 临时前缀），不会被生命周期规则自动清理。
+    - 返回的 ``avatar_url`` 是 **OSS 永久公开 URL**（CDN / 自定义域名优先），
+      非二进制、不过期，可直接写进 ``<img src>``；仅当未配置任何公开域名时，
+      才退化为后端代理地址兜底。
     - 成功后清空 avatar_color（已有真实图片，渐变头像不再需要）。
     """
     if not db.available:
@@ -210,19 +227,21 @@ async def upload_avatar(
         # 类型不一致不致命，但以嗅探到的真实类型入库，避免被伪造扩展名误导
         logger.warning("头像声明类型 %s 与实际 %s 不符", file.content_type, detected)
 
+    # 永久对象：独立前缀 avatars/，覆盖写，URL 长期稳定，不被 OSS 生命周期清理
     key = f"avatars/{user.id}"
     await oss.put_object(key, data, content_type=detected)
 
-    # 公开代理地址：稳定、长期有效，且跨域 <img> 可直接加载
-    avatar_url = f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
+    # 优先返回 OSS 永久公开 URL（CDN / 自定义域名）；无公开域名时退化为后端代理
+    avatar_url = oss.public_url(key) or f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
     rows = await db.upsert(
         "profiles",
         {"id": user.id, "avatar_url": avatar_url, "avatar_color": None},
         on_conflict="id",
     )
     profile = rows[0] if rows else {"avatar_url": avatar_url, "avatar_color": None}
-    logger.info("用户上传头像成功（id=%s）", user.id)
-    return _profile_response(user, profile)
+    logger.info("用户上传头像成功（id=%s, url=%s）", user.id, avatar_url)
+    email_verified = await _resolve_email_verified(auth, user)
+    return _profile_response(user, profile, email_verified)
 
 
 def _check_password_strength(password: str) -> Optional[str]:

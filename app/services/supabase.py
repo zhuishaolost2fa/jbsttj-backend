@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -16,6 +17,10 @@ from app.core.config import Settings, get_settings
 from app.core.exceptions import AuthError, ConfigError, DatabaseError, ValidationError
 
 logger = logging.getLogger("app.supabase")
+
+# /me 等接口用来缓存「实时邮箱验证状态」的短 TTL 缓存，避免每次请求都打 GoTrue。
+_admin_user_cache: Dict[str, Tuple[float, bool]] = {}
+_ADMIN_USER_CACHE_TTL = 30.0
 
 
 class SupabaseClient:
@@ -282,6 +287,57 @@ class SupabaseAuth:
             return resp.json()
         except Exception:  # noqa: BLE001
             return {}
+
+    async def admin_get_user(self, user_id: str) -> Dict[str, Any]:
+        """用 service_role 调 GoTrue 管理接口读取用户实时状态。
+
+        用于 /me 等场景获取真实的邮箱验证状态（email_confirmed_at），
+        避免依赖签发过早、claim 已过期的 access token。
+        """
+        if not user_id:
+            raise ValidationError("缺少用户标识，无法读取账号")
+        url = f"{self._settings.supabase_auth_url}/admin/users/{user_id}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers=self._admin_headers())
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("message")
+                or detail.get("error_description")
+                or detail.get("msg")
+                or "读取账号失败"
+            )
+            raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
+
+    async def get_email_verified(self, user_id: str) -> bool:
+        """返回用户实时邮箱是否已验证，带 30s TTL 缓存。
+
+        优先读取 GoTrue 管理接口的 email_confirmed_at / confirmed_at；
+        若接口不可用（未配置 service_role 或网络异常）则退化为 False，
+        由调用方用 token claim 兜底。
+        """
+        now = time.monotonic()
+        cached = _admin_user_cache.get(user_id)
+        if cached is not None:
+            ts, value = cached
+            if now - ts < _ADMIN_USER_CACHE_TTL:
+                return value
+        try:
+            user = await self.admin_get_user(user_id)
+        except (AuthError, ConfigError) as exc:  # noqa: BLE001
+            logger.warning("读取用户实时状态失败（id=%s），退回未验证: %s", user_id, exc)
+            return False
+        confirmed = bool(user.get("email_confirmed_at") or user.get("confirmed_at"))
+        _admin_user_cache[user_id] = (now, confirmed)
+        return confirmed
 
 
 supabase = SupabaseClient()

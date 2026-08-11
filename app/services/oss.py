@@ -403,6 +403,42 @@ class OSSService:
         except Exception as exc:  # noqa: BLE001
             raise self._wrap(exc, "签发下载地址") from exc
 
+    def public_url(self, key: str) -> Optional[str]:
+        """构造对象的**永久公开 URL**（非签名、不过期）。
+
+        与 ``sign_download_url``（临时签名、会过期）不同，这里产出的是可直接写进
+        ``<img src>`` 的长期地址。适用前提：bucket 已开启公共读，或已绑定
+        CDN / 自定义域名回源 OSS。
+
+        域名选取优先级：
+          - ``oss_cdn_domain``        → 已绑定 CDN / 自定义域名（直接当 host）
+          - ``oss_use_cname`` + endpoint → endpoint 本身是 CNAME，无需拼 bucket
+          - 仅 ``oss_endpoint``        → 标准 OSS 公网域名 ``{bucket}.{endpoint}``
+
+        若三项都没有任何公开域名配置，返回 ``None``，调用方应改走签名地址或后端代理。
+        """
+        s = self._settings
+        raw = (s.oss_cdn_domain or "").strip()
+        if raw:
+            host = self._normalize_host(raw)
+        elif s.oss_use_cname and s.oss_endpoint:
+            host = self._normalize_host(s.oss_endpoint)
+        elif s.oss_endpoint:
+            host = f"{s.oss_bucket}.{self._normalize_host(s.oss_endpoint)}"
+        else:
+            return None
+        key = key.lstrip("/")
+        return f"https://{host}/{key}"
+
+    @staticmethod
+    def _normalize_host(raw: str) -> str:
+        """去掉协议头与首尾斜杠，便于统一拼 ``https://``。"""
+        raw = raw.strip()
+        for scheme in ("https://", "http://"):
+            if raw.lower().startswith(scheme):
+                raw = raw[len(scheme):]
+        return raw.rstrip("/")
+
     async def get_object_bytes(self, key: str) -> Tuple[Optional[bytes], Optional[str]]:
         """读取对象完整内容。
 
