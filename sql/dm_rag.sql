@@ -31,6 +31,8 @@ create extension if not exists pg_trgm;
 create table if not exists public.script_dm_documents (
     id            uuid primary key default gen_random_uuid(),
     script_id     uuid not null references public.scripts (id) on delete cascade,
+    -- 基于剧本中文名派生的稳定业务编码：同名剧本被拆成多个 script_id 时，用它聚合检索
+    script_code   text not null default '',
 
     -- OSS 定位信息，来自 scripts.extra->'dmGuide'
     file_id       text,
@@ -61,8 +63,21 @@ create table if not exists public.script_dm_documents (
     constraint uq_dm_doc_hash unique (script_id, content_hash)
 );
 
+-- 兼容早于本版本建好的库：老表没有 script_code，需要显式补列。
+alter table public.script_dm_documents add column if not exists script_code text not null default '';
+
+update public.script_dm_documents d
+   set script_code = s.code
+  from public.scripts s
+ where d.script_id = s.id
+   and coalesce(d.script_code, '') = '';
+
 create index if not exists idx_dm_doc_script
     on public.script_dm_documents (script_id, is_active)
+    where deleted_at is null;
+
+create index if not exists idx_dm_doc_script_code
+    on public.script_dm_documents (script_code, is_active)
     where deleted_at is null;
 
 create index if not exists idx_dm_doc_object_key
@@ -77,6 +92,8 @@ create table if not exists public.script_dm_chunks (
     document_id   uuid not null references public.script_dm_documents (id) on delete cascade,
     -- 冗余 script_id：检索时按剧本过滤是最高频路径，避免每次都 join 文档表
     script_id     uuid not null references public.scripts (id) on delete cascade,
+    -- 冗余 script_code：同名剧本拆成多个 script_id 时，可按业务 code 聚合检索
+    script_code   text not null default '',
 
     chunk_index   integer not null,
     content       text not null,
@@ -103,11 +120,22 @@ create table if not exists public.script_dm_chunks (
     constraint ck_dm_chunk_block_type check (block_type in ('body', 'heading', 'table', 'list'))
 );
 
+alter table public.script_dm_chunks add column if not exists script_code text not null default '';
+
+update public.script_dm_chunks c
+   set script_code = s.code
+  from public.scripts s
+ where c.script_id = s.id
+   and coalesce(c.script_code, '') = '';
+
 create index if not exists idx_dm_chunk_doc
     on public.script_dm_chunks (document_id, chunk_index);
 
 create index if not exists idx_dm_chunk_script
     on public.script_dm_chunks (script_id);
+
+create index if not exists idx_dm_chunk_script_code
+    on public.script_dm_chunks (script_code);
 
 -- SimHash 分段索引：跨文档找近似重复段落时按高 16 位快速圈定候选
 create index if not exists idx_dm_chunk_simhash
@@ -135,6 +163,8 @@ create table if not exists public.script_dm_qa (
     id            uuid primary key default gen_random_uuid(),
     document_id   uuid not null references public.script_dm_documents (id) on delete cascade,
     script_id     uuid not null references public.scripts (id) on delete cascade,
+    -- 基于剧本中文名派生的稳定业务编码：同名剧本被拆成多个 script_id 时，用它聚合检索
+    script_code   text not null default '',
     -- 来源块，允许为空（块被删除后问答对仍可保留）
     chunk_id      uuid references public.script_dm_chunks (id) on delete set null,
 
@@ -155,8 +185,17 @@ create table if not exists public.script_dm_qa (
     constraint uq_dm_qa_hash unique (document_id, question_hash)
 );
 
+alter table public.script_dm_qa add column if not exists script_code text not null default '';
+
+update public.script_dm_qa q
+   set script_code = s.code
+  from public.scripts s
+ where q.script_id = s.id
+   and coalesce(q.script_code, '') = '';
+
 create index if not exists idx_dm_qa_doc      on public.script_dm_qa (document_id);
 create index if not exists idx_dm_qa_script   on public.script_dm_qa (script_id);
+create index if not exists idx_dm_qa_code     on public.script_dm_qa (script_code);
 create index if not exists idx_dm_qa_chunk    on public.script_dm_qa (chunk_id);
 create index if not exists idx_dm_qa_category on public.script_dm_qa (category);
 
@@ -175,6 +214,7 @@ create index if not exists idx_dm_qa_embedding_hnsw
 create table if not exists public.script_dm_jobs (
     id             uuid primary key default gen_random_uuid(),
     script_id      uuid not null references public.scripts (id) on delete cascade,
+    script_code    text not null default '',
     document_id    uuid references public.script_dm_documents (id) on delete set null,
 
     object_key     text not null,
@@ -216,7 +256,14 @@ create table if not exists public.script_dm_jobs (
 -- 兼容早于本版本建好的库：create table if not exists 对已存在的表不生效，
 -- 列和 check 约束的变更必须显式补。缺了这段，老库会在 QA 阶段写状态时
 -- 撞上 ck_dm_job_status 直接失败 —— 而且是任务跑了十几分钟之后才失败。
+alter table public.script_dm_jobs add column if not exists script_code text not null default '';
 alter table public.script_dm_jobs add column if not exists created_by uuid;
+
+update public.script_dm_jobs j
+   set script_code = s.code
+  from public.scripts s
+ where j.script_id = s.id
+   and coalesce(j.script_code, '') = '';
 alter table public.script_dm_jobs drop constraint if exists ck_dm_job_status;
 alter table public.script_dm_jobs add constraint ck_dm_job_status check (status in (
     'pending', 'downloading', 'extracting', 'chunking',
@@ -225,6 +272,7 @@ alter table public.script_dm_jobs add constraint ck_dm_job_status check (status 
 ));
 
 create index if not exists idx_dm_job_script  on public.script_dm_jobs (script_id, created_at desc);
+create index if not exists idx_dm_job_script_code on public.script_dm_jobs (script_code, created_at desc);
 drop index if exists public.idx_dm_job_status;
 create index if not exists idx_dm_job_status  on public.script_dm_jobs (status)
     where status not in ('completed', 'failed', 'cancelled', 'skipped');
@@ -313,6 +361,7 @@ create or replace function public.match_dm_chunks(
     query_embedding      vector(1024),
     p_script_id          uuid default null,
     p_document_id        uuid default null,
+    p_script_code        text default null,
     match_count          integer default 8,
     similarity_threshold double precision default 0.25
 )
@@ -320,6 +369,7 @@ returns table (
     id           uuid,
     document_id  uuid,
     script_id    uuid,
+    script_code  text,
     chunk_index  integer,
     content      text,
     page_start   integer,
@@ -340,6 +390,7 @@ begin
     select c.id,
            c.document_id,
            c.script_id,
+           c.script_code,
            c.chunk_index,
            c.content,
            c.page_start,
@@ -353,6 +404,7 @@ begin
        and d.deleted_at is null
        and d.is_active
        and (p_script_id   is null or c.script_id   = p_script_id)
+       and (p_script_code is null or c.script_code = p_script_code)
        and (p_document_id is null or c.document_id = p_document_id)
        and (1 - (c.embedding <=> query_embedding)) >= similarity_threshold
      order by c.embedding <=> query_embedding
@@ -364,6 +416,7 @@ create or replace function public.match_dm_qa(
     query_embedding      vector(1024),
     p_script_id          uuid default null,
     p_document_id        uuid default null,
+    p_script_code        text default null,
     p_category           text default null,
     match_count          integer default 8,
     similarity_threshold double precision default 0.25
@@ -372,6 +425,7 @@ returns table (
     id           uuid,
     document_id  uuid,
     script_id    uuid,
+    script_code  text,
     chunk_id     uuid,
     question     text,
     answer       text,
@@ -393,6 +447,7 @@ begin
     select q.id,
            q.document_id,
            q.script_id,
+           q.script_code,
            q.chunk_id,
            q.question,
            q.answer,
@@ -407,6 +462,7 @@ begin
        and d.deleted_at is null
        and d.is_active
        and (p_script_id   is null or q.script_id   = p_script_id)
+       and (p_script_code is null or q.script_code = p_script_code)
        and (p_document_id is null or q.document_id = p_document_id)
        and (p_category    is null or q.category    = p_category)
        and (1 - (q.embedding <=> query_embedding)) >= similarity_threshold
@@ -484,7 +540,7 @@ alter table public.script_dm_jobs      enable row level security;
 -- ------------------------------------------------------------
 create or replace view public.script_dm_overview as
 select s.id            as script_id,
-       s.code          as script_code,
+       coalesce(nullif(d.script_code, ''), s.code) as script_code,
        s.title         as script_title,
        d.id            as document_id,
        d.file_name,

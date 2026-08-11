@@ -24,7 +24,7 @@ from app.schemas.dm_guide import (
     JobProgress,
     SearchResult,
 )
-from app.services.dm_service import DMGuideService, get_dm_guide_service
+from app.services.dm_service import DMGuideService, get_dm_guide_service, script_dm_code
 from app.services.script_service import ScriptService, get_script_service
 
 router = APIRouter(prefix="/scripts", tags=["DM 主持人手册"])
@@ -169,6 +169,7 @@ async def search_dm_guide(
     return await service.search(
         query=q,
         script_id=str(script.id),
+        script_code=script_dm_code(script),
         mode=mode,
         top_k=top_k,
         min_similarity=min_similarity,

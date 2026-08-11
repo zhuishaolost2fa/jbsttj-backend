@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import AuthError, ConfigError, DatabaseError
+from app.core.exceptions import AuthError, ConfigError, DatabaseError, ValidationError
 
 logger = logging.getLogger("app.supabase")
 
@@ -205,6 +205,15 @@ class SupabaseAuth:
             raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
         return data
 
+    def _admin_headers(self) -> Dict[str, str]:
+        if not self._settings.supabase_service_role_key:
+            raise ConfigError("未配置 SUPABASE_SERVICE_ROLE_KEY，无法管理账号")
+        return {
+            "apikey": self._settings.supabase_service_role_key,
+            "Authorization": f"Bearer {self._settings.supabase_service_role_key}",
+            "Content-Type": "application/json",
+        }
+
     async def sign_in(self, email: str, password: str) -> Dict[str, Any]:
         return await self._post("/token?grant_type=password", {"email": email, "password": password})
 
@@ -213,6 +222,66 @@ class SupabaseAuth:
 
     async def refresh(self, refresh_token: str) -> Dict[str, Any]:
         return await self._post("/token?grant_type=refresh_token", {"refresh_token": refresh_token})
+
+    async def verify_password(self, email: str, password: str) -> bool:
+        """校验用户当前密码是否正确。
+
+        用于改密 / 改邮箱前的身份确认。返回 True 表示密码正确；
+        返回 False 表示凭证无效（邮箱或密码错误）；其它异常（限流、服务不可用）
+        直接抛出 AuthError，由上层转成统一错误结构。
+        """
+        if not email:
+            return False
+        url = f"{self._settings.supabase_auth_url}/token?grant_type=password"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                url, json={"email": email, "password": password}, headers=self._headers()
+            )
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 400:
+            # 凭证无效或邮箱未验证，均视为「无法确认当前密码」
+            return False
+        detail: Any
+        try:
+            detail = resp.json()
+        except Exception:  # noqa: BLE001
+            detail = resp.text
+        message = (
+            detail.get("error_description")
+            or detail.get("msg")
+            or detail.get("message")
+            or "校验当前密码失败"
+        )
+        raise AuthError(str(message), status_code=502)
+
+    async def admin_update_user(self, user_id: str, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """调用 GoTrue 管理接口更新用户属性（密码 / 邮箱等）。
+
+        需要 service_role key，本地无直接校验密码的能力时靠它落地改密 / 改邮箱。
+        """
+        if not user_id:
+            raise ValidationError("缺少用户标识，无法更新账号")
+        url = f"{self._settings.supabase_auth_url}/admin/users/{user_id}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.put(url, json=attrs, headers=self._admin_headers())
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("message")
+                or detail.get("error_description")
+                or detail.get("msg")
+                or "账号更新失败"
+            )
+            raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
 
 
 supabase = SupabaseClient()

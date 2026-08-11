@@ -299,6 +299,14 @@ def main() -> int:
         check("过期 token 被拒", r.status_code == 401 and r.json()["error"]["code"] == "token_expired", r.text[:120])
         r = client.get("/api/v1/auth/me", headers=AUTH)
         check("合法 token 通过", r.status_code == 200 and r.json()["id"] == USER_ID, r.text[:120])
+        check("me 接口含昵称/头像字段",
+              "nickname" in r.json() and "avatar_url" in r.json(), r.text[:120])
+        check("PATCH /me 空请求被拒",
+              client.patch("/api/v1/auth/me", headers=AUTH, json={}).status_code == 422,
+              r.text[:120])
+        check("OpenAPI 含 PATCH /auth/me",
+              "patch" in paths.get("/api/v1/auth/me", {}) or "/api/v1/auth/me" in paths,
+              "未注册")
 
         print("\n[3] 分片上传全流程")
         size = int(CHUNK * 2.5)

@@ -72,6 +72,7 @@ from app.services.dm_store import (
     to_pgvector,
 )
 from app.services.llm import QAPair, get_llm_client
+from app.services.script_service import slugify
 from app.services.pdf_extract import (
     ShardResult,
     build_section_paths,
@@ -276,6 +277,7 @@ def prepare_document(
     file_id: str = "",
     file_size: int = 0,
     script_title: str = "",
+    script_code: str = "",
     force: bool = False,
 ) -> Dict[str, Any]:
     """下载 PDF、建文档记录、规划分片并派发 T1 群组。"""
@@ -295,6 +297,7 @@ def prepare_document(
 
     local_path, size = ensure_local_file(object_key, expected_size=file_size)
     content_hash = sha256_file(local_path)
+    dm_script_code = (script_code or slugify(script_title) or script_id).strip().lower()
 
     # ---- 按真实落盘后缀分支：PDF 按页规划分片，Word(.docx) 按文本单元规划 ----
     # 两者最终都产出 ShardResult，下游 chunk_and_dedup 等完全复用，无需 OCR。
@@ -325,6 +328,7 @@ def prepare_document(
     document = store.upsert_document(
         {
             "script_id": script_id,
+            "script_code": dm_script_code,
             "file_id": file_id or None,
             "object_key": object_key,
             "file_name": file_name or None,
@@ -426,6 +430,7 @@ def prepare_document(
         job_id=job_id,
         document_id=document_id,
         script_id=script_id,
+        script_code=dm_script_code,
         script_title=script_title,
         object_key=object_key,
     )
@@ -433,6 +438,7 @@ def prepare_document(
 
     return {
         "document_id": document_id,
+        "script_code": dm_script_code,
         "total_pages": total_pages,
         "total_shards": len(shards),
         "dispatched": True,
@@ -550,6 +556,7 @@ def chunk_and_dedup(
     job_id: str,
     document_id: str,
     script_id: str,
+    script_code: str = "",
     script_title: str = "",
     object_key: str = "",
 ) -> Dict[str, Any]:
@@ -658,18 +665,25 @@ def chunk_and_dedup(
                 job_id=job_id,
                 document_id=document_id,
                 script_id=script_id,
+                script_code=script_code,
                 script_title=script_title,
             ),
             embed_and_store.s(
                 job_id=job_id,
                 document_id=document_id,
                 script_id=script_id,
+                script_code=script_code,
                 total_chunks=len(kept),
             ),
         )
         for batch in batches
     ]
-    callback = finalize.s(job_id=job_id, document_id=document_id, script_id=script_id)
+    callback = finalize.s(
+        job_id=job_id,
+        document_id=document_id,
+        script_id=script_id,
+        script_code=script_code,
+    )
     chord(header)(callback.on_error(on_pipeline_error.s(job_id=job_id)))
 
     return {
@@ -695,6 +709,7 @@ def generate_qa(
     job_id: str,
     document_id: str,
     script_id: str,
+    script_code: str = "",
     script_title: str = "",
 ) -> Dict[str, Any]:
     """给一批 chunk 生成问答对，把 chunk 原样透传给下游 T4。
@@ -738,6 +753,7 @@ def embed_and_store(
     job_id: str,
     document_id: str,
     script_id: str,
+    script_code: str = "",
     total_chunks: int = 0,
 ) -> Dict[str, Any]:
     """把一批 chunk 与其问答对向量化后写入 Supabase。"""
@@ -760,6 +776,7 @@ def embed_and_store(
             {
                 "document_id": document_id,
                 "script_id": script_id,
+                "script_code": script_code,
                 "chunk_index": payload_item.get("chunk_index", chunk_obj.chunk_index),
                 "content": chunk_obj.text,
                 "content_hash": payload_item["content_hash"],
@@ -793,6 +810,7 @@ def embed_and_store(
                 {
                     "document_id": document_id,
                     "script_id": script_id,
+                    "script_code": script_code,
                     "chunk_id": chunk_id,
                     "question": question,
                     "answer": item["answer"],
@@ -868,6 +886,7 @@ def finalize(
     job_id: str,
     document_id: str,
     script_id: str = "",
+    script_code: str = "",
 ) -> Dict[str, Any]:
     """所有批次入库完毕后收尾。
 
@@ -880,9 +899,10 @@ def finalize(
 
     _mark_completed(store, job_id, document_id, chunk_count=chunk_count, qa_count=qa_count)
 
-    # 新版本入库成功后才让旧版本下线，避免中途失败时新旧都不可用
+    # 新版本入库成功后才让同一 script_id 的旧版本下线，避免中途失败时新旧都不可用。
+    # 这里不能按 script_code 下线，否则同名分片的其它手册会被误置为 inactive。
     if script_id:
-        store.deactivate_other_versions(script_id, document_id)
+        store.deactivate_other_versions(script_id, document_id, script_code=script_code or None)
 
     batches = len(results) if results else 0
     logger.info(
@@ -921,6 +941,7 @@ def dispatch_pipeline(
     file_id: str = "",
     file_size: int = 0,
     script_title: str = "",
+    script_code: str = "",
     force: bool = False,
 ) -> Optional[str]:
     """派发整条流水线，返回 Celery 任务 id（未启用 Celery 时返回 None）。"""
@@ -935,6 +956,7 @@ def dispatch_pipeline(
             "file_id": file_id,
             "file_size": file_size,
             "script_title": script_title,
+            "script_code": script_code,
             "force": force,
         },
         link_error=on_pipeline_error.s(job_id=job_id),

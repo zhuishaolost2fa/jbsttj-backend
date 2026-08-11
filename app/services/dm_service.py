@@ -42,10 +42,23 @@ from app.schemas.dm_guide import (
 )
 from app.services import dm_store as store_mod
 from app.services.repository import UploadTaskRepository
+from app.services.script_service import slugify
 
 logger = logging.getLogger("app.dm_service")
 
 SEARCH_MODES = ("chunk", "qa", "hybrid")
+
+
+def script_dm_code(script: Any) -> str:
+    """按剧本中文名派生 DM 聚合 code。
+
+    与 `scripts.code` 不完全等价：`scripts.code` 为了全表唯一可能带 `-2` 后缀，
+    而 DM 需要把同名分片聚合到同一个业务 code 下，所以直接从标题生成基础 slug。
+    """
+    title = str(getattr(script, "title", "") or "").strip()
+    script_id = str(getattr(script, "id", "") or "")
+    return (slugify(title) or script_id).strip().lower()
+
 
 # 问答（RAG 生成答案）的提示词。答案必须严格基于手册检索到的内容，
 # 不编造 —— 主持人靠这个带本，瞎编一条规则就是事故。
@@ -161,13 +174,16 @@ class DMGuideService:
         script_id = str(getattr(script, "id", "") or "")
         if not script_id:
             raise ValidationError("剧本 ID 缺失", code="script_id_required")
+        script_code = script_dm_code(script)
 
         ref = self._resolve_ref(script, payload.object_key)
         store = store_mod.get_dm_store()
 
         # 同一剧本同时跑两条流水线没有意义：两边都会往同一批唯一约束上撞，
         # 后完成的那条大部分写入会被 on_conflict 吞掉，白烧一遍 API 额度。
-        active = await run_in_threadpool(store.find_active_job, script_id)
+        active = await run_in_threadpool(
+            store.find_active_job, script_id, script_code=script_code
+        )
         if active and not payload.force:
             return IngestResponse(
                 job_id=str(active.get("id")),
@@ -189,6 +205,7 @@ class DMGuideService:
             {
                 "id": job_id,
                 "script_id": script_id,
+                "script_code": script_code,
                 "status": store_mod.JOB_PENDING,
                 "stage_detail": "任务已入队，等待 worker 领取",
                 "object_key": ref.object_key,
@@ -202,6 +219,7 @@ class DMGuideService:
             dispatch_pipeline(
                 job_id=job_id,
                 script_id=script_id,
+                script_code=script_code,
                 object_key=ref.object_key,
                 file_name=ref.file_name or "",
                 file_id=ref.file_id or "",
@@ -292,6 +310,7 @@ class DMGuideService:
     async def get_status(self, script: Any) -> DMGuideStatus:
         """剧本详情页用的聚合状态。"""
         script_id = str(getattr(script, "id", "") or "")
+        script_code = script_dm_code(script)
         ref = DMGuideRef.from_extra(getattr(script, "extra", None))
 
         if not self._settings.dm_rag_enabled:
@@ -300,19 +319,33 @@ class DMGuideService:
             )
 
         store = store_mod.get_dm_store()
-        doc = await run_in_threadpool(store.get_active_document, script_id)
-        job_row = await run_in_threadpool(store.latest_job, script_id)
+        docs = await run_in_threadpool(store.list_active_documents_by_code, script_code)
+        if not docs:
+            doc = await run_in_threadpool(
+                store.get_active_document, script_id, script_code=script_code
+            )
+            docs = [doc] if doc else []
+        latest_doc = docs[0] if docs else None
+        job_row = await run_in_threadpool(
+            store.latest_job, script_id, script_code=script_code
+        )
+
+        total_pages = sum(int(d.get("total_pages") or 0) for d in docs)
+        total_chunks = sum(int(d.get("total_chunks") or 0) for d in docs)
+        total_qa = sum(int(d.get("total_qa") or 0) for d in docs)
+        version = int(latest_doc.get("version") or 0) if latest_doc else 0
+        indexed = bool(total_chunks > 0)
 
         return DMGuideStatus(
             script_id=script_id,
             has_guide=bool(ref),
-            indexed=bool(doc and int(doc.get("total_chunks") or 0) > 0),
-            document_id=(str(doc["id"]) if doc else None),
-            file_name=(doc.get("file_name") if doc else None) or (ref.file_name if ref else None),
-            total_pages=int((doc or {}).get("total_pages") or 0),
-            total_chunks=int((doc or {}).get("total_chunks") or 0),
-            total_qa=int((doc or {}).get("total_qa") or 0),
-            version=int((doc or {}).get("version") or 0),
+            indexed=indexed,
+            document_id=(str(latest_doc["id"]) if latest_doc else None),
+            file_name=(latest_doc.get("file_name") if latest_doc else None) or (ref.file_name if ref else None),
+            total_pages=total_pages,
+            total_chunks=total_chunks,
+            total_qa=total_qa,
+            version=version,
             job=self._to_progress(job_row) if job_row else None,
         )
 
@@ -443,6 +476,7 @@ class DMGuideService:
         *,
         query: str,
         script_id: Optional[str] = None,
+        script_code: Optional[str] = None,
         document_id: Optional[str] = None,
         mode: str = "hybrid",
         top_k: Optional[int] = None,
@@ -497,6 +531,7 @@ class DMGuideService:
                 store.match_chunks,
                 vector,
                 script_id=script_id,
+                script_code=script_code,
                 document_id=document_id,
                 match_count=chunk_k,
                 similarity_threshold=threshold,
@@ -506,6 +541,7 @@ class DMGuideService:
                 store.match_qa,
                 vector,
                 script_id=script_id,
+                script_code=script_code,
                 document_id=document_id,
                 category=category,
                 match_count=qa_k,
@@ -564,6 +600,7 @@ class DMGuideService:
         result = await self.search(
             query=question,
             script_id=script_id,
+            script_code=script_dm_code(script),
             mode=mode,
             top_k=top_k,
             min_similarity=min_similarity,

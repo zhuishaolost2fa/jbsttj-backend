@@ -215,7 +215,8 @@ celery -A app.tasks worker -Q dm.embed   -c 6 -n embed@%h
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/v1/auth/register` `/login` `/refresh` | Supabase 认证代理，便于调试 |
-| GET | `/api/v1/auth/me` | 当前登录身份 |
+| GET | `/api/v1/auth/me` | 当前登录身份（含昵称、头像） |
+| PATCH | `/api/v1/auth/me` | 编辑个人资料：昵称 / 头像 URL / 简介（部分更新） |
 | GET | `/health` `/ready` | 存活 / 就绪探针 |
 
 ### 剧本杀筛选维度字典（公开只读）

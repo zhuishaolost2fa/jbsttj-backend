@@ -167,45 +167,75 @@ class DMStore:
         rows = self._rows(resp)
         return rows[0] if rows else None
 
-    def get_active_document(self, script_id: str) -> Optional[Dict[str, Any]]:
-        """取该剧本当前参与检索的那一版手册。
+    def get_active_document(
+        self, script_id: str = "", *, script_code: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """取当前参与检索的手册。
 
-        同一剧本可以有多版手册（重新上传即新版本），但只有 `is_active` 那版
-        进入检索。理论上不会有两版同时 active（`finalize` 会先把旧版下掉），
-        这里仍按 version 倒序取第一条 —— 万一并发写出两条 active，
-        检索侧至少确定性地用最新的那版，而不是随机命中一条。
+        传 `script_code` 时按业务 code 查询，用于同名剧本被拆成多个 script_id 后的
+        详情页聚合；否则保持旧行为，只取单个 script_id 下的最新活跃版本。
+        如果新字段暂时还没回填，自动退回到 script_id 查询，保证旧库可用。
         """
+        params: Dict[str, Any] = {
+            "is_active": "eq.true",
+            "deleted_at": "is.null",
+            "select": "*",
+            "order": "version.desc",
+            "limit": 1,
+        }
+        if script_code:
+            params["script_code"] = f"eq.{script_code}"
+        else:
+            params["script_id"] = f"eq.{script_id}"
+        resp = self._request("GET", f"/{TABLE_DOCUMENTS}", params=params)
+        rows = self._rows(resp)
+        if rows or not script_code or not script_id or script_code == script_id:
+            return rows[0] if rows else None
+        legacy_params = dict(params)
+        legacy_params.pop("script_code", None)
+        legacy_params["script_id"] = f"eq.{script_id}"
+        resp = self._request("GET", f"/{TABLE_DOCUMENTS}", params=legacy_params)
+        rows = self._rows(resp)
+        return rows[0] if rows else None
+
+    def list_active_documents_by_code(self, script_code: str) -> List[Dict[str, Any]]:
+        """取同一业务 code 下所有活跃手册，用于详情页聚合状态。"""
         resp = self._request(
             "GET",
             f"/{TABLE_DOCUMENTS}",
             params={
-                "script_id": f"eq.{script_id}",
+                "script_code": f"eq.{script_code}",
                 "is_active": "eq.true",
                 "deleted_at": "is.null",
                 "select": "*",
-                "order": "version.desc",
-                "limit": 1,
+                "order": "created_at.desc",
             },
         )
-        rows = self._rows(resp)
-        return rows[0] if rows else None
+        return self._rows(resp)
 
-    def latest_job(self, script_id: str) -> Optional[Dict[str, Any]]:
-        """取该剧本最近一次任务，不论是否已结束。
+    def latest_job(self, script_id: str = "", *, script_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """取最近一次任务，不论是否已结束。
 
         与 :meth:`find_active_job` 的区别：那个只看在跑的，用于防重复派发；
         这个包含终态，用于在详情页展示「上次解析失败了，原因是 XXX」。
         """
-        resp = self._request(
-            "GET",
-            f"/{TABLE_JOBS}",
-            params={
-                "script_id": f"eq.{script_id}",
-                "select": "*",
-                "order": "created_at.desc",
-                "limit": 1,
-            },
-        )
+        params: Dict[str, Any] = {
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": 1,
+        }
+        if script_code:
+            params["script_code"] = f"eq.{script_code}"
+        else:
+            params["script_id"] = f"eq.{script_id}"
+        resp = self._request("GET", f"/{TABLE_JOBS}", params=params)
+        rows = self._rows(resp)
+        if rows or not script_code or not script_id or script_code == script_id:
+            return rows[0] if rows else None
+        legacy_params = dict(params)
+        legacy_params.pop("script_code", None)
+        legacy_params["script_id"] = f"eq.{script_id}"
+        resp = self._request("GET", f"/{TABLE_JOBS}", params=legacy_params)
         rows = self._rows(resp)
         return rows[0] if rows else None
 
@@ -218,11 +248,13 @@ class DMStore:
             json=patch,
         )
 
-    def deactivate_other_versions(self, script_id: str, keep_document_id: str) -> None:
-        """把同一剧本下的旧版本文档置为非激活。
+    def deactivate_other_versions(
+        self, script_id: str, keep_document_id: str, *, script_code: Optional[str] = None
+    ) -> None:
+        """把同一剧本实例下的旧版本文档置为非激活。
 
-        DM 手册会改版。旧版本不删除（历史检索结果的外键还指着它），
-        只是从默认检索范围里摘出去。
+        注意这里只按 `script_id` 下线旧版本，不按 `script_code` 下线。因为同一业务 code
+        可能对应多个分片剧本，各片段的手册都应保持 active，供详情页聚合检索。
         """
         self._request(
             "PATCH",
@@ -274,19 +306,19 @@ class DMStore:
         rows = self._rows(resp)
         return rows[0] if rows else None
 
-    def find_active_job(self, script_id: str) -> Optional[Dict[str, Any]]:
-        """查询该剧本是否已有在跑的任务，避免重复派发整条流水线。"""
-        resp = self._request(
-            "GET",
-            f"/{TABLE_JOBS}",
-            params={
-                "script_id": f"eq.{script_id}",
-                "status": f"not.in.({','.join(sorted(TERMINAL_STATES))})",
-                "select": "*",
-                "order": "created_at.desc",
-                "limit": 1,
-            },
-        )
+    def find_active_job(self, script_id: str = "", *, script_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """查询是否已有在跑的任务，避免重复派发整条流水线。"""
+        params: Dict[str, Any] = {
+            "status": f"not.in.({','.join(sorted(TERMINAL_STATES))})",
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": 1,
+        }
+        if script_code:
+            params["script_code"] = f"eq.{script_code}"
+        else:
+            params["script_id"] = f"eq.{script_id}"
+        resp = self._request("GET", f"/{TABLE_JOBS}", params=params)
         rows = self._rows(resp)
         return rows[0] if rows else None
 
@@ -411,6 +443,7 @@ class DMStore:
         embedding: Sequence[float],
         *,
         script_id: Optional[str] = None,
+        script_code: Optional[str] = None,
         document_id: Optional[str] = None,
         match_count: int = 8,
         similarity_threshold: float = 0.25,
@@ -420,6 +453,7 @@ class DMStore:
             {
                 "query_embedding": to_pgvector(embedding),
                 "p_script_id": script_id,
+                "p_script_code": script_code,
                 "p_document_id": document_id,
                 "match_count": match_count,
                 "similarity_threshold": similarity_threshold,
@@ -432,6 +466,7 @@ class DMStore:
         embedding: Sequence[float],
         *,
         script_id: Optional[str] = None,
+        script_code: Optional[str] = None,
         document_id: Optional[str] = None,
         category: Optional[str] = None,
         match_count: int = 8,
@@ -442,6 +477,7 @@ class DMStore:
             {
                 "query_embedding": to_pgvector(embedding),
                 "p_script_id": script_id,
+                "p_script_code": script_code,
                 "p_document_id": document_id,
                 "p_category": category,
                 "match_count": match_count,

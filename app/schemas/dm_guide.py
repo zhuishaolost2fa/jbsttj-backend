@@ -285,6 +285,14 @@ class AskRequest(BaseModel):
         default=None, description="只看某一类问答，仅对 qa / hybrid 模式生效"
     )
 
+    @field_validator("question")
+    @classmethod
+    def _question_not_blank(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("question 不能为空")
+        return v
+
 
 class AskSource(BaseModel):
     """回答引用的一条来源，前端可据此展示出处（章节、页码）。"""
