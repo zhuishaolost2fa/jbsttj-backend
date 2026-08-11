@@ -25,6 +25,7 @@ from app.core.exceptions import (
 )
 from app.core.security import CurrentUser, get_current_user
 from app.schemas.auth import (
+    AvatarPresignResponse,
     ChangeEmailRequest,
     ChangePasswordRequest,
     LoginRequest,
@@ -242,6 +243,32 @@ async def upload_avatar(
     logger.info("用户上传头像成功（id=%s, url=%s）", user.id, avatar_url)
     email_verified = await _resolve_email_verified(auth, user)
     return _profile_response(user, profile, email_verified)
+
+
+@router.post(
+    "/me/avatar/presign",
+    response_model=AvatarPresignResponse,
+    summary="获取头像直传预签名地址",
+)
+async def avatar_presign(
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+    oss: OSSService = Depends(get_oss_service),
+) -> AvatarPresignResponse:
+    """返回头像对象的预签名 PUT 直传地址与最终公开 URL。
+
+    前端拿到后**直接用 PUT 把图片字节传到 OSS**（不经过后端，省带宽），
+    再把 ``avatar_url`` 通过 ``PATCH /auth/me`` 落库即可。
+
+    - key 固定 ``avatars/{user_id}``，永久前缀、覆盖写，URL 长期稳定。
+    - 直传 PUT **不要**带 ``Content-Type`` 头（与预签名保持一致，否则 V4 签名校验失败）。
+    - ``avatar_url`` 为 OSS 永久公开地址；未配置公开域名时为 None，
+      此时前端应退化为 ``POST /auth/me/avatar`` 后端中转上传。
+    """
+    key = f"avatars/{user.id}"
+    upload_url = await oss.presign_put(key, expires=600)  # 10 分钟足够裁剪后上传
+    avatar_url = oss.public_url(key) or f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
+    return AvatarPresignResponse(upload_url=upload_url, key=key, avatar_url=avatar_url)
 
 
 def _check_password_strength(password: str) -> Optional[str]:

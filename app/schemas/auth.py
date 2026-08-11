@@ -117,3 +117,16 @@ class MessageResponse(BaseModel):
     """通用操作结果提示（改密 / 改邮箱等）。"""
 
     message: str
+
+
+class AvatarPresignResponse(BaseModel):
+    """头像直传预签名结果。
+
+    - ``upload_url``：OSS 预签名 PUT 地址，前端直接 PUT 图片字节（不经过后端）。
+    - ``key``：OSS 对象 key（avatars/{user_id}），便于排查。
+    - ``avatar_url``：上传完成后头像的永久公开 URL；若未配置公开域名则为 None。
+    """
+
+    upload_url: str
+    key: str
+    avatar_url: Optional[str] = None
