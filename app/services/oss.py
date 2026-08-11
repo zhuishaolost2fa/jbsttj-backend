@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import alibabacloud_oss_v2 as oss
@@ -402,6 +402,28 @@ class OSSService:
             return await run_in_threadpool(_call)
         except Exception as exc:  # noqa: BLE001
             raise self._wrap(exc, "签发下载地址") from exc
+
+    async def get_object_bytes(self, key: str) -> Tuple[Optional[bytes], Optional[str]]:
+        """读取对象完整内容。
+
+        **仅适合小对象（头像等）**；大文件应走签名下载 URL。
+        对象不存在时返回 ``(None, None)`` 而非抛错，便于上层直接转 404。
+        """
+
+        def _call() -> Tuple[bytes, Optional[str]]:
+            req = oss.GetObjectRequest(bucket=self._settings.oss_bucket, key=key)
+            resp = self.client.get_object(req)
+            body = resp.body
+            data = body.read() if hasattr(body, "read") else bytes(body)
+            return data, resp.content_type
+
+        try:
+            return await run_in_threadpool(_call)
+        except Exception as exc:  # noqa: BLE001
+            wrapped = self._wrap(exc, "读取对象")
+            if isinstance(wrapped, NotFoundError):
+                return None, None
+            raise wrapped from exc
 
     async def delete_object(self, key: str) -> None:
         def _call() -> None:

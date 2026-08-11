@@ -6,10 +6,12 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Path, Query, Response, UploadFile, status
 
+from app.core.exceptions import NotFoundError
 from app.core.security import CurrentUser, get_current_user
 from app.schemas.common import PageResult, Pagination
 from app.schemas.file import DownloadUrlResponse, FileInfo, SimpleUploadResponse
 from app.services.file_service import FileService, get_file_service
+from app.services.oss import OSSService, get_oss_service
 
 router = APIRouter(prefix="/files", tags=["文件管理"])
 
@@ -83,6 +85,29 @@ async def get_download_url(
     service: FileService = Depends(get_file_service),
 ) -> DownloadUrlResponse:
     return await service.get_download_url(user, file_id, expires=expires, inline=inline)
+
+
+@router.get(
+    "/avatar/{user_id}",
+    summary="公开获取用户头像",
+    description=(
+        "从头像对象 ``avatars/{user_id}`` 读取并以图片流返回。"
+        "设计为无需鉴权（头像敏感度低、且个人中心多处展示），URL 稳定长期有效，"
+        "不依赖 bucket 公开读权限。未设置头像时返回 404。"
+    ),
+)
+async def get_avatar(
+    user_id: str = Path(..., description="用户 ID"),
+    oss: OSSService = Depends(get_oss_service),
+) -> Response:
+    data, content_type = await oss.get_object_bytes(f"avatars/{user_id}")
+    if data is None:
+        raise NotFoundError("头像不存在", code="avatar_not_found")
+    return Response(
+        content=data,
+        media_type=content_type or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @router.delete(

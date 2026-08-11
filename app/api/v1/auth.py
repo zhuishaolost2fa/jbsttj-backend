@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 
 from app.core.exceptions import (
     AuthError,
@@ -36,10 +36,25 @@ from app.schemas.auth import (
     TokenResponse,
 )
 from app.services.supabase import SupabaseAuth, SupabaseClient, get_supabase, get_supabase_auth
+from app.services.oss import OSSService, get_oss_service
 
 logger = logging.getLogger("app.auth")
 
 router = APIRouter(prefix="/auth", tags=["鉴权"])
+
+AVATAR_MAX_BYTES = 2 * 1024 * 1024
+_AVATAR_ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def _detect_image_type(data: bytes) -> Optional[str]:
+    """嗅探文件头，识别真实图片类型，防止伪造扩展名 / content-type。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _to_token(data: Dict[str, Any]) -> TokenResponse:
@@ -160,6 +175,53 @@ async def update_me(
     rows = await db.upsert("profiles", data, on_conflict="id")
     profile = rows[0] if rows else {**(current or {}), **data}
 
+    return _profile_response(user, profile)
+
+
+@router.post("/me/avatar", response_model=ProfileResponse, summary="上传并更新头像")
+async def upload_avatar(
+    request: Request,
+    file: UploadFile = File(..., description="头像图片，支持 JPG / PNG / WEBP，大小 ≤ 2MB"),
+    user: CurrentUser = Depends(get_current_user),
+    db: SupabaseClient = Depends(get_supabase),
+    oss: OSSService = Depends(get_oss_service),
+):
+    """上传头像图片（裁剪由前端完成），服务端只负责存储与落库。
+
+    - 校验格式（JPG/PNG/WEBP）、大小（≤2MB），并嗅探文件头防伪装。
+    - 以稳定 key ``avatars/{user_id}`` 覆盖写入，URL 长期不变。
+    - 头像通过后端代理地址返回，避免依赖 bucket 公开读权限。
+    - 成功后清空 avatar_color（已有真实图片，渐变头像不再需要）。
+    """
+    if not db.available:
+        raise DatabaseError("数据库未配置，无法保存头像", code="db_unavailable")
+
+    data = await file.read()
+    if not data:
+        raise ValidationError("图片内容为空", code="empty_avatar")
+    if len(data) > AVATAR_MAX_BYTES:
+        raise ValidationError("头像图片不能超过 2MB", code="avatar_too_large")
+    if (file.content_type or "").lower() not in _AVATAR_ALLOWED_TYPES:
+        raise ValidationError("仅支持 JPG / PNG / WEBP 格式的头像", code="bad_avatar_type")
+    detected = _detect_image_type(data)
+    if detected is None:
+        raise ValidationError("图片内容无法识别，请更换图片后重试", code="bad_avatar")
+    if detected != (file.content_type or "").lower():
+        # 类型不一致不致命，但以嗅探到的真实类型入库，避免被伪造扩展名误导
+        logger.warning("头像声明类型 %s 与实际 %s 不符", file.content_type, detected)
+
+    key = f"avatars/{user.id}"
+    await oss.put_object(key, data, content_type=detected)
+
+    # 公开代理地址：稳定、长期有效，且跨域 <img> 可直接加载
+    avatar_url = f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
+    rows = await db.upsert(
+        "profiles",
+        {"id": user.id, "avatar_url": avatar_url, "avatar_color": None},
+        on_conflict="id",
+    )
+    profile = rows[0] if rows else {"avatar_url": avatar_url, "avatar_color": None}
+    logger.info("用户上传头像成功（id=%s）", user.id)
     return _profile_response(user, profile)
 
 
