@@ -267,11 +267,28 @@ class ImportStatus(BaseModel):
 # 问答（RAG 生成答案）
 # ------------------------------------------------------------
 class AskRequest(BaseModel):
-    """基于手册内容向 LLM 提问，返回带引用的答案。"""
+    """基于手册内容向 LLM 提问，返回带引用的答案。
+
+    扁平调用（前端直接用它对接 `POST /api/v1/dm-guide/ask`）时：
+    - `code` 必填，用来界定「在哪本手册里检索」；
+    - `询问` 与 `question` 二选一，都是自然语言问题（前者给中文前端更顺手）。
+    """
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
-    question: str = Field(min_length=1, max_length=500, description="主持人的问题，自然语言描述")
+    # code 既可以是业务编码也可以是剧本 UUID，service 内部统一按 get_script 解析。
+    # 路径式接口（/scripts/{id_or_code}/dm-guide/ask）不需要它，这里默认 None。
+    code: Optional[str] = Field(
+        default=None,
+        description="剧本业务编码（code）或 UUID，用于界定检索范围（只在该剧本手册内做向量检索）。扁平接口必填。",
+    )
+    # 中文「询问」与英文 question 同时接受（populate_by_name 已开启）
+    question: str = Field(
+        min_length=1,
+        max_length=500,
+        alias="询问",
+        description="主持人的问题（询问），自然语言描述。可用 `询问` 或 `question` 任一键名传入。",
+    )
     mode: str = Field(
         default="hybrid",
         pattern="^(chunk|qa|hybrid)$",

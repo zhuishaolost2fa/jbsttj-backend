@@ -13,6 +13,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Path, Query, status
 
+from app.core.exceptions import ValidationError
 from app.core.security import CurrentUser, get_current_user, get_current_user_optional
 from app.schemas.dm_guide import (
     AskRequest,
@@ -198,6 +199,52 @@ async def ask_dm_guide(
     service: DMGuideService = Depends(get_dm_guide_service),
 ) -> AskResponse:
     script = await scripts.get_script(id_or_code)
+    return await service.ask(
+        question=payload.question,
+        script=script,
+        mode=payload.mode,
+        top_k=payload.top_k,
+        min_similarity=payload.min_similarity,
+        category=payload.category,
+    )
+
+
+# ------------------------------------------------------------
+# 扁平问答接口
+# ------------------------------------------------------------
+# 与前缀 /scripts 的「路径式」ask 功能完全一致，只是把剧本标识从 URL 路径
+# 挪到请求体：前端只需知道剧本的 `code`（或 UUID）加上 `询问` 即可发起检索，
+# 不必先拼出 `/scripts/{id_or_code}` 路径。这样前端在任何拿到剧本 code 的
+# 场景（列表项、详情页、带本页）都能直接调，无需再额外维护 scriptId 映射。
+ask_router = APIRouter(prefix="/dm-guide", tags=["DM 主持人手册"])
+
+
+@ask_router.post(
+    "/ask",
+    response_model=AskResponse,
+    summary="剧本问答（按 code 直接检索）",
+    description=(
+        "与 `POST /scripts/{id_or_code}/dm-guide/ask` 功能完全一致，只是把剧本标识从 URL 路径\n"
+        "挪到了请求体：前端只需知道剧本的 `code`（或 UUID）加上 `询问`，即可发起检索，\n"
+        "不必先拼出 `/scripts/{id_or_code}` 路径。\n\n"
+        "请求体字段：`code`（**必填**，界定检索范围）、`询问`/`question`（**必填**，自然语言问题）、\n"
+        "`mode`、`topK`、`minSimilarity`、`category`（均可选，含义同检索接口）。\n\n"
+        "后端先用 `code` 解析出剧本，再用 `询问` 向量化后在**该剧本手册内**做向量检索，\n"
+        "最后用 LLM 把命中内容合成一条带引用出处的答案。检索范围严格限定在 `code` 对应的手册，\n"
+        "不会跨剧本串味。前置条件同检索：手册须已完成索引（`indexed=true`），否则返回 409。"
+    ),
+)
+async def ask_dm_guide_by_code(
+    payload: AskRequest,
+    user: CurrentUser = Depends(get_current_user),
+    scripts: ScriptService = Depends(get_script_service),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> AskResponse:
+    code = (payload.code or "").strip()
+    if not code:
+        raise ValidationError("code 不能为空，请传入剧本业务编码或 UUID", code="code_required")
+    # question 已由 AskRequest 的校验器保证非空
+    script = await scripts.get_script(code)
     return await service.ask(
         question=payload.question,
         script=script,

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DM 手册问答 · 演示</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #e3e6ea; --text: #1f2328;
+    --muted: #6b7280; --accent: #2563eb; --ok: #15803d; --err: #b91c1c; --warn: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+         font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=text], input[type=password], textarea {
+    flex: 1; min-width: 180px; padding: 8px 10px; border: 1px solid var(--border);
+    border-radius: 6px; font-size: 13px; background: #fff; color: var(--text); font-family: inherit; }
+  textarea { min-height: 64px; resize: vertical; }
+  button { padding: 8px 14px; border: 1px solid var(--border); border-radius: 6px;
+           background: #fff; color: var(--text); font-size: 13px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #c3c8ce; background: #fafbfc; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+         background: #eef2ff; color: #3730a3; margin-right: 6px; }
+  .answer { background: #f8fafc; border-left: 3px solid var(--accent); padding: 12px 14px;
+            border-radius: 6px; white-space: pre-wrap; }
+  ul.sources { margin: 8px 0 0; padding-left: 0; list-style: none; }
+  ul.sources li { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .st { font-size: 12px; }
+  .st.ok { color: var(--ok); } .st.err { color: var(--err); } .st.warn { color: var(--warn); }
+  .hide { display: none; }
+  code { background: #f1f3f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="panel">
+    <h1>DM 手册问答 · 演示</h1>
+    <p class="muted" style="margin:6px 0 14px">
+      对接 <code>POST /api/v1/dm-guide/ask</code>：填剧本 <code>code</code> + 询问，
+      后端向量化后在該剧本手册内做向量检索，再用 LLM 合成带出处的答案。
+    </p>
+    <div class="row">
+      <input type="text" id="apiBase" placeholder="服务地址，留空表示同源">
+      <button id="btnToggleLogin">登录 / 切换账号</button>
+      <span id="authState" class="muted">未登录</span>
+    </div>
+    <div id="loginBox" class="row hide" style="margin-top:10px">
+      <input type="email" id="email" placeholder="邮箱">
+      <input type="password" id="password" placeholder="密码">
+      <button class="primary" id="btnLogin">登录</button>
+      <button id="btnRegister">注册</button>
+      <input type="text" id="tokenInput" placeholder="或直接粘贴 access_token">
+      <button id="btnUseToken">使用此 token</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>问答</h2>
+    <div class="row" style="margin-bottom:10px">
+      <input type="text" id="code" placeholder="剧本 code 或 UUID（界定检索范围）">
+      <button id="btnStatus">查索引状态</button>
+      <span id="statusText" class="muted"></span>
+    </div>
+    <textarea id="question" placeholder="询问，例如：搜证阶段每人能搜几次？"></textarea>
+    <div class="row" style="margin-top:10px; justify-content:space-between">
+      <label class="muted">模式
+        <select id="mode" style="margin-left:6px;padding:6px 8px;border:1px solid var(--border);border-radius:6px">
+          <option value="hybrid">hybrid（推荐）</option>
+          <option value="qa">qa（仅问答对）</option>
+          <option value="chunk">chunk（仅原文块）</option>
+        </select>
+      </label>
+      <button class="primary" id="btnAsk">提问</button>
+    </div>
+  </div>
+
+  <div class="panel hide" id="resultPanel">
+    <h2>答案</h2>
+    <div class="answer" id="answer"></div>
+    <h2 style="margin-top:16px">引用来源</h2>
+    <ul class="sources" id="sources"></ul>
+    <p class="muted" id="meta"></p>
+  </div>
+
+</div>
+
+<script>
+const S = {
+  api: localStorage.getItem('upload_api') || '',
+  token: localStorage.getItem('upload_token') || '',
+};
+
+const $ = id => document.getElementById(id);
+
+// 与 index.html 同款的请求封装
+async function api(method, path, body, opts = {}) {
+  const headers = { 'Accept': 'application/json' };
+  if (S.token) headers['Authorization'] = 'Bearer ' + S.token;
+  if (body !== undefined && !(body instanceof FormData)) headers['Content-Type'] = 'application/json';
+  const resp = await fetch(`${S.api}/api/v1${path}`, {
+    method, headers,
+    body: body === undefined ? undefined : (body instanceof FormData ? body : JSON.stringify(body)),
+    signal: opts.signal,
+  });
+  if (resp.status === 204) return null;
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const e = data.error || {};
+    const err = new Error(e.message || `请求失败 (${resp.status})`);
+    err.code = e.code; err.details = e.details; err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------- 鉴权（复用上传页逻辑）
+function setToken(token, email) {
+  S.token = token || '';
+  localStorage.setItem('upload_token', S.token);
+  $('authState').textContent = S.token ? `已登录${email ? '：' + email : ''}` : '未登录';
+  $('authState').className = S.token ? 'st ok' : 'muted';
+}
+$('apiBase').value = S.api;
+$('apiBase').onchange = e => {
+  S.api = e.target.value.trim().replace(/\/$/, '');
+  localStorage.setItem('upload_api', S.api);
+};
+$('btnToggleLogin').onclick = () => $('loginBox').classList.toggle('hide');
+$('btnLogin').onclick = async () => {
+  try {
+    const r = await api('POST', '/auth/login', { email: $('email').value, password: $('password').value });
+    setToken(r.access_token, $('email').value);
+    $('loginBox').classList.add('hide');
+  } catch (e) { alert('登录失败：' + e.message); }
+};
+$('btnRegister').onclick = async () => {
+  try {
+    const r = await api('POST', '/auth/register', { email: $('email').value, password: $('password').value });
+    if (r.access_token) { setToken(r.access_token, $('email').value); alert('注册成功并已登录'); }
+    else alert('注册成功，请前往邮箱完成验证后再登录');
+  } catch (e) { alert('注册失败：' + e.message); }
+};
+$('btnUseToken').onclick = () => {
+  const t = $('tokenInput').value.trim();
+  if (t) { setToken(t); $('loginBox').classList.add('hide'); }
+};
+setToken(S.token);
+
+// ---------------------------------------------------------------- 索引状态
+$('btnStatus').onclick = async () => {
+  const code = $('code').value.trim();
+  if (!code) return alert('请先填写剧本 code');
+  if (!S.token) return alert('请先登录');
+  $('statusText').className = 'muted';
+  $('statusText').textContent = '查询中…';
+  try {
+    const st = await api('GET', `/scripts/${encodeURIComponent(code)}/dm-guide`);
+    if (st.indexed) {
+      $('statusText').className = 'st ok';
+      $('statusText').textContent = `可问答 · 分块 ${st.totalChunks} · 问答对 ${st.totalQa}`;
+    } else if (st.hasGuide) {
+      $('statusText').className = 'st warn';
+      $('statusText').textContent = '手册已上传，解析中（暂不可问答）';
+    } else {
+      $('statusText').className = 'st warn';
+      $('statusText').textContent = '该剧本尚未上传 DM 手册';
+    }
+  } catch (err) {
+    $('statusText').className = 'st err';
+    $('statusText').textContent = '查询失败：' + err.message;
+  }
+};
+
+// ---------------------------------------------------------------- 提问
+$('btnAsk').onclick = async () => {
+  const code = $('code').value.trim();
+  const question = $('question').value.trim();
+  if (!S.token) return alert('请先登录');
+  if (!code) return alert('请填写剧本 code');
+  if (!question) return alert('请填写询问');
+
+  const btn = $('btnAsk');
+  btn.disabled = true; btn.textContent = '生成中…';
+  $('resultPanel').classList.add('hide');
+
+  try {
+    const res = await api('POST', '/dm-guide/ask', {
+      code,
+      询问: question,
+      mode: $('mode').value,
+      topK: 6,
+    });
+    render(res);
+  } catch (err) {
+    if (err.code === 'dm_not_indexed') {
+      alert('该剧本手册还在解析中，暂不能问答');
+    } else {
+      alert('问答失败：' + err.message);
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = '提问';
+  }
+};
+
+function render(res) {
+  $('resultPanel').classList.remove('hide');
+  $('answer').textContent = res.answer || '（未生成答案）';
+  $('sources').innerHTML = (res.sources || []).map(s => {
+    const where = [ (s.sectionPath || []).join(' > '),
+                    s.pageStart ? `P${s.pageStart}${s.pageEnd && s.pageEnd !== s.pageStart ? '-' + s.pageEnd : ''}` : '' ]
+      .filter(Boolean).join(' ');
+    const text = s.type === 'qa' ? (s.answer || '') : (s.content || '');
+    const sim = s.similarity != null ? ` · 相似度 ${(s.similarity * 100).toFixed(0)}%` : '';
+    return `<li><span class="tag">${s.type || ''}</span>${text}
+            <div class="muted">${where}${sim}</div></li>`;
+  }).join('');
+  $('meta').textContent =
+    `mode=${res.mode} · tookMs=${res.tookMs}${res.documentId ? ' · doc=' + res.documentId : ''}`;
+}
+</script>
+</body>
+</html>

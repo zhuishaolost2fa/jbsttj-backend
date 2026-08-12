@@ -27,6 +27,23 @@ def test_ask_request_strips_question():
     assert payload.question == "搜证阶段每人能搜几次？"
 
 
+def test_ask_request_accepts_chinese_alias():
+    # 前端用「询问」键名传入，等价于 question
+    payload = AskRequest(**{"询问": "搜证阶段每人能搜几次？"})
+    assert payload.question == "搜证阶段每人能搜几次？"
+
+
+def test_ask_request_code_field():
+    payload = AskRequest(question="搜证阶段每人能搜几次？", code="xiaochikuaican")
+    assert payload.code == "xiaochikuaican"
+
+
+def test_ask_request_code_optional():
+    # 路径式接口不传 code，应为 None
+    payload = AskRequest(question="搜证阶段每人能搜几次？")
+    assert payload.code is None
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
