@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -228,6 +229,40 @@ def _escape_like(keyword: str) -> str:
     return keyword.strip()
 
 
+# 文件名扩展名：导入时标题常从文件名派生，需剥掉
+_TITLE_EXT_RE = re.compile(r"\.(pdf|docx?|txt|epub|pptx?|md|rtf)$", re.IGNORECASE)
+# 操作系统复制文件时自动追加的噪音：「副本」「copy」「（1）」
+_TITLE_DUP_RE = re.compile(r"\s*(副本|copy)$", re.IGNORECASE)
+_TITLE_PAREN_NUM_RE = re.compile(r"[（(]\s*[0-9]+\s*[）)]\s*$")
+
+
+def normalize_title_key(title: str) -> str:
+    """把剧本标题归一化成「同一本剧本」的稳定匹配键，用于导入去重。
+
+    只清掉系统噪音，不清用户有意写的序号：
+      - 去首尾空白、转小写；
+      - 剥文件名扩展名（.pdf/.docx...）；
+      - 去掉操作系统复制文件自动加的「副本 / copy /（1）」等。
+
+    于是「山母鬼」「山母鬼.pdf」「山母鬼 副本」「山母鬼（1）」都被识别为同一本，
+    重传时合并回原行，而不是生成 shan-mu-gui-2 这种假续集编码。
+
+    刻意**保留**「山母鬼2」「山母鬼 第二部」等用户有意序号，避免把真续集误判成重传。
+    """
+    if not title:
+        return ""
+    key = title.strip().lower()
+    key = _TITLE_EXT_RE.sub("", key)
+    # 反复清理，兼容「山母鬼 副本（1）」这类噪音叠加
+    for _ in range(3):
+        new = _TITLE_PAREN_NUM_RE.sub("", key)
+        new = _TITLE_DUP_RE.sub("", new).strip()
+        if new == key:
+            break
+        key = new
+    return key
+
+
 class ScriptOptionRepository:
     """剧本杀筛选维度字典的读写。
 
@@ -434,18 +469,31 @@ class ScriptRepository:
 
         匹配规则（与「按名称找剧本」语义一致，但只取精确命中，供关联使用）：
         - 标题精确匹配（忽略大小写，先清理特殊字符避免破坏 `or=()` 语法）；
-        - 或别名数组精确包含该名称。
+        - 或别名数组精确包含该名称；
+        - 上面两者都用「归一化键」再过一遍：剥掉扩展名 / 首尾空白 / 系统复制噪音，
+          于是「山母鬼」「山母鬼.pdf」「山母鬼 副本」都命中同一条，重传时合并回原行，
+          避免生成 shan-mu-gui-2 这类假续集编码。
 
         排除了软删除记录。命中多个时取热度最高的一条，导入关联落到最可能被
         用户认领的那份上。找不到返回 `None`。
         """
-        safe = _escape_like(title)
-        if not safe:
+        raw = (title or "").strip()
+        if not raw:
             return None
+        key = normalize_title_key(title)
+        if not key:
+            return None
+        esc_raw = _escape_like(raw)
+        esc_key = _escape_like(key)
         filters: Dict[str, str] = {}
         if not include_deleted:
             filters["deleted_at"] = "is.null"
-        filters["or"] = f"(title.ilike.{safe},aliases.cs.{{{safe}}})"
+        # 归一化键同时匹配标题与别名，让同一本剧本的不同标题写法都能关联
+        filters["or"] = (
+            f"(title.ilike.{esc_raw},"
+            f"title.ilike.{esc_key},"
+            f"aliases.cs.{{{esc_key}}})"
+        )
         rows = await self.db.select(
             TABLE_SCRIPTS,
             filters=filters,

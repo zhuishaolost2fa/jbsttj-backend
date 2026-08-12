@@ -32,7 +32,7 @@ from app.schemas.script import (
     ScriptSearchByNameResult,
     ScriptUpdate,
 )
-from app.services.repository import ScriptRepository
+from app.services.repository import ScriptRepository, normalize_title_key
 from app.services.script_option_service import ScriptOptionService, get_script_option_service
 from app.schemas.dm_guide import DMGuideRef
 
@@ -182,6 +182,15 @@ class ScriptService:
             raise ConflictError(f"剧本编码已存在: {code}", code="script_code_exists")
         data["code"] = code
 
+        # 把归一化标题键写入别名，使后续「山母鬼.pdf」之类的重传能反向匹配到本行
+        key = normalize_title_key(payload.title)
+        if key:
+            aliases = list(data.get("aliases") or [])
+            if key not in aliases:
+                aliases.append(key)
+            if aliases:
+                data["aliases"] = aliases
+
         data.setdefault("status", "published")
         if user_id:
             data["created_by"] = user_id
@@ -204,6 +213,15 @@ class ScriptService:
         skip = {"title", "code", "created_by", "id", "deleted_at"}
 
         merged: Dict[str, Any] = {}
+
+        # 把本次导入的归一化标题键并入已有剧本的别名：同一本剧本用过的各种标题
+        # 写法（山母鬼 / 山母鬼.pdf / 山母鬼 副本）都能在后续重传时被匹配到
+        key = normalize_title_key(data.get("title") or "")
+        if key:
+            existing_aliases = list(existing.get("aliases") or [])
+            if key not in existing_aliases:
+                existing_aliases.append(key)
+                merged["aliases"] = existing_aliases
 
         # 1) 挂 DM 手册
         existing_extra = dict(existing.get("extra") or {})
