@@ -261,11 +261,24 @@ class DMGuideService:
             script_id = str(getattr(script, "id", "") or "")
             store = store_mod.get_dm_store()
 
-            # 已经建好索引且文件没换过，就不必重跑
+            # 已经建好索引且文件没换过：绝大多数情况不必重跑。
+            # 但若是「退化索引」——建了文档却 0 块或 0 问答（例如上一轮 QA 生成阶段
+            # 中途失败），必须自动补跑，否则就是用户说的「导入后不再处理」的卡死态。
             doc = await run_in_threadpool(store.get_active_document, script_id)
             ref = DMGuideRef.from_extra(getattr(script, "extra", None))
             if doc and ref and doc.get("object_key") == ref.object_key:
-                return None
+                total_chunks = int(doc.get("total_chunks") or 0)
+                total_qa = int(doc.get("total_qa") or 0)
+                if total_chunks > 0 and total_qa > 0:
+                    return None
+                logger.info(
+                    "检测到退化索引(块=%s 问答=%s)，自动以 force 补跑解析 script=%s",
+                    total_chunks, total_qa, script_id,
+                )
+                result = await self.trigger_ingest(
+                    script, payload=IngestRequest(force=True), user_id=user_id
+                )
+                return result.job_id
 
             result = await self.trigger_ingest(script, user_id=user_id)
             return result.job_id

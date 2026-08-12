@@ -154,8 +154,9 @@ class Settings(BaseSettings):
     dm_header_footer_ratio: float = 0.6
     # 每批送给 LLM 生成问答对的块数
     dm_qa_batch_size: int = 6
-    # 每个块期望生成的问答对数量上限
-    dm_qa_per_chunk: int = 3
+    # 每个块期望生成的问答对数量上限（提示词已要求「尽可能多」、
+    # 多角度生成；此处为安全上限，避免单批 token 爆炸）
+    dm_qa_per_chunk: int = 5
     # 检索默认返回条数与相似度下限
     dm_search_top_k: int = 8
     dm_search_min_similarity: float = 0.25

@@ -410,12 +410,26 @@ class DMStore:
     def insert_qa(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not rows:
             return []
+        # 同批次内若同一 question_hash 出现多次（模型在同一批里重复产出相同问句，
+        # 多见于「每片段多生成」之后），PostgREST 的单条 ON CONFLICT DO UPDATE
+        # 会报「cannot affect row a second time」直接 500，拖垮整条流水线。
+        # 入库前先按 question_hash 去重（保留第一条）；跨批次的重复由 on_conflict 兜底合并。
+        seen: set = set()
+        uniq: List[Dict[str, Any]] = []
+        for r in rows:
+            key = r.get("question_hash")
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
+        if len(uniq) != len(rows):
+            logger.info("insert_qa 同批次去重：%s -> %s 条", len(rows), len(uniq))
         resp = self._request(
             "POST",
             f"/{TABLE_QA}",
             params={"on_conflict": "document_id,question_hash"},
             headers={"Prefer": "resolution=merge-duplicates,return=representation"},
-            json=list(rows),
+            json=list(uniq),
         )
         return self._rows(resp)
 
