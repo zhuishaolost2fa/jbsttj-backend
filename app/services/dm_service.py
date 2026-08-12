@@ -685,6 +685,13 @@ def _to_chunk_hit(row: Dict[str, Any]) -> ChunkHit:
 
 
 def _to_qa_hit(row: Dict[str, Any]) -> QAHit:
+    # section_path 在 DB 里是 text[]，PostgREST 正常返回 JSON 数组；
+    # 但历史脏数据可能是逗号串，这里兼容一下，与 _to_chunk_hit 保持一致。
+    raw_path = row.get("section_path")
+    if isinstance(raw_path, str):
+        section_path = [p for p in (s.strip() for s in raw_path.split(",")) if p]
+    else:
+        section_path = list(raw_path or [])
     return QAHit(
         id=str(row.get("id") or ""),
         document_id=str(row.get("document_id") or ""),
@@ -692,6 +699,9 @@ def _to_qa_hit(row: Dict[str, Any]) -> QAHit:
         answer=str(row.get("answer") or ""),
         category=row.get("category"),
         chunk_id=(str(row["chunk_id"]) if row.get("chunk_id") else None),
+        section_path=section_path,
+        page_start=int(row.get("page_start") or 0),
+        page_end=int(row.get("page_end") or 0),
         similarity=round(float(row.get("similarity") or 0.0), 4),
     )
 

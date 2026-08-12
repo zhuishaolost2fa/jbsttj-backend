@@ -165,6 +165,11 @@ class QAHit(BaseModel):
     answer: str = Field(description="答案")
     category: Optional[str] = Field(default=None, description="问题分类")
     chunk_id: Optional[str] = Field(default=None, description="来源分块 ID")
+    # 与 ChunkHit 保持一致：问答对同样带章节面包屑与页码，
+    # 下游 ask() 组装 AskSource 时要取这些字段，缺一不可，否则 AttributeError → 500。
+    section_path: List[str] = Field(default_factory=list, description="章节面包屑")
+    page_start: int = Field(default=0, description="起始页")
+    page_end: int = Field(default=0, description="结束页")
     similarity: float = Field(default=0.0, description="余弦相似度")
 
 

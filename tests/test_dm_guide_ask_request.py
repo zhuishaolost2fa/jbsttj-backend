@@ -12,6 +12,7 @@ from pydantic import ValidationError
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.schemas.dm_guide import AskRequest
+from app.services.dm_service import _to_qa_hit
 
 
 def test_ask_request_rejects_blank_question():
@@ -42,6 +43,42 @@ def test_ask_request_code_optional():
     # 路径式接口不传 code，应为 None
     payload = AskRequest(question="搜证阶段每人能搜几次？")
     assert payload.code is None
+
+
+def test_qa_hit_carries_page_and_section():
+    """回归测试：问答对必须带上章节与页码，否则 ask() 拼 AskSource 取
+    h.section_path / h.page_start / h.page_end 会抛 AttributeError → 500。
+
+    模拟 match_dm_qa RPC 的返回行（含 section_path / page_start / page_end）。
+    """
+    row = {
+        "id": "qa-1",
+        "document_id": "doc-1",
+        "question": "马踏春是怎么死的",
+        "answer": "被……",
+        "category": "clue",
+        "chunk_id": "c-1",
+        "section_path": ["第一章", "真相"],
+        "page_start": 12,
+        "page_end": 13,
+        "similarity": 0.9123,
+    }
+    hit = _to_qa_hit(row)
+    assert hit.section_path == ["第一章", "真相"]
+    assert hit.page_start == 12
+    assert hit.page_end == 13
+    # 复现 ask() 里从 QAHit 取字段组装 AskSource 的操作，确认不再 AttributeError
+    from app.schemas.dm_guide import AskSource
+
+    AskSource(
+        type="qa",
+        similarity=hit.similarity,
+        question=hit.question,
+        answer=hit.answer,
+        section_path=hit.section_path,
+        page_start=hit.page_start,
+        page_end=hit.page_end,
+    )
 
 
 def _run_all():
