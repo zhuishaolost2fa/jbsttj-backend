@@ -546,6 +546,23 @@ class ScriptRepository:
         )
         return rows[0] if rows else None
 
+    async def update_by_code(
+        self, code: str, data: Dict[str, Any], *, include_deleted: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """按 code 更新（用于撞 `uq_scripts_code` 唯一约束时把提交「补充」到已有行）。
+
+        ``include_deleted=True`` 时不过滤软删除，并在更新时把 ``deleted_at`` 置空，
+        从而「复活」因竞态被软删的重复记录，避免并发下仍报唯一约束错误。
+        """
+        payload = {**data, "updated_at": _now()}
+        filters: Dict[str, str] = {"code": f"eq.{code}"}
+        if include_deleted:
+            payload["deleted_at"] = None
+        else:
+            filters["deleted_at"] = "is.null"
+        rows = await self.db.update(TABLE_SCRIPTS, filters=filters, data=payload)
+        return rows[0] if rows else None
+
     async def soft_delete(self, script_id: str) -> Optional[Dict[str, Any]]:
         rows = await self.db.update(
             TABLE_SCRIPTS,

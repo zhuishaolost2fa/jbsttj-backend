@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pypinyin import lazy_pinyin
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import DatabaseError, NotFoundError, ValidationError
 from app.data import script_options_seed as opt_seed
 from app.schemas.common import Pagination
 from app.schemas.script import (
@@ -41,6 +41,11 @@ logger = logging.getLogger("app.script")
 
 MAX_PAGE_SIZE = 100
 
+# 补充更新时绝不改动的身份 / 系统字段
+_IDENTITY_FIELDS = ("id", "code", "created_by", "created_at", "deleted_at")
+# 补充更新时按「并集」合并的数组字段（避免覆盖库存信息）
+_ARRAY_FIELDS = ("aliases", "playstyles", "themes", "tags")
+
 
 def slugify(title: str) -> str:
     """把剧本名转成 URL 友好的 code 片段。
@@ -56,6 +61,23 @@ def slugify(title: str) -> str:
     ascii_only = normalized.encode("ascii", "ignore").decode("ascii").lower()
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_only).strip("-")
     return slug[:48]
+
+
+def _is_unique_violation(exc: DatabaseError, constraint: str) -> bool:
+    """判断数据库异常是否由指定唯一约束冲突引起。
+
+    PostgREST 在撞唯一约束时返回的 body 形如：
+    ``{"code":"23505","details":"Key (code)=(xxx) already exists.",
+       "message":"duplicate key value violates unique constraint \\"uq_scripts_code\\""}``
+    这里按「约束名」精确识别（PostgreSQL 总会把约束名带在 message 里），
+    避免把其它表的 23505 误判成本表的 code 冲突。
+    """
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        text = f"{details.get('message', '')} {details.get('details', '')}"
+    else:
+        text = str(details)
+    return constraint in text
 
 
 class ScriptService:
@@ -168,19 +190,53 @@ class ScriptService:
             row = await self.repo.update(existing["id"], merged)
             if row is None:
                 # 极端竞态：查到之后被软删了，退化为新建，避免导入静默失败
-                return await self._create_new(payload, data, user_id=user_id)
+                return await self._create_or_supplement(payload, data, user_id=user_id)
             logger.info("导入关联到已有剧本 %s (%s)", row.get("title"), row.get("code"))
             return self._to_item(row, await self._label_map()), False
 
-        # 2) 库里没有 -> 新建
-        return await self._create_new(payload, data, user_id=user_id)
+        # 2) 库里没有 -> 新建（若 code 撞唯一约束则自动转为补充更新）
+        return await self._create_or_supplement(payload, data, user_id=user_id)
 
-    async def _create_new(
+    @staticmethod
+    def _merge_upsert(existing: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+        """把提交的字段「补充」进已有剧本（code 冲突时的更新语义）。
+
+        - 身份 / 系统字段（id / code / created_by / created_at / deleted_at）绝不改动；
+        - 标量字段：以本次提交值为准（update 语义，提交即覆盖）；
+        - 数组字段（别名 / 玩法 / 题材 / 标签）：与已有值取并集，避免覆盖掉库存信息；
+        - extra(jsonb)：按 key 深合并，保留已有键、覆盖传入键。
+        """
+        merged: Dict[str, Any] = {}
+        existing_extra = dict(existing.get("extra") or {})
+        incoming_extra = dict(data.get("extra") or {})
+        for key, value in data.items():
+            if key in _IDENTITY_FIELDS:
+                continue
+            if key == "extra":
+                merged["extra"] = {**existing_extra, **incoming_extra}
+                continue
+            if key in _ARRAY_FIELDS and isinstance(value, list):
+                base = list(existing.get(key) or [])
+                for item in value:
+                    if item not in base:
+                        base.append(item)
+                merged[key] = base
+                continue
+            merged[key] = value
+        return merged
+
+    async def _create_or_supplement(
         self, payload: ScriptCreate, data: Dict[str, Any], *, user_id: Optional[str] = None
     ) -> Tuple[ScriptItem, bool]:
+        """新增剧本；若 code 与 `uq_scripts_code` 冲突，则转为「补充更新」而非报错。
+
+        这是 POST /api/v1/scripts 幂等化的关键：重复提交同一 code 时不再 500，
+        而是把本次提交合并进已有行（身份字段不动），返回 `was_created=False`，
+        语义与「导入去重关联」保持一致。
+        """
         # 不再做 code 唯一性校验：code 直接由标题经 pinyin 派生（仅标题含数字才带数字），
-        # 生成后即使用。重名碰撞不再抛错、也不再自动加 -2/-3 序号；若数据库唯一约束兜底
-        # 拦下重复 code，将按数据库错误返回，而不是凭空造一个「假续集」编码。
+        # 生成后即使用。若与已有 code 撞车，不报错、也不造「假续集」编码，
+        # 而是把本次提交「补充」到已有行上（见下方冲突处理）。
         code = data.get("code") or await self._generate_code(payload.title)
         data["code"] = code
 
@@ -197,7 +253,33 @@ class ScriptService:
         if user_id:
             data["created_by"] = user_id
 
-        row = await self.repo.create(data)
+        # 1) 主动查重：code 已存在则说明是重复提交，直接转为「补充更新」
+        existing = await self.repo.get_by_code(code)
+        if existing is not None:
+            merged = self._merge_upsert(existing, data)
+            row = await self.repo.update(existing["id"], merged)
+            # 竞态：查到后该行被软删，退化为按 code 复活更新
+            if row is None:
+                row = await self.repo.update_by_code(code, merged, include_deleted=True)
+            logger.info("code 已存在，补充更新剧本 %s (%s)", row.get("title"), row.get("code"))
+            return self._to_item(row, await self._label_map()), False
+
+        # 2) 库里没有该 code -> 新建；若并发写入仍撞唯一约束，兜底转补充更新
+        try:
+            row = await self.repo.create(data)
+        except DatabaseError as exc:
+            if not _is_unique_violation(exc, "uq_scripts_code"):
+                raise
+            logger.info("code 并发冲突，转为补充更新: %s", code)
+            existing = await self.repo.get_by_code(code, include_deleted=True)
+            if existing is None:
+                raise
+            merged = self._merge_upsert(existing, data)
+            row = await self.repo.update_by_code(code, merged, include_deleted=True)
+            if row is None:
+                raise
+            return self._to_item(row, await self._label_map()), False
+
         logger.info("新增剧本 %s (%s)", row.get("title"), row.get("code"))
         return self._to_item(row, await self._label_map()), True
 

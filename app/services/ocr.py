@@ -1,14 +1,17 @@
-"""阿里云 OCR 识别（处理图片型 / 扫描件 PDF）。
+"""OCR 识别（处理图片型 / 扫描件 PDF）。
 
 DM 主持人手册经常是整页扫描的 PDF：PyMuPDF 抽不到文字层。流水线在提取阶段
-发现「某页没有文字块、但有图片」，就把该页渲染成 PNG 交给阿里云
-`RecognizeAllText` 识别，再把识别文本接回既有的分块 / 向量化流程。
+发现「某页没有文字块、但有图片」，就把该页渲染成 PNG 交给**本地免费 OCR 引擎**
+（`rapid` / `paddle` / `tesseract`，由 `OCR_ENGINE` 配置）识别，再把识别文本
+接回既有的分块 / 向量化流程。
+
+**阿里云 OCR 已禁用**：任何路径都不再调用阿里云 `RecognizeAllText`（`ocr_image`
+遇到 `aliyun` 直接抛 `OcrUnavailable`，`get_ocr_client` 也不再构建付费客户端），
+以避免产生对外付费请求。本地引擎未安装时 OCR 会优雅跳过，扫描页拿不到文字层。
 
 OCR 文本没有字号、加粗、精确坐标，这里给标题行赋一个**伪字号**，让下游既有
 的 `classify_block` / `calibrate_headings` / `build_section_paths` 逻辑照常产出
 章节层级，而不是把所有 OCR 文本都当成一坨正文。
-
-鉴权复用阿里云 OSS 的 AccessKey（同账号），签名由官方 Tea SDK 处理。
 """
 
 from __future__ import annotations
@@ -59,30 +62,14 @@ class OcrUnavailable(RuntimeError):
 def get_ocr_client(settings) -> "OcrClient":
     """构建阿里云 OCR 客户端。
 
-    优先用专门的 OCR 密钥，缺省复用 OSS 的 AccessKey（同账号）。
+    ⚠️ 阿里云 OCR 已禁用：本函数不再对外提供服务，调用即抛错，
+    以确保任何代码路径都无法触发付费的 ``RecognizeAllText`` 请求。
+    需要 OCR 时请改用本地免费引擎（OCR_ENGINE=rapid/paddle/tesseract）。
     """
-    if not _OCR_SDK_AVAILABLE:
-        raise OcrUnavailable(
-            "未安装阿里云 OCR SDK，请执行：pip install alibabacloud_ocr_api20210707"
-        )
-    ak = settings.ocr_access_key_id or settings.oss_access_key_id
-    sk = settings.ocr_access_key_secret or settings.oss_access_key_secret
-    if not ak or not sk:
-        raise OcrUnavailable(
-            "缺少 OCR 访问密钥（且无法复用 OSS 密钥），请在 .env 配置 "
-            "OCR_ACCESS_KEY_ID / OCR_ACCESS_KEY_SECRET"
-        )
-    config = open_api_models.Config(access_key_id=ak, access_key_secret=sk)
-    config.endpoint = settings.ocr_endpoint
-    # 整页扫描图渲染出的 PNG 偏大，识别耗时可能超过 Tea SDK 默认的 10s 读超时，
-    # 这里把读超时放宽到 60s、连接超时 10s，避免单页超时把整本 OCR 拖垮。
-    config.read_timeout = 60000
-    config.connect_timeout = 10000
-    # 扫描件渲染出的 PNG 较大，向阿里云上传识别请求时写超时也会触发
-    # （日志曾出现 'The write operation timed out'）；放宽到 60s 让单页失败快速返回，
-    # 由 extract_shard 的 try/except 吞掉并跳过，而不是把整本 OCR 拖死。
-    config.write_timeout = 60000
-    return OcrClient(config)
+    raise OcrUnavailable(
+        "阿里云 OCR 已禁用，无法构建阿里云 OCR 客户端；"
+        "请改用本地引擎（rapid/paddle/tesseract）"
+    )
 
 
 # OCR 接口单图硬上限 8192px，但官方建议走 URL 时图片 < 1.5MB。
@@ -193,23 +180,24 @@ def _ocr_image_local(image_bytes: bytes, engine: str) -> str:
 def ocr_image(client, image_bytes: bytes, ocr_type: str = "General", *, engine: Optional[str] = None) -> str:
     """识别单张图片的二进制内容，返回识别文本。
 
-    引擎由 ``OCR_ENGINE`` 配置决定（默认 aliyun，行为不变）：
+    引擎由 ``OCR_ENGINE`` 配置决定（默认 ``rapid``，本地离线免费）：
 
-      - ``aliyun``  → 走阿里云 ``RecognizeAllText``（付费，需 ``client``）；
       - ``rapid`` / ``paddle`` / ``tesseract`` → 本地离线免费引擎，
-        不再需要 ``client``，也不产生任何对外请求。
+        不需要 ``client``，也不产生任何对外请求；
+      - ``aliyun`` → **已禁用**，调用即抛 ``OcrUnavailable``，绝不触发付费云识别。
 
-    `RecognizeAllText` 的 `Url` 与 `body` 二选一；aliyun 路径走 `body` 直接传二进制，
-    省去先把页面上传到公网 URL 的环节。
+    注意：**阿里云 OCR 已禁用**，``client`` 参数在此处不再有意义（``get_ocr_client``
+    也已改为直接抛错），请勿再传入阿里云客户端。
     """
     if engine is None:
         from app.core.config import get_settings
 
-        engine = (get_settings().ocr_engine or "aliyun").lower()
+        engine = (get_settings().ocr_engine or "rapid").lower()
     if engine == "aliyun":
-        if client is None:
-            raise OcrUnavailable("未提供阿里云 OCR 客户端（本地引擎未启用）")
-        return _ocr_image_aliyun(client, image_bytes, ocr_type)
+        # 阿里云 OCR 已禁用（见 OCR_ENGINE 配置约束）：任何途径都不得触发付费云识别。
+        raise OcrUnavailable(
+            "阿里云 OCR 已禁用，OCR_ENGINE 请改用本地引擎（rapid/paddle/tesseract）"
+        )
     return _ocr_image_local(image_bytes, engine)
 
 

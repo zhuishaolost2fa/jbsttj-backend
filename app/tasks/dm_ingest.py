@@ -493,7 +493,9 @@ def extract_shard(
         page_start, page_end = unit_start, unit_end
 
     # ---- OCR 兜底：仅对图片型 / 扫描件 PDF ----
-    # 某页抽不到文字块、但有图片（PDF 是整页扫描），交给阿里云 OCR 识别后并回块列表。
+    # 某页抽不到文字块、但有图片（PDF 是整页扫描），交给**本地免费 OCR 引擎**识别后并回块列表。
+    # 阿里云 OCR 已禁用，绝不调用付费云识别；引擎未安装时 ocr_image 抛 OcrUnavailable，
+    # 由下方 try/except 吞掉并跳过该页，扫描件不再当纯噪声丢进噪声统计。
     # docx 自带文字层且无真页码（page_start/page_end 是文本单元序号，不是页），
     # 套用按页 OCR 会对每个「伪页码」空跑 render_page_png，必须整体跳过。
     if doc_format == "docx":
@@ -505,18 +507,9 @@ def extract_shard(
         from app.services.ocr import blocks_from_ocr, ocr_image, render_page_png
 
         settings = get_settings()
-        engine = (settings.ocr_engine or "aliyun").lower()
-        # 本地免费引擎不需要 aliyun client；只有 aliyun 才去构建客户端，
-        # 拿不到密钥时整段跳过，不再把扫描件当纯噪声丢进噪声统计。
+        engine = (settings.ocr_engine or "rapid").lower()
+        # 阿里云 OCR 已禁用：只走本地免费引擎，不需要也不构建任何阿里云 client。
         client = None
-        if engine == "aliyun":
-            try:
-                from app.services.ocr import get_ocr_client
-
-                client = get_ocr_client(settings)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("阿里云 OCR 客户端不可用，跳过 OCR 兜底：%s", exc)
-                need_ocr = []
         ocr_hits = 0
         for pno in need_ocr:
             try:

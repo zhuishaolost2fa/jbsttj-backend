@@ -62,10 +62,12 @@ class Settings(BaseSettings):
     ocr_type: str = "General"          # General=通用印刷体基础版；Advanced=高精版
     ocr_dpi: int = 130                 # 扫描页渲染成 PNG 的 DPI（越大越准但越慢；内部还会按最长边封顶）
 
-    # ---------------- 本地免费 OCR（替代阿里云 OCR，离线运行）----------------
-    # aliyun=付费云识别（默认，行为不变）；rapid=RapidOCR(ONNX，轻量中文准)；
-    # paddle=PaddleOCR(精度最高但依赖 paddlepaddle，体积大)；tesseract=Tesseract(超轻量，中文版式弱)
-    ocr_engine: str = "aliyun"
+    # ---------------- 本地免费 OCR（已取代阿里云 OCR，离线运行）----------------
+    # 阿里云 OCR 已禁用：OCR_ENGINE 不再接受 aliyun 取值，默认改为本地引擎。
+    # rapid=RapidOCR(ONNX，轻量中文准)；paddle=PaddleOCR(精度最高但依赖 paddlepaddle，体积大)；
+    # tesseract=Tesseract(超轻量，中文版式弱)。对应依赖需在 requirements 中自行启用，
+    # 未安装时 OCR 会优雅跳过（扫描页拿不到文字层，不再触发任何对外请求）。
+    ocr_engine: str = "rapid"
     # LibreOffice 可执行文件路径，用于把旧版二进制 .doc 本地转成 .docx；留空自动探测 soffice/libreoffice
     libreoffice_path: str = ""
 
@@ -264,9 +266,9 @@ class Settings(BaseSettings):
         if not (0 <= self.dm_simhash_threshold <= 16):
             raise ValueError("DM_SIMHASH_THRESHOLD 需在 0~16 之间（64 位指纹）")
         if self.ocr_engine and self.ocr_engine.lower() not in {
-            "aliyun", "rapid", "paddle", "tesseract",
+            "rapid", "paddle", "tesseract",
         }:
-            raise ValueError("OCR_ENGINE 仅支持 aliyun / rapid / paddle / tesseract")
+            raise ValueError("OCR_ENGINE 已禁用阿里云，仅支持 rapid / paddle / tesseract")
         if not (0 < self.dm_header_footer_ratio <= 1):
             raise ValueError("DM_HEADER_FOOTER_RATIO 需在 (0, 1] 之间")
         if self.dm_extract_pages_per_shard < 1:
