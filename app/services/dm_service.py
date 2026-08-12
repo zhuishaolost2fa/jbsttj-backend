@@ -226,6 +226,7 @@ class DMGuideService:
                 file_size=ref.file_size or 0,
                 script_title=str(getattr(script, "title", "") or ""),
                 force=payload.force,
+                created_by=user_id,
             )
         except Exception as exc:  # noqa: BLE001 - broker 挂了要立刻告诉调用方
             logger.exception("派发 DM 解析流水线失败: %s", exc)

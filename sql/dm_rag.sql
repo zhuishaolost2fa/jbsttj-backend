@@ -193,11 +193,17 @@ update public.script_dm_qa q
  where q.script_id = s.id
    and coalesce(q.script_code, '') = '';
 
+-- 提供者：记录是谁上传的手册产出了这条问答（与 script_dm_jobs.created_by 同源）。
+-- 冗余到问答对层面，便于按用户追溯「这条问答出自谁上传的剧本」。
+-- 历史问答没有对应的上传记录，留 NULL 即可。
+alter table public.script_dm_qa add column if not exists created_by uuid;
+
 create index if not exists idx_dm_qa_doc      on public.script_dm_qa (document_id);
 create index if not exists idx_dm_qa_script   on public.script_dm_qa (script_id);
 create index if not exists idx_dm_qa_code     on public.script_dm_qa (script_code);
 create index if not exists idx_dm_qa_chunk    on public.script_dm_qa (chunk_id);
 create index if not exists idx_dm_qa_category on public.script_dm_qa (category);
+create index if not exists idx_dm_qa_created_by on public.script_dm_qa (created_by);
 
 create index if not exists idx_dm_qa_question_trgm
     on public.script_dm_qa using gin (question gin_trgm_ops);

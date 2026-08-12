@@ -279,6 +279,7 @@ def prepare_document(
     script_title: str = "",
     script_code: str = "",
     force: bool = False,
+    created_by: str = "",
 ) -> Dict[str, Any]:
     """下载 PDF、建文档记录、规划分片并派发 T1 群组。"""
     store = get_dm_store()
@@ -433,6 +434,7 @@ def prepare_document(
         script_code=dm_script_code,
         script_title=script_title,
         object_key=object_key,
+        created_by=created_by,
     )
     chord(header)(callback.on_error(on_pipeline_error.s(job_id=job_id)))
 
@@ -559,6 +561,7 @@ def chunk_and_dedup(
     script_code: str = "",
     script_title: str = "",
     object_key: str = "",
+    created_by: str = "",
 ) -> Dict[str, Any]:
     """chord 回调：把所有分片汇总成去重后的 chunk，并派发 T3→T4 流水线。
 
@@ -674,6 +677,7 @@ def chunk_and_dedup(
                 script_id=script_id,
                 script_code=script_code,
                 total_chunks=len(kept),
+                created_by=created_by,
             ),
         )
         for batch in batches
@@ -755,6 +759,7 @@ def embed_and_store(
     script_id: str,
     script_code: str = "",
     total_chunks: int = 0,
+    created_by: str = "",
 ) -> Dict[str, Any]:
     """把一批 chunk 与其问答对向量化后写入 Supabase。"""
     chunks: List[Dict[str, Any]] = list(payload.get("chunks") or [])
@@ -821,6 +826,7 @@ def embed_and_store(
                     "page_start": source.get("page_start"),
                     "page_end": source.get("page_end"),
                     "section_path": source.get("section_path") or [],
+                    "created_by": created_by or None,
                     "embedding": to_pgvector(vector),
                 }
             )
@@ -943,6 +949,7 @@ def dispatch_pipeline(
     script_title: str = "",
     script_code: str = "",
     force: bool = False,
+    created_by: str = "",
 ) -> Optional[str]:
     """派发整条流水线，返回 Celery 任务 id（未启用 Celery 时返回 None）。"""
     if not celery_available():
@@ -958,6 +965,7 @@ def dispatch_pipeline(
             "script_title": script_title,
             "script_code": script_code,
             "force": force,
+            "created_by": created_by,
         },
         link_error=on_pipeline_error.s(job_id=job_id),
     )
