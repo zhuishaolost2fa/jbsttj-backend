@@ -12,6 +12,7 @@ from app.schemas.common import PageResult, Pagination
 from app.schemas.file import DownloadUrlResponse, FileInfo, SimpleUploadResponse
 from app.services.file_service import FileService, get_file_service
 from app.services.oss import OSSService, get_oss_service
+from app.services.supabase import SupabaseClient, get_supabase
 
 router = APIRouter(prefix="/files", tags=["文件管理"])
 
@@ -91,16 +92,30 @@ async def get_download_url(
     "/avatar/{user_id}",
     summary="公开获取用户头像",
     description=(
-        "从头像对象 ``avatars/{user_id}`` 读取并以图片流返回。"
+        "从 ``profiles.avatar_object_key`` 指向的 OSS 对象读取并以图片流返回；"
+        "未设置该字段时回退到旧的 ``avatars/{user_id}`` 对象。"
         "设计为无需鉴权（头像敏感度低、且个人中心多处展示），URL 稳定长期有效，"
         "不依赖 bucket 公开读权限。未设置头像时返回 404。"
     ),
 )
 async def get_avatar(
     user_id: str = Path(..., description="用户 ID"),
+    db: SupabaseClient = Depends(get_supabase),
     oss: OSSService = Depends(get_oss_service),
 ) -> Response:
-    data, content_type = await oss.get_object_bytes(f"avatars/{user_id}")
+    object_key = None
+    if db.available:
+        row = await db.select_one(
+            "profiles",
+            filters={"id": f"eq.{user_id}"},
+            columns="avatar_object_key",
+        )
+        object_key = (row or {}).get("avatar_object_key") if row else None
+    # 回退：老数据头像直接存在 avatars/{user_id}
+    if not object_key:
+        object_key = f"avatars/{user_id}"
+
+    data, content_type = await oss.get_object_bytes(object_key)
     if data is None:
         raise NotFoundError("头像不存在", code="avatar_not_found")
     return Response(

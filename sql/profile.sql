@@ -21,6 +21,9 @@ create table if not exists public.profiles (
     birthday     date,
     -- 地区，存「省份 城市」拼接串，便于展示与检索
     region       text,
+    -- 头像对应的 OSS 对象 key（由 simple_upload 生成，如 avatars/{user_id}/{date}/{uuid}.ext）。
+    -- get_avatar 据此回源，避免依赖对象 key 的命名规则；未设置时回退到旧的 avatars/{user_id}。
+    avatar_object_key text,
     created_at   timestamptz not null default now(),
     updated_at   timestamptz not null default now()
 );
@@ -39,6 +42,9 @@ begin
     end if;
     if not exists (select 1 from information_schema.columns where table_name = 'profiles' and column_name = 'region') then
         alter table public.profiles add column region text;
+    end if;
+    if not exists (select 1 from information_schema.columns where table_name = 'profiles' and column_name = 'avatar_object_key') then
+        alter table public.profiles add column avatar_object_key text;
     end if;
 end $$;
 

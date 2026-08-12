@@ -189,6 +189,9 @@ class FileRepository:
         offset: int = 0,
     ) -> Tuple[List[Dict[str, Any]], int]:
         filters = {"user_id": f"eq.{user_id}", "deleted_at": "is.null"}
+        # 头像走 simple_upload(prefix=avatars) 时也会落一条 files 记录，
+        # 但它由 profiles.avatar_object_key 单独管理，不应出现在用户的文件列表里。
+        filters["object_key"] = "not.like.avatars/*"
         if keyword:
             safe = keyword.replace("*", "").replace(",", "")
             filters["filename"] = f"ilike.*{safe}*"

@@ -97,8 +97,14 @@ class FileService:
         content_type: Optional[str],
         data: bytes,
         max_size: int = 20 * 1024 * 1024,
+        prefix: Optional[str] = None,
     ) -> FileInfo:
-        """小文件一次性上传，走服务端中转。大文件请使用分片上传接口。"""
+        """小文件一次性上传，走服务端中转。大文件请使用分片上传接口。
+
+        ``prefix`` 可覆盖默认的对象 key 前缀（settings.upload_prefix），
+        例如头像上传传 ``"avatars"`` 以落到独立的命名空间，便于公开接口按 key 回源、
+        也避免污染普通文件列表。
+        """
         if not data:
             raise ValidationError("文件内容为空")
         if len(data) > max_size:
@@ -133,7 +139,7 @@ class FileService:
                 )
                 return FileInfo.from_row(row)
 
-        object_key = build_object_key(user.id, clean_name, self.settings.upload_prefix)
+        object_key = build_object_key(user.id, clean_name, prefix or self.settings.upload_prefix)
         meta = await self.oss.put_object(object_key, data, content_type=mime)
         row = await self.files.create(
             {

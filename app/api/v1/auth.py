@@ -25,7 +25,6 @@ from app.core.exceptions import (
 )
 from app.core.security import CurrentUser, get_current_user
 from app.schemas.auth import (
-    AvatarPresignResponse,
     ChangeEmailRequest,
     ChangePasswordRequest,
     LoginRequest,
@@ -38,6 +37,7 @@ from app.schemas.auth import (
 )
 from app.services.supabase import SupabaseAuth, SupabaseClient, get_supabase, get_supabase_auth
 from app.services.oss import OSSService, get_oss_service
+from app.services.file_service import FileService, get_file_service
 
 logger = logging.getLogger("app.auth")
 
@@ -200,15 +200,16 @@ async def upload_avatar(
     db: SupabaseClient = Depends(get_supabase),
     oss: OSSService = Depends(get_oss_service),
     auth: SupabaseAuth = Depends(get_supabase_auth),
+    service: FileService = Depends(get_file_service),
 ):
-    """上传头像图片（裁剪由前端完成），服务端只负责存储与落库。
+    """上传头像图片（裁剪由前端完成），服务端中转存储。
 
     - 校验格式（JPG/PNG/WEBP）、大小（≤2MB），并嗅探文件头防伪装。
-    - 以稳定 key ``avatars/{user_id}`` 覆盖写入 OSS，该对象落在永久前缀下
-      （非 ``temp/`` 临时前缀），不会被生命周期规则自动清理。
-    - 返回的 ``avatar_url`` 是 **OSS 永久公开 URL**（CDN / 自定义域名优先），
-      非二进制、不过期，可直接写进 ``<img src>``；仅当未配置任何公开域名时，
-      才退化为后端代理地址兜底。
+    - 复用文件服务的 ``simple_upload`` 走服务端中转写入 OSS（含秒传去重），
+      对象落在 ``avatars/`` 前缀下，key 记录在 ``profiles.avatar_object_key``，
+      便于公开接口稳定回源；该前缀也不出现在用户的文件列表里。
+    - ``avatar_url`` 优先返回 OSS 永久公开 URL（CDN / 自定义域名），
+      无公开域名时退化为后端代理地址 ``/api/v1/files/avatar/{user_id}``。
     - 成功后清空 avatar_color（已有真实图片，渐变头像不再需要）。
     """
     if not db.available:
@@ -228,47 +229,38 @@ async def upload_avatar(
         # 类型不一致不致命，但以嗅探到的真实类型入库，避免被伪造扩展名误导
         logger.warning("头像声明类型 %s 与实际 %s 不符", file.content_type, detected)
 
-    # 永久对象：独立前缀 avatars/，覆盖写，URL 长期稳定，不被 OSS 生命周期清理
-    key = f"avatars/{user.id}"
-    await oss.put_object(key, data, content_type=detected)
+    # 复用文件服务的 simple_upload：服务端中转写入 OSS（含秒传去重）
+    ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(detected, "jpg")
+    info = await service.simple_upload(
+        user,
+        filename=f"avatar.{ext}",
+        content_type=detected,
+        data=data,
+        max_size=AVATAR_MAX_BYTES,
+        prefix="avatars",
+    )
+    object_key = info.object_key
 
     # 优先返回 OSS 永久公开 URL（CDN / 自定义域名）；无公开域名时退化为后端代理
-    avatar_url = oss.public_url(key) or f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
+    avatar_url = oss.public_url(object_key) or f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
     rows = await db.upsert(
         "profiles",
-        {"id": user.id, "avatar_url": avatar_url, "avatar_color": None},
+        {
+            "id": user.id,
+            "avatar_url": avatar_url,
+            "avatar_object_key": object_key,
+            "avatar_color": None,
+        },
         on_conflict="id",
     )
-    profile = rows[0] if rows else {"avatar_url": avatar_url, "avatar_color": None}
-    logger.info("用户上传头像成功（id=%s, url=%s）", user.id, avatar_url)
+    profile = (
+        rows[0]
+        if rows
+        else {"avatar_url": avatar_url, "avatar_object_key": object_key, "avatar_color": None}
+    )
+    logger.info("用户上传头像成功（id=%s, key=%s, url=%s）", user.id, object_key, avatar_url)
     email_verified = await _resolve_email_verified(auth, user)
     return _profile_response(user, profile, email_verified)
-
-
-@router.post(
-    "/me/avatar/presign",
-    response_model=AvatarPresignResponse,
-    summary="获取头像直传预签名地址",
-)
-async def avatar_presign(
-    request: Request,
-    user: CurrentUser = Depends(get_current_user),
-    oss: OSSService = Depends(get_oss_service),
-) -> AvatarPresignResponse:
-    """返回头像对象的预签名 PUT 直传地址与最终公开 URL。
-
-    前端拿到后**直接用 PUT 把图片字节传到 OSS**（不经过后端，省带宽），
-    再把 ``avatar_url`` 通过 ``PATCH /auth/me`` 落库即可。
-
-    - key 固定 ``avatars/{user_id}``，永久前缀、覆盖写，URL 长期稳定。
-    - 直传 PUT **不要**带 ``Content-Type`` 头（与预签名保持一致，否则 V4 签名校验失败）。
-    - ``avatar_url`` 为 OSS 永久公开地址；未配置公开域名时为 None，
-      此时前端应退化为 ``POST /auth/me/avatar`` 后端中转上传。
-    """
-    key = f"avatars/{user.id}"
-    upload_url = await oss.presign_put(key, expires=600)  # 10 分钟足够裁剪后上传
-    avatar_url = oss.public_url(key) or f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
-    return AvatarPresignResponse(upload_url=upload_url, key=key, avatar_url=avatar_url)
 
 
 def _check_password_strength(password: str) -> Optional[str]:
