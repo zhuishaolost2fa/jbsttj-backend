@@ -12,8 +12,10 @@ create table if not exists public.profiles (
     -- 与 upload_tasks / files 表保持一致，避免 service_role 写入受 FK 约束。
     nickname     text,
     avatar_url   text,
-    -- 默认头像配色：未设置 avatar_url 时，前端按此索引渲染渐变首字母头像（0~7）
-    avatar_color integer not null default 0 check (avatar_color between 0 and 7),
+    -- 默认头像配色：未设置 avatar_url 时，前端按此索引渲染渐变首字母头像（0~7）。
+    -- 允许为 null：上传真实头像或显式清空时置 null（表示「不使用渐变头像」），
+    -- 因此不能设 NOT NULL；读取侧已用 coalesce/默认值兜底（见 auth.py 的 int(... or 0)）。
+    avatar_color integer default 0 check (avatar_color between 0 and 7),
     bio          text,
     -- 性别：male / female / other（other 也用于「不愿透露」）
     gender       text check (gender is null or gender in ('male', 'female', 'other')),
@@ -32,8 +34,10 @@ create table if not exists public.profiles (
 do $$
 begin
     if not exists (select 1 from information_schema.columns where table_name = 'profiles' and column_name = 'avatar_color') then
-        alter table public.profiles add column avatar_color integer not null default 0 check (avatar_color between 0 and 7);
+        alter table public.profiles add column avatar_color integer default 0 check (avatar_color between 0 and 7);
     end if;
+    -- 存量库可能仍是旧约束（NOT NULL），这里幂等地放宽为可空，匹配「null=已清空」语义
+    alter table public.profiles alter column avatar_color drop not null;
     if not exists (select 1 from information_schema.columns where table_name = 'profiles' and column_name = 'gender') then
         alter table public.profiles add column gender text check (gender is null or gender in ('male', 'female', 'other'));
     end if;
