@@ -4,7 +4,8 @@
   1. **字典校验** —— 提交的玩法/题材/发行方式/难度必须是字典里真实存在的 code。
      数据库触发器也会拦，但那层报错是 PostgREST 的英文原文，不适合直接给前端；
      在这里拦掉可以给出「未知的玩法编码: xxx，可选值：...」这种能直接照着改的提示。
-  2. **slug 生成** —— 新增时不传 code 就按标题自动派生，重名自动加后缀。
+  2. **code 生成** —— 新增时不传 code 就按标题经 pinyin 派生；仅当标题含数字时
+     code 才带数字，不自动追加 2、3 这类序号。
   3. **展示文案** —— 人数「6人（3男3女）」、时长「4-5小时」这类拼装放在后端，
      避免每个前端各写一套格式化逻辑。
 """
@@ -19,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pypinyin import lazy_pinyin
 
-from app.core.exceptions import ConflictError, NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.data import script_options_seed as opt_seed
 from app.schemas.common import Pagination
 from app.schemas.script import (
@@ -42,10 +43,10 @@ MAX_PAGE_SIZE = 100
 
 
 def slugify(title: str) -> str:
-    """把剧本名转成 URL 友好的 slug。
+    """把剧本名转成 URL 友好的 code 片段。
 
     中文优先转拼音（pypinyin），英文/数字原样保留，再用连字符规整。
-    例：雾都疑影 -> wu-du-yi-ying；雾都疑影 2nd -> wu-du-yi-ying-2nd。
+    例：雾都疑影 -> wu-du-yi-ying；山母鬼3 -> shan-mu-gui-3（标题里的数字会保留进 code）。
     若转拼音后为空（极端情况，如纯符号标题），调用方会退回到随机短码。
     """
     # 逐词转拼音：中文变拼音，非中文（字母/数字/标点）原样保留
@@ -177,9 +178,10 @@ class ScriptService:
     async def _create_new(
         self, payload: ScriptCreate, data: Dict[str, Any], *, user_id: Optional[str] = None
     ) -> Tuple[ScriptItem, bool]:
+        # 不再做 code 唯一性校验：code 直接由标题经 pinyin 派生（仅标题含数字才带数字），
+        # 生成后即使用。重名碰撞不再抛错、也不再自动加 -2/-3 序号；若数据库唯一约束兜底
+        # 拦下重复 code，将按数据库错误返回，而不是凭空造一个「假续集」编码。
         code = data.get("code") or await self._generate_code(payload.title)
-        if await self.repo.get_by_code(code, include_deleted=True):
-            raise ConflictError(f"剧本编码已存在: {code}", code="script_code_exists")
         data["code"] = code
 
         # 把归一化标题键写入别名，使后续「山母鬼.pdf」之类的重传能反向匹配到本行
@@ -373,14 +375,21 @@ class ScriptService:
         return {c.code: {o.code: o.label for o in c.options} for c in tree.categories}
 
     async def _generate_code(self, title: str) -> str:
-        """按标题派生拼音 slug；极端情况下退化为随机短码，冲突则追加序号。"""
-        base = slugify(title) or f"script-{uuid.uuid4().hex[:8]}"
-        candidate = base
-        for suffix in range(2, 12):
-            if not await self.repo.get_by_code(candidate, include_deleted=True):
-                return candidate
-            candidate = f"{base}-{suffix}"
-        return f"{base}-{uuid.uuid4().hex[:6]}"
+        """按标题经 pinyin 派生剧本 code。
+
+        规则：
+        - 通过 pypinyin 把标题转拼音（英文/数字原样保留），再用连字符规整；
+        - **仅当标题本身含数字时** code 才带数字（数字直接来自标题原文，例如
+          「山母鬼3」→ ``shan-mu-gui-3``），不做任何自增序号；
+        - **不再自动追加 2、3 这类序号**来规避重名，也不再对 code 做唯一性校验；
+          code 直接由标题派生后使用。若数据库唯一约束兜底拦下重复 code，会按数据库
+          错误返回，而不会悄悄加 ``-2`` 凭空造出一个「假续集」编码。
+        """
+        code = slugify(title)
+        if not code:
+            # 极端情况（纯符号标题）退化为随机短码，同样不含自增式数字
+            code = f"script-{uuid.uuid4().hex[:8]}"
+        return code
 
     # ================= 按名称查找 =================
     async def search_by_name(
