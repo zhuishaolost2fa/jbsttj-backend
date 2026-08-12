@@ -37,6 +37,7 @@ from app.schemas.auth import (
 )
 from app.services.supabase import SupabaseAuth, SupabaseClient, get_supabase, get_supabase_auth
 from app.services.file_service import FileService, get_file_service
+from app.services.oss import OSSService, get_oss_service
 
 logger = logging.getLogger("app.auth")
 
@@ -197,6 +198,7 @@ async def upload_avatar(
     file: UploadFile = File(..., description="头像图片，支持 JPG / PNG / WEBP，大小 ≤ 2MB"),
     user: CurrentUser = Depends(get_current_user),
     db: SupabaseClient = Depends(get_supabase),
+    oss: OSSService = Depends(get_oss_service),
     auth: SupabaseAuth = Depends(get_supabase_auth),
     service: FileService = Depends(get_file_service),
 ):
@@ -206,12 +208,12 @@ async def upload_avatar(
     - 复用文件服务的 ``simple_upload`` 走服务端中转写入 OSS（含秒传去重），
       对象落在 ``avatars/`` 前缀下，key 记录在 ``profiles.avatar_object_key``，
       便于公开接口稳定回源；该前缀也不出现在用户的文件列表里。
-    - ``avatar_url`` 统一使用后端代理地址 ``/api/v1/files/avatar/{user_id}``：
-      该接口用服务端凭证读取 OSS，不依赖 bucket 公开读权限。裸 bucket 公网域名
-      / CDN 仅在 bucket 或对象为 public-read 时才可达，而本项目的 OSS bucket
-      默认不开启公共读，且阿里云默认启用「阻止公共访问」，直接返回 OSS URL 会
-      403 无法展示；代理地址稳定、长期有效、无需鉴权，专为头像设计。
+    - 头像对象在上传时被设为 ``public-read``（``simple_upload(acl="public-read")``），
+      因此 ``avatar_url`` 返回 OSS/CDN 直链，浏览器可直接加载、无需后端中转，
+      也利于 CDN 边缘缓存。仅在完全没有配置公开域名时才退化为后端代理地址
+      ``/api/v1/files/avatar/{user_id}``。前提：bucket 须关闭「阻止公共访问」。
     - 成功后清空 avatar_color（已有真实图片，渐变头像不再需要）。
+    - 上传新头像后会删除 OSS 上该用户此前的旧头像对象，避免残留冗余文件。
     """
     if not db.available:
         raise DatabaseError("数据库未配置，无法保存头像", code="db_unavailable")
@@ -232,6 +234,11 @@ async def upload_avatar(
 
     # 复用文件服务的 simple_upload：服务端中转写入 OSS（含秒传去重）
     ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(detected, "jpg")
+
+    # 上传前先取旧头像对象 key，便于上传成功后清理 OSS 上的旧文件，避免残留
+    old_profile = await db.select_one("profiles", filters={"id": f"eq.{user.id}"})
+    old_object_key = (old_profile or {}).get("avatar_object_key")
+
     info = await service.simple_upload(
         user,
         filename=f"avatar.{ext}",
@@ -239,12 +246,12 @@ async def upload_avatar(
         data=data,
         max_size=AVATAR_MAX_BYTES,
         prefix="avatars",
+        acl="public-read",
     )
     object_key = info.object_key
 
-    # 头像回源统一走后端代理接口（用服务端凭证读 OSS，不依赖 bucket 公开读权限，
-    # 规避阿里云「阻止公共访问」导致的 403；接口见 files.py 的 get_avatar）。
-    avatar_url = f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
+    # 头像对象已设为 public-read，优先返回 OSS/CDN 直链；无公开域名时才退化为后端代理。
+    avatar_url = oss.public_url(object_key) or f"{str(request.base_url).rstrip('/')}/api/v1/files/avatar/{user.id}"
     rows = await db.upsert(
         "profiles",
         {
@@ -260,6 +267,13 @@ async def upload_avatar(
         if rows
         else {"avatar_url": avatar_url, "avatar_object_key": object_key, "avatar_color": None}
     )
+
+    # 删除旧头像对象（仅当新旧 key 不同），清理 OSS 残留；失败仅告警，不阻断本次更新
+    if old_object_key and old_object_key != object_key:
+        try:
+            await oss.delete_object(old_object_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除旧头像对象失败（key=%s）: %s", old_object_key, exc)
     logger.info("用户上传头像成功（id=%s, key=%s, url=%s）", user.id, object_key, avatar_url)
     email_verified = await _resolve_email_verified(auth, user)
     return _profile_response(user, profile, email_verified)

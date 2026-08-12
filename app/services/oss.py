@@ -332,6 +332,32 @@ class OSSService:
             raise self._wrap(exc, "上传对象") from exc
         return ObjectMeta(key=key, size=len(data), etag=etag, content_type=content_type)
 
+    async def set_object_acl(self, key: str, acl: str) -> None:
+        """设置单个对象的访问权限（如 ``public-read``）。
+
+        用于头像等需匿名可读的对象。若 bucket 开启了「阻止公共访问」
+        （阿里云 OSS 默认开启），此调用会被拒绝（AccessDenied），需先在 OSS 控制台
+        关闭该设置，否则头像直链仍会 403。
+        """
+        def _call() -> None:
+            req = oss.PutObjectAclRequest(
+                bucket=self._settings.oss_bucket, key=key, acl=acl
+            )
+            self.client.put_object_acl(req)
+
+        try:
+            await run_in_threadpool(_call)
+        except Exception as exc:  # noqa: BLE001
+            wrapped = self._wrap(exc, "设置对象 ACL")
+            # 阿里云默认开启「阻止公共访问」，未关闭时设 public-read 会 AccessDenied
+            if isinstance(wrapped, StorageError):
+                raise StorageError(
+                    "设置 OSS 对象公开读失败：请先在 OSS 控制台关闭该 bucket 的"
+                    "「阻止公共访问」（Block Public Access）后再上传头像",
+                    details=getattr(wrapped, "details", None),
+                ) from exc
+            raise wrapped from exc
+
     async def head_object(self, key: str) -> Optional[ObjectMeta]:
         def _call():
             req = oss.HeadObjectRequest(bucket=self._settings.oss_bucket, key=key)

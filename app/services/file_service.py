@@ -98,12 +98,15 @@ class FileService:
         data: bytes,
         max_size: int = 20 * 1024 * 1024,
         prefix: Optional[str] = None,
+        acl: Optional[str] = None,
     ) -> FileInfo:
         """小文件一次性上传，走服务端中转。大文件请使用分片上传接口。
 
         ``prefix`` 可覆盖默认的对象 key 前缀（settings.upload_prefix），
         例如头像上传传 ``"avatars"`` 以落到独立的命名空间，便于公开接口按 key 回源、
         也避免污染普通文件列表。
+        ``acl`` 可选，传入如 ``"public-read"`` 可将对象设为匿名可读（头像直链场景）；
+        普通文件上传不传，保持 bucket 默认私有。
         """
         if not data:
             raise ValidationError("文件内容为空")
@@ -124,6 +127,9 @@ class FileService:
         if existing and int(existing.get("file_size") or 0) == len(data):
             meta = await self.oss.head_object(existing["object_key"])
             if meta:
+                if acl:
+                    # 秒传复用已有对象，仍按调用方要求确保 ACL（如头像需 public-read）
+                    await self.oss.set_object_acl(existing["object_key"], acl)
                 row = await self.files.create(
                     {
                         "user_id": user.id,
@@ -141,6 +147,8 @@ class FileService:
 
         object_key = build_object_key(user.id, clean_name, prefix or self.settings.upload_prefix)
         meta = await self.oss.put_object(object_key, data, content_type=mime)
+        if acl:
+            await self.oss.set_object_acl(object_key, acl)
         row = await self.files.create(
             {
                 "user_id": user.id,
