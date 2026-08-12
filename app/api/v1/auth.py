@@ -214,6 +214,7 @@ async def upload_avatar(
       ``/api/v1/files/avatar/{user_id}``。前提：bucket 须关闭「阻止公共访问」。
     - 成功后清空 avatar_color（已有真实图片，渐变头像不再需要）。
     - 上传新头像后会删除 OSS 上该用户此前的旧头像对象，避免残留冗余文件。
+    - 头像对象显式设置 ``Content-Disposition: inline``，确保浏览器内联展示而非直接下载。
     """
     if not db.available:
         raise DatabaseError("数据库未配置，无法保存头像", code="db_unavailable")
@@ -247,6 +248,7 @@ async def upload_avatar(
         max_size=AVATAR_MAX_BYTES,
         prefix="avatars",
         acl="public-read",
+        content_disposition="inline",
     )
     object_key = info.object_key
 

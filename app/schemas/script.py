@@ -295,3 +295,47 @@ class ScriptSearchByNameResult(BaseModel):
     items: List[ScriptItemCamel] = Field(
         default_factory=list, description="匹配到的剧本列表（已按匹配质量排序）"
     )
+
+
+class ScriptAutocompleteItem(BaseModel):
+    """自动补全（联想）用的轻量剧本项。
+
+    只带下拉框要展示的字段，不拉字典标签、不拼展示文案，避免联想接口被列表级的
+    计算拖慢。和 `ScriptItem` 一样是蛇形命名，与剧本模块其余读接口保持一致。
+    """
+
+    id: str = Field(description="剧本 ID")
+    code: str = Field(description="业务编码")
+    title: str = Field(description="剧本名称")
+    author: Optional[str] = Field(default=None, description="作者")
+    cover_url: Optional[str] = Field(default=None, description="封面图")
+    has_guide: bool = Field(
+        default=False,
+        description="是否已关联 DM 主持人手册，便于导入时提示「该剧本已导入过」",
+    )
+
+
+class ScriptAutocompleteResult(BaseModel):
+    """自动补全（联想）结果。"""
+
+    query: str = Field(description="回显本次输入片段")
+    count: int = Field(description="匹配到的剧本数量")
+    items: List[ScriptAutocompleteItem] = Field(
+        default_factory=list, description="联想候选剧本列表"
+    )
+
+
+class ScriptCreateResult(ScriptItem):
+    """新增 / 导入剧本的返回结构。
+
+    在 :class:`ScriptItem` 基础上加一个 `was_created` 标识：
+
+    - `true`  —— 剧本库原本没有该剧本，本次新建了一行；
+    - `false` —— 剧本库已存在同名剧本，本次只是把 DM 手册**关联**到了它（去重），
+      前端据此提示「已关联到已有剧本《xxx》」而不是「新建成功」，避免误以为重复导入。
+    """
+
+    was_created: bool = Field(
+        default=True,
+        description="true=本次新建剧本；false=关联到已有剧本（去重，未新建）",
+    )

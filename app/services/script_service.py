@@ -24,6 +24,7 @@ from app.data import script_options_seed as opt_seed
 from app.schemas.common import Pagination
 from app.schemas.script import (
     LabeledCode,
+    ScriptAutocompleteItem,
     ScriptCreate,
     ScriptItem,
     ScriptItemCamel,
@@ -134,8 +135,22 @@ class ScriptService:
             raise NotFoundError(f"剧本不存在: {id_or_code}", code="script_not_found")
         return self._to_item(row, await self._label_map())
 
-    # ================= 新增 =================
-    async def create_script(self, payload: ScriptCreate, *, user_id: Optional[str] = None) -> ScriptItem:
+    # ================= 新增 / 导入 =================
+    async def create_script(
+        self, payload: ScriptCreate, *, user_id: Optional[str] = None
+    ) -> Tuple[ScriptItem, bool]:
+        """新增剧本，但导入场景下会先做**去重关联**。
+
+        返回 `(剧本项, was_created)`：
+
+        - 剧本库已存在同名（标题精确 / 别名精确）剧本 -> 不新建，把导入信息
+          **关联**到已有剧本上（挂 DM 手册、补全缺失字段、置为已上架），
+          `was_created=False`；
+        - 剧本库没有 -> 正常新建，`was_created=True`。
+
+        这样「导入 DM 指南」流程就不会再产出重复的剧本行：库里本来有一份
+        「雾都疑影」（无手册），导入它的手册后直接挂上去，而不是再建一份。
+        """
         data = payload.model_dump(exclude_unset=True, exclude_none=True)
         await self._assert_codes(
             playstyles=data.get("playstyles"),
@@ -145,6 +160,23 @@ class ScriptService:
         )
         self._check_gender_sum(data)
 
+        # 1) 先看剧本库是否已有同名剧本（导入去重的核心）
+        existing = await self.repo.find_existing(payload.title)
+        if existing is not None:
+            merged = self._merge_for_link(existing, data)
+            row = await self.repo.update(existing["id"], merged)
+            if row is None:
+                # 极端竞态：查到之后被软删了，退化为新建，避免导入静默失败
+                return await self._create_new(payload, data, user_id=user_id)
+            logger.info("导入关联到已有剧本 %s (%s)", row.get("title"), row.get("code"))
+            return self._to_item(row, await self._label_map()), False
+
+        # 2) 库里没有 -> 新建
+        return await self._create_new(payload, data, user_id=user_id)
+
+    async def _create_new(
+        self, payload: ScriptCreate, data: Dict[str, Any], *, user_id: Optional[str] = None
+    ) -> Tuple[ScriptItem, bool]:
         code = data.get("code") or await self._generate_code(payload.title)
         if await self.repo.get_by_code(code, include_deleted=True):
             raise ConflictError(f"剧本编码已存在: {code}", code="script_code_exists")
@@ -156,7 +188,46 @@ class ScriptService:
 
         row = await self.repo.create(data)
         logger.info("新增剧本 %s (%s)", row.get("title"), row.get("code"))
-        return self._to_item(row, await self._label_map())
+        return self._to_item(row, await self._label_map()), True
+
+    @staticmethod
+    def _merge_for_link(existing: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+        """把导入信息合并进已有剧本，规则：
+
+        - DM 手册（extra.dmGuide）**总是挂上**——这是导入的核心目标；
+        - 其余字段只在「库里该字段为空」时补全，绝不覆盖剧本库已有数据，
+          避免导入方随手填的字段把运营维护的权威信息冲掉；
+        - 标题 / code / created_by 等身份字段不动；
+        - 关联即视为「可对外可见」：若原状态是 draft / offline 则提升为 published。
+        """
+        # 不随导入覆盖的身份 / 系统字段
+        skip = {"title", "code", "created_by", "id", "deleted_at"}
+
+        merged: Dict[str, Any] = {}
+
+        # 1) 挂 DM 手册
+        existing_extra = dict(existing.get("extra") or {})
+        incoming_extra = dict(data.get("extra") or {})
+        dm = incoming_extra.get("dmGuide") or incoming_extra.get("dm_guide")
+        if dm is not None:
+            existing_extra["dmGuide"] = dm
+            merged["extra"] = existing_extra
+
+        # 2) 补全缺失字段
+        for key, value in data.items():
+            if key in skip or key == "extra":
+                continue
+            if value is None:
+                continue
+            current = existing.get(key)
+            if current in (None, "", [], {}):
+                merged[key] = value
+
+        # 3) 导入即视为可用：草稿 / 下架提升为已上架
+        if existing.get("status") in (None, "draft", "offline"):
+            merged["status"] = "published"
+
+        return merged
 
     # ================= 修改 =================
     async def update_script(self, script_id: str, payload: ScriptUpdate) -> ScriptItem:
@@ -325,6 +396,30 @@ class ScriptService:
         ranked = sorted(rows, key=lambda r: (_score(r), -(r.get("play_count") or 0)))
         items = [self._to_item(r, labels, ScriptItemCamel) for r in ranked]
         return items, bool(items)
+
+    # ================= 自动补全（联想） =================
+    async def autocomplete(self, q: str, *, limit: int = 8) -> List[ScriptAutocompleteItem]:
+        """边输入边查的轻量剧本联想。
+
+        只召回已上架剧本的精简字段（id / code / title / author / cover_url / has_guide），
+        不拉字典标签、不拼展示文案，保证下拉框实时响应。找不到返回空列表。
+        """
+        q = (q or "").strip()
+        if not q:
+            return []
+        rows = await self.repo.autocomplete(q, limit=max(1, min(limit, 20)))
+        return [self._to_autocomplete_item(r) for r in rows]
+
+    @staticmethod
+    def _to_autocomplete_item(row: Dict[str, Any]) -> ScriptAutocompleteItem:
+        return ScriptAutocompleteItem(
+            id=str(row.get("id") or ""),
+            code=row.get("code") or "",
+            title=row.get("title") or "",
+            author=row.get("author"),
+            cover_url=row.get("cover_url"),
+            has_guide=bool(DMGuideRef.from_extra(row.get("extra"))),
+        )
 
     # ================= 内部：出参组装 =================
     def _to_item(

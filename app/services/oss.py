@@ -315,7 +315,11 @@ class OSSService:
     # 普通对象操作
     # ------------------------------------------------------------------
     async def put_object(
-        self, key: str, data: bytes, content_type: Optional[str] = None
+        self,
+        key: str,
+        data: bytes,
+        content_type: Optional[str] = None,
+        content_disposition: Optional[str] = None,
     ) -> ObjectMeta:
         def _call() -> str:
             req = oss.PutObjectRequest(
@@ -323,6 +327,7 @@ class OSSService:
                 key=key,
                 body=data,
                 content_type=content_type or "application/octet-stream",
+                content_disposition=content_disposition,
             )
             return (self.client.put_object(req).etag or "").strip('"')
 

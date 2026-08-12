@@ -429,6 +429,56 @@ class ScriptRepository:
             limit=max(1, min(limit, 50)),
         )
 
+    async def find_existing(self, title: str, *, include_deleted: bool = False) -> Optional[Dict[str, Any]]:
+        """按名称去重查找：用于导入时判断剧本库是否已有该剧本。
+
+        匹配规则（与「按名称找剧本」语义一致，但只取精确命中，供关联使用）：
+        - 标题精确匹配（忽略大小写，先清理特殊字符避免破坏 `or=()` 语法）；
+        - 或别名数组精确包含该名称。
+
+        排除了软删除记录。命中多个时取热度最高的一条，导入关联落到最可能被
+        用户认领的那份上。找不到返回 `None`。
+        """
+        safe = _escape_like(title)
+        if not safe:
+            return None
+        filters: Dict[str, str] = {}
+        if not include_deleted:
+            filters["deleted_at"] = "is.null"
+        filters["or"] = f"(title.ilike.{safe},aliases.cs.{{{safe}}})"
+        rows = await self.db.select(
+            TABLE_SCRIPTS,
+            filters=filters,
+            order="play_count.desc,rating.desc.nullslast",
+            limit=5,
+        )
+        return rows[0] if rows else None
+
+    async def autocomplete(
+        self, q: str, *, status: Optional[str] = "published", limit: int = 8
+    ) -> List[Dict[str, Any]]:
+        """自动补全（联想）用的轻量检索。
+
+        只查已上架（默认）且未删除的剧本，按「标题模糊 + 别名精确」召回，
+        只回选中的少数几列（不含 summary / extra 大字段之外的冗余信息），
+        适配下拉框边输入边查的实时场景。返回行供 service 层映射成轻量项。
+        """
+        safe = _escape_like(q)
+        if not safe:
+            return []
+        filters: Dict[str, str] = {"deleted_at": "is.null"}
+        if status:
+            filters["status"] = f"eq.{status}"
+        filters["or"] = f"(title.ilike.*{safe}*,aliases.cs.{{{safe}}})"
+        columns = "id,code,title,author,cover_url,aliases,extra,status"
+        return await self.db.select(
+            TABLE_SCRIPTS,
+            filters=filters,
+            columns=columns,
+            order="play_count.desc,rating.desc.nullslast",
+            limit=max(1, min(limit, 20)),
+        )
+
     async def count_all(self) -> int:
         _, total = await self.db.select_with_count(
             TABLE_SCRIPTS, filters={"deleted_at": "is.null"}, columns="id", limit=1

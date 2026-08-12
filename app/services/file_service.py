@@ -99,6 +99,7 @@ class FileService:
         max_size: int = 20 * 1024 * 1024,
         prefix: Optional[str] = None,
         acl: Optional[str] = None,
+        content_disposition: Optional[str] = None,
     ) -> FileInfo:
         """小文件一次性上传，走服务端中转。大文件请使用分片上传接口。
 
@@ -146,7 +147,9 @@ class FileService:
                 return FileInfo.from_row(row)
 
         object_key = build_object_key(user.id, clean_name, prefix or self.settings.upload_prefix)
-        meta = await self.oss.put_object(object_key, data, content_type=mime)
+        meta = await self.oss.put_object(
+            object_key, data, content_type=mime, content_disposition=content_disposition
+        )
         if acl:
             await self.oss.set_object_acl(object_key, acl)
         row = await self.files.create(

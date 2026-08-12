@@ -17,7 +17,9 @@ from app.core.security import CurrentUser, get_current_user, get_current_user_op
 from app.core.exceptions import AuthError
 from app.schemas.common import MessageResponse
 from app.schemas.script import (
+    ScriptAutocompleteResult,
     ScriptCreate,
+    ScriptCreateResult,
     ScriptItem,
     ScriptListResult,
     ScriptSearchByNameResult,
@@ -99,11 +101,15 @@ async def list_scripts(
 
 @router.post(
     "",
-    response_model=ScriptItem,
+    response_model=ScriptCreateResult,
     status_code=status.HTTP_201_CREATED,
-    summary="新增剧本",
+    summary="新增 / 导入剧本",
     description=(
-        "只有 `title` 必填。\n\n"
+        "只有 `title` 必填。这是「新增剧本」与「导入 DM 指南」共用的入口。\n\n"
+        "**导入去重关联**：若剧本库已存在同名（标题精确 / 别名精确）剧本，不会新建重复行，"
+        "而是把本次导入的信息**关联**到已有剧本上（挂上 `extra.dmGuide`、补全缺失字段、"
+        "置为已上架），并在响应里返回 `was_created=false`，前端据此提示「已关联到已有剧本」；"
+        "若库里没有，则正常新建（`was_created=true`）。\n\n"
         "- `code` 不传时由后端按标题自动生成，重名会自动加序号；\n"
         "- `playstyles` / `themes` / `release_type` / `difficulty` 必须是字典里真实存在的编码，"
         "传错会返回 422 并在 `details.allowed` 里列出全部可选值；\n"
@@ -118,13 +124,13 @@ async def create_script(
     user: CurrentUser = Depends(get_current_user),
     service: ScriptService = Depends(get_script_service),
     dm: DMGuideService = Depends(get_dm_guide_service),
-) -> ScriptItem:
-    script = await service.create_script(payload, user_id=user.id)
+) -> ScriptCreateResult:
+    script, was_created = await service.create_script(payload, user_id=user.id)
     # 放进后台任务而不是就地 await：派发要先查一次库、再往 MQ 投递，
     # 挂在请求链路上会让保存接口凭空多出几百毫秒。
     # maybe_trigger 内部吞掉全部异常 —— 手册解析失败绝不能让剧本保存看起来失败。
     background.add_task(dm.maybe_trigger, script, user_id=user.id)
-    return script
+    return ScriptCreateResult(**script.model_dump(), was_created=was_created)
 
 
 @router.get(
@@ -182,6 +188,29 @@ async def batch_import_status(
             # 单个剧本异常（已删除 / 内部错误）不应让整批失败
             continue
     return out
+
+
+@router.get(
+    "/autocomplete",
+    response_model=ScriptAutocompleteResult,
+    summary="剧本名自动补全（联想搜索）",
+    description=(
+        "边输入边查的轻量搜索，供导入表单的下拉框「先选已有剧本再挂手册」使用，"
+        "也供任意需要按名称快速检索剧本的场景。\n\n"
+        "只按**已上架**剧本的标题（模糊）与别名（精确）召回，返回精简字段"
+        "（id / code / title / author / cover_url / has_guide），不拉字典标签、不拼展示文案，"
+        "保证实时响应。`has_guide=true` 表示该剧本已导入过 DM 手册，前端可据此提示避免重复导入。"
+    ),
+)
+async def autocomplete_scripts(
+    q: str = Query(
+        ..., min_length=1, max_length=50, description="输入中的剧本名片段"
+    ),
+    limit: int = Query(default=8, ge=1, le=20, description="最多返回条数"),
+    service: ScriptService = Depends(get_script_service),
+) -> ScriptAutocompleteResult:
+    items = await service.autocomplete(q, limit=limit)
+    return ScriptAutocompleteResult(query=q, count=len(items), items=items)
 
 
 @router.get(
