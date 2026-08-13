@@ -600,6 +600,17 @@ def chunk_and_dedup(
         namespace=f"dm:dedup:{document_id}",
         ttl=7 * 24 * 3600,
     )
+    # 每轮 T2 开始前必须清空该文档的历史指纹，否则两种场景会全军覆没：
+    # ① force 重跑只清了数据库（purge_document），Redis 指纹 TTL 长达 7 天，
+    #    同一份手册重传时所有 chunk 被判为 exact 重复，最终 0 块入库
+    #    （前端表现为「解析完成但不可问答」的卡死态）；
+    # ② T2 自身重试时，上一轮已登记的指纹会把本轮相同内容全部误杀。
+    # 同一文档的流水线由 trigger_ingest 保证串行（force 会先取消旧任务），
+    # 清空操作不影响并发安全；InMemory 后端的 clear 是无害 no-op。
+    try:
+        backend.clear()
+    except Exception as exc:  # noqa: BLE001 - 清空失败不应中断流水线
+        logger.warning("清空去重指纹失败 doc=%s: %s", document_id, exc)
     dedup = Deduplicator(
         backend=backend,
         threshold=settings.dm_simhash_threshold,
