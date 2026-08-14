@@ -185,18 +185,44 @@ class DMGuideService:
             store.find_active_job, script_id, script_code=script_code
         )
         if active and not payload.force:
-            return IngestResponse(
-                job_id=str(active.get("id")),
-                status=str(active.get("status") or store_mod.JOB_PENDING),
-                reused=True,
-                message="该剧本已有解析任务在执行，返回现有任务进度",
-            )
+            active_key = active.get("object_key")
+            # 文件已变更（用户删掉旧文件、换了一份新文件重传）：旧任务对应的是老文件，
+            # 必须作废旧任务、按新文件重新派发，否则状态会一直停在旧文件上，
+            # 新文件永远进不了流水线（这正是「删了 pdf 传了 docs，解析状态还是 pdf」的原因）。
+            if active_key and ref.object_key and active_key != ref.object_key:
+                logger.info(
+                    "检测到文件已变更，取消旧解析任务 job=%s old=%s new=%s",
+                    active.get("id"), active_key, ref.object_key,
+                )
+                await run_in_threadpool(
+                    store.update_job,
+                    str(active.get("id")),
+                    {
+                        "status": store_mod.JOB_CANCELLED,
+                        "error_message": "文件已更换，旧解析任务被新文件取代",
+                    },
+                )
+            else:
+                return IngestResponse(
+                    job_id=str(active.get("id")),
+                    status=str(active.get("status") or store_mod.JOB_PENDING),
+                    reused=True,
+                    message="该剧本已有解析任务在执行，返回现有任务进度",
+                )
         if active and payload.force:
             # force 语义是「以新任务为准」，旧任务标记取消，避免进度接口拿到两条在跑
             await run_in_threadpool(
                 store.update_job,
                 str(active.get("id")),
                 {"status": store_mod.JOB_CANCELLED, "error_message": "被强制重跑任务取代"},
+            )
+
+        # 派发新任务前，先把不属于当前文件的其他激活文档下线：
+        # 否则旧文件的文档仍是 is_active=true，get_status 会把它当成「最新」展示。
+        if ref.object_key:
+            await run_in_threadpool(
+                store.deactivate_documents_not_matching,
+                script_id, ref.object_key, script_code,
             )
 
         job_id = str(uuid.uuid4())
@@ -339,10 +365,27 @@ class DMGuideService:
                 store.get_active_document, script_id, script_code=script_code
             )
             docs = [doc] if doc else []
-        latest_doc = docs[0] if docs else None
+        # 优先锚定到「当前关联文件」对应的文档：用户换文件重传后，库里可能同时残留
+        # 旧文件的激活文档（且 created_at 更新），若只取「最新激活」会把旧文件当成
+        # 当前手册，导致解析状态文件名卡在旧文件上。
+        if ref and ref.object_key:
+            matched = next(
+                (d for d in docs if d and d.get("object_key") == ref.object_key), None
+            )
+            latest_doc = matched if matched is not None else (docs[0] if docs else None)
+        else:
+            latest_doc = docs[0] if docs else None
         job_row = await run_in_threadpool(
             store.latest_job, script_id, script_code=script_code
         )
+        # 同理：若最新任务对应的是已被替换的旧文件，优先取当前文件的最新任务，
+        # 避免「解析状态」展示成旧文件。
+        if ref and ref.object_key and job_row and job_row.get("object_key") != ref.object_key:
+            matched_job = await run_in_threadpool(
+                store.latest_job, script_id, script_code=script_code, object_key=ref.object_key
+            )
+            if matched_job:
+                job_row = matched_job
 
         total_pages = sum(int(d.get("total_pages") or 0) for d in docs)
         total_chunks = sum(int(d.get("total_chunks") or 0) for d in docs)

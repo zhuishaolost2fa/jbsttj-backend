@@ -213,11 +213,21 @@ class DMStore:
         )
         return self._rows(resp)
 
-    def latest_job(self, script_id: str = "", *, script_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def latest_job(
+        self,
+        script_id: str = "",
+        *,
+        script_code: Optional[str] = None,
+        object_key: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """取最近一次任务，不论是否已结束。
 
         与 :meth:`find_active_job` 的区别：那个只看在跑的，用于防重复派发；
         这个包含终态，用于在详情页展示「上次解析失败了，原因是 XXX」。
+
+        `object_key` 传入时，只在该文件对应的任务里取最新一条 —— 用于在
+        `extra.dmGuide` 已经换成新文件、但库里还残留着旧文件任务时，
+        把「解析状态」正确锚定到当前关联的文件，而不是被旧文件的任务带偏。
         """
         params: Dict[str, Any] = {
             "select": "*",
@@ -228,6 +238,8 @@ class DMStore:
             params["script_code"] = f"eq.{script_code}"
         else:
             params["script_id"] = f"eq.{script_id}"
+        if object_key:
+            params["object_key"] = f"eq.{object_key}"
         resp = self._request("GET", f"/{TABLE_JOBS}", params=params)
         rows = self._rows(resp)
         if rows or not script_code or not script_id or script_code == script_id:
@@ -264,6 +276,32 @@ class DMStore:
                 "id": f"neq.{keep_document_id}",
                 "is_active": "eq.true",
             },
+            headers={"Prefer": "return=minimal"},
+            json={"is_active": False},
+        )
+
+    def deactivate_documents_not_matching(
+        self, script_id: str, object_key: str, *, script_code: Optional[str] = None
+    ) -> None:
+        """把同一剧本下、不属于「当前文件」的激活文档全部下线。
+
+        用于「换了文件重新上传」的场景：用户在旧文件解析还在跑的时候换了一份新文件，
+        旧文件的文档仍是 `is_active=true`。若不处理，`get_status` 会按 `created_at`
+        把旧文件的文档当成「最新」展示，解析状态的文件名就卡在旧文件上。
+        这里只保留与当前 `object_key` 一致的文档为激活态。
+        """
+        params: Dict[str, Any] = {
+            "script_id": f"eq.{script_id}",
+            "object_key": f"neq.{object_key}",
+            "is_active": "eq.true",
+            "deleted_at": "is.null",
+        }
+        if script_code:
+            params["script_code"] = f"eq.{script_code}"
+        self._request(
+            "PATCH",
+            f"/{TABLE_DOCUMENTS}",
+            params=params,
             headers={"Prefer": "return=minimal"},
             json={"is_active": False},
         )
