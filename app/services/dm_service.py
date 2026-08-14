@@ -589,19 +589,25 @@ class DMGuideService:
         top_k: int = 6,
         min_similarity: Optional[float] = None,
         category: Optional[str] = None,
+        use_llm: bool = False,
     ) -> AskResponse:
-        """检索手册相关内容，再用 LLM 合成一条带引用的答案。
+        """检索手册相关内容，返回答案。
 
-        与 :meth:`search` 的区别：search 只返回原始命中（前端自己挑），
-        ask 额外走一步 LLM 把命中内容揉成一句直接能照着念的答案，并标注出处。
-        答案**严格**基于检索到的手册内容，模型无法看到的页面不会出现在答案里。
+        速度优先：`use_llm=False`（默认）时**不调用大模型**——直接把向量检索到的
+        最近命中（qa 答案或原文块）透出为 `answer`，只花一次 embedding + 向量查询的
+        开销，端到端通常在几十毫秒级，零 LLM 额度消耗。
+
+        `use_llm=True` 时走原 RAG 链路：用 LLM 把命中内容合成一条带引用出处的答案。
+
+        与 :meth:`search` 的区别：search 只返回原始命中（前端自己挑），ask 额外把
+        答案凝练成一条可直接照着念的文本，并标注出处来源 `sources`。
         """
         self._require_rag_config()
         script_id = str(getattr(script, "id", "") or "")
         if not script_id:
             raise ValidationError("剧本 ID 缺失", code="script_id_required")
 
-        # 没索引就回答不了 —— 直接告诉前端先等解析完成，不要抛 LLM 空答
+        # 没索引就回答不了 —— 直接告诉前端先等解析完成，不要抛空答
         status = await self.get_status(script)
         if not status.indexed:
             raise ConflictError(
@@ -649,30 +655,36 @@ class DMGuideService:
                 )
             )
 
-        context = _format_answer_context(sources)
-        user_prompt = (
-            f"剧本：《{getattr(script, 'title', '') or script_id}》\n\n"
-            f"【手册内容】\n{context}\n\n"
-            f"【问题】\n{question}\n\n"
-            "请基于手册内容回答上面的问题。"
-        )
-        from app.services.llm import get_llm_client
+        if use_llm:
+            # LLM 合成路径：把命中内容揉成一句直接能照着念、带括号出处的答案。
+            context = _format_answer_context(sources)
+            user_prompt = (
+                f"剧本：《{getattr(script, 'title', '') or script_id}》\n\n"
+                f"【手册内容】\n{context}\n\n"
+                f"【问题】\n{question}\n\n"
+                "请基于手册内容回答上面的问题。"
+            )
+            from app.services.llm import get_llm_client
 
-        client = get_llm_client()
-        # chat 是同步阻塞网络调用，丢进线程池避免卡住事件循环
-        answer = await run_in_threadpool(
-            client.chat,
-            [
-                {"role": "system", "content": _ANSWER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            **{"temperature": 0.3, "max_tokens": 1024},
-        )
+            client = get_llm_client()
+            # chat 是同步阻塞网络调用，丢进线程池避免卡住事件循环
+            answer = await run_in_threadpool(
+                client.chat,
+                [
+                    {"role": "system", "content": _ANSWER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                **{"temperature": 0.3, "max_tokens": 1024},
+            )
+            answer = (answer or "").strip()
+        else:
+            # 速度最优路径：直接返回向量最近命中的答案文本，不调 LLM。
+            answer = _compose_direct_answer(sources)
 
         took = int((time.perf_counter() - started) * 1000)
         return AskResponse(
             question=question,
-            answer=(answer or "").strip(),
+            answer=answer,
             sources=sources,
             mode=result.mode,
             document_id=result.document_id,
@@ -736,6 +748,23 @@ def _coarse_progress(job: "JobProgress") -> float:
     if job.total_shards > 0:
         return min(100.0, round(job.finished_shards / job.total_shards * 100, 1))
     return 0.0
+
+
+def _compose_direct_answer(
+    sources: List[AskSource], fallback: str = "手册中未找到相关内容"
+) -> str:
+    """速度最优路径：直接返回向量最近命中的答案文本，不调用 LLM。
+
+    `sources` 在 :meth:`DMGuideService.ask` 内已是 **qa 优先** 排序（先放 qa 命中、
+    再放 chunk 命中），所以取首条即可得到本次检索中业务权重最高、且相似度最靠前的那条；
+    对 chunk 模式则取相似度最高的原文块。无需任何模型推理，仅字符串拼接。
+    """
+    if not sources:
+        return fallback
+    top = sources[0]
+    if top.type == "qa":
+        return (top.answer or "").strip()
+    return (top.content or "").strip()
 
 
 def _format_answer_context(sources: List[AskSource]) -> str:

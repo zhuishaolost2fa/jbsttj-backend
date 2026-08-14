@@ -306,6 +306,16 @@ class AskRequest(BaseModel):
     category: Optional[str] = Field(
         default=None, description="只看某一类问答，仅对 qa / hybrid 模式生效"
     )
+    # 速度开关：默认 false 直接返回向量最近命中（不调用 LLM），速度最优；
+    # 设为 true 才走 LLM 把命中内容合成一条带引用的答案。
+    use_llm: bool = Field(
+        default=False,
+        alias="useLlm",
+        description=(
+            "是否用 LLM 合成答案。默认 false：直接返回向量最近命中的答案文本，"
+            "速度最优、零 LLM 额度消耗；设为 true 时才调用 LLM 生成带引用出处的答案。"
+        ),
+    )
 
     @field_validator("question")
     @classmethod
@@ -332,12 +342,16 @@ class AskSource(BaseModel):
 
 
 class AskResponse(BaseModel):
-    """问答结果：LLM 合成的答案为 `answer`，`sources` 是其引用的手册出处。"""
+    """问答结果。
+
+    `answer` 默认是向量检索到的「最近命中」答案文本（直接透出、不调 LLM，速度最优）；
+    仅当请求 `useLlm=true` 时才是 LLM 把命中内容合成、带引用出处的答案。
+    `sources` 是参与作答的引用出处（qa 优先）。"""
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     question: str = Field(description="原始问题")
-    answer: str = Field(description="基于手册内容生成的答案")
+    answer: str = Field(description="答案：默认向量最近命中文本，useLlm=true 时为 LLM 合成")
     sources: List[AskSource] = Field(default_factory=list, description="引用来源（qa 优先）")
     mode: str = Field(description="实际使用的检索模式")
     document_id: Optional[str] = Field(default=None, description="命中的文档 ID")

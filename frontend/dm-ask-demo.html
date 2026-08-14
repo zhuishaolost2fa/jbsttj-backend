@@ -47,7 +47,8 @@
     <h1>DM 手册问答 · 演示</h1>
     <p class="muted" style="margin:6px 0 14px">
       对接 <code>POST /api/v1/dm-guide/ask</code>：填剧本 <code>code</code> + 询问，
-      后端向量化后在該剧本手册内做向量检索，再用 LLM 合成带出处的答案。
+      后端向量化后在該剧本手册内做向量检索，默认直接返回向量最近命中（不调 LLM，速度最快）；
+      需要 LLM 合成带出处答案时把 <code>useLlm</code> 设为 true。
     </p>
     <div class="row">
       <input type="text" id="apiBase" placeholder="服务地址，留空表示同源">

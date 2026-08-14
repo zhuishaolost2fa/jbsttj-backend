@@ -181,14 +181,17 @@ async def search_dm_guide(
 @router.post(
     "/{id_or_code}/dm-guide/ask",
     response_model=AskResponse,
-    summary="剧本详情问答（RAG 生成答案）",
+    summary="剧本详情问答（向量直出，速度最优）",
     description=(
-        "检索手册相关内容，再用 LLM 合成一条**带引用出处**的答案，供主持人在带本过程中直接照着念。\n\n"
-        "与 `search` 的区别：search 只返回原始命中（前端自己挑），ask 额外走一步 LLM "
-        "把命中内容揉成一句可直接执行的答案，并在 `sources` 里给出每条结论对应的章节与页码。\n"
-        "答案严格基于检索到的手册内容，模型看不到的页面不会出现在答案里。\n\n"
-        "前置条件同检索：剧本手册必须已完成索引（`indexed=true`），否则返回 409。\n"
-        "该接口会消耗 LLM 额度，需登录调用。"
+        "检索手册相关内容，返回答案。\n\n"
+        "**速度优先（默认）**：`useLlm` 不传或为 `false` 时**不调用大模型**，直接把向量检索到的\n"
+        "最近命中（qa 答案或原文块）透出为 `answer`，端到端只花一次 embedding + 向量查询，\n"
+        "几十毫秒级、零 LLM 额度，适合带本时高频即时查规则。\n\n"
+        "需要 LLM 把命中内容**合成**成一条带引用出处的答案时，把 `useLlm` 设为 `true`\n"
+        "（会消耗 LLM 额度，速度更慢）。\n\n"
+        "与 `search` 的区别：search 只返回原始命中（前端自己挑），ask 额外把答案凝练成\n"
+        "一条可直接照着念的文本，并在 `sources` 里给出每条结论对应的章节与页码。\n\n"
+        "前置条件同检索：剧本手册必须已完成索引（`indexed=true`），否则返回 409。需登录调用。"
     ),
 )
 async def ask_dm_guide(
@@ -206,6 +209,7 @@ async def ask_dm_guide(
         top_k=payload.top_k,
         min_similarity=payload.min_similarity,
         category=payload.category,
+        use_llm=payload.use_llm,
     )
 
 
@@ -222,15 +226,17 @@ ask_router = APIRouter(prefix="/dm-guide", tags=["DM 主持人手册"])
 @ask_router.post(
     "/ask",
     response_model=AskResponse,
-    summary="剧本问答（按 code 直接检索）",
+    summary="剧本问答（按 code 直接检索，向量直出）",
     description=(
         "与 `POST /scripts/{id_or_code}/dm-guide/ask` 功能完全一致，只是把剧本标识从 URL 路径\n"
         "挪到了请求体：前端只需知道剧本的 `code`（或 UUID）加上 `询问`，即可发起检索，\n"
         "不必先拼出 `/scripts/{id_or_code}` 路径。\n\n"
         "请求体字段：`code`（**必填**，界定检索范围）、`询问`/`question`（**必填**，自然语言问题）、\n"
-        "`mode`、`topK`、`minSimilarity`、`category`（均可选，含义同检索接口）。\n\n"
-        "后端先用 `code` 解析出剧本，再用 `询问` 向量化后在**该剧本手册内**做向量检索，\n"
-        "最后用 LLM 把命中内容合成一条带引用出处的答案。检索范围严格限定在 `code` 对应的手册，\n"
+        "`mode`、`topK`、`minSimilarity`、`category`（均可选，含义同检索接口）、\n"
+        "`useLlm`（可选，默认 `false`）。\n\n"
+        "后端先用 `code` 解析出剧本，再用 `询问` 向量化后在**该剧本手册内**做向量检索。\n"
+        "**默认 `useLlm=false`：不调大模型，直接把向量最近命中的答案文本返回，速度最优、零 LLM 额度**；\n"
+        "需要 LLM 合成带引用出处的答案时再设 `useLlm=true`。检索范围严格限定在 `code` 对应的手册，\n"
         "不会跨剧本串味。前置条件同检索：手册须已完成索引（`indexed=true`），否则返回 409。"
     ),
 )
@@ -252,4 +258,5 @@ async def ask_dm_guide_by_code(
         top_k=payload.top_k,
         min_similarity=payload.min_similarity,
         category=payload.category,
+        use_llm=payload.use_llm,
     )
