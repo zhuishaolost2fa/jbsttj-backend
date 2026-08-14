@@ -222,7 +222,7 @@ class DMGuideService:
         if ref.object_key:
             await run_in_threadpool(
                 store.deactivate_documents_not_matching,
-                script_id, ref.object_key, script_code,
+                script_id, ref.object_key, script_code=script_code,
             )
 
         job_id = str(uuid.uuid4())

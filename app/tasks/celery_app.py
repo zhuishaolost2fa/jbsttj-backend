@@ -87,8 +87,13 @@ def _build_app() -> Any:
             "dm.chunk_and_dedup": {"queue": QUEUE_CHUNK},
             "dm.generate_qa": {"queue": QUEUE_QA},
             "dm.embed_and_store": {"queue": QUEUE_EMBED},
-            "dm.finalize": {"queue": QUEUE_DEFAULT},
-            "dm.on_pipeline_error": {"queue": QUEUE_DEFAULT},
+            # finalize / on_pipeline_error 是流水线的「收尾 / 失败落库」控制任务。
+            # 必须用「确实有 worker 在消费」的队列，否则任务进 orphan 队列永远不执行：
+            # 成功时 job 卡在 embedding 不翻 completed，失败时 job 永远不翻 failed。
+            # 早期版本路由到 default，但 4 个 worker 都各自独占一条队列、无人消费 default，
+            # 导致所有任务卡在 embedding。这里改挂到 dm.chunk 控制队列（worker_chunk 常驻）。
+            "dm.finalize": {"queue": QUEUE_CHUNK},
+            "dm.on_pipeline_error": {"queue": QUEUE_CHUNK},
         },
 
         # ---------- 可靠性 ----------
