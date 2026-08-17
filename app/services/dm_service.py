@@ -752,7 +752,7 @@ class DMGuideService:
 
         与向量检索不同，这里**不做语义匹配、不调 embedding**：
         就是把该剧本（含同名分片）已入库的 QA 按行文顺序全量列出、按标题分组，
-        供前端做「手册目录 + 标题下问答」的结构化浏览。
+        供前端做「玩家问答目录 + 标题下问答」的结构化浏览（QA 生成本身即面向玩家撰写）。
         """
         code = (script_code or "").strip().lower()
         if not code:

@@ -134,12 +134,13 @@ async def get_dm_guide_job(
     "/{id_or_code}/dm-guide/qa-titles",
     response_model=QATitleChain,
     response_model_by_alias=True,
-    summary="DM 手册标题链（QA 按标题分组）",
+    summary="玩家问答标题链（QA 按标题分组）",
     description=(
-        "把手册的全部问答对按「标题链」结构返回：标题层级来自手册的章节面包屑，\n"
+        "把手册生成的**面向玩家**的全部问答对按「标题链」结构返回：问答以玩家口吻提问、"
+        "向玩家作答（不含主持侧术语与剧透内容），标题层级来自手册的章节面包屑，\n"
         "同一标题下的问答按手册行文顺序排列，多个同名分片剧本的 QA 会聚合到同一棵树下。\n\n"
         "与 `search` 的区别：search 是语义匹配（按相似度返回少量命中），\n"
-        "本接口是**全量结构化浏览**（不做语义过滤、不调 embedding），适合「手册目录 + 问答列表」页。\n\n"
+        "本接口是**全量结构化浏览**（不做语义过滤、不调 embedding），适合「玩家问答目录 + 问答列表」页。\n\n"
         "响应的 `titles` 是根级标题节点，每个节点含 `title` / `path`（完整标题路径）/\n"
         "`qa`（本标题直接挂的问答）/ `children`（子标题）；无章节信息的问答归入「未分节」节点。"
     ),
@@ -293,9 +294,9 @@ async def ask_dm_guide_by_code(
     "/qa-titles",
     response_model=QATitleChain,
     response_model_by_alias=True,
-    summary="手册标题链（按剧本杀名称直接提取）",
+    summary="玩家问答标题链（按剧本杀名称直接提取）",
     description=(
-        "按**剧本杀名称**提取手册标题链：`title=六角馆谋杀奇谋` 即可拿到该剧本\n"
+        "按**剧本杀名称**提取面向玩家的问答标题链：`title=六角馆谋杀奇谋` 即可拿到该剧本\n"
         "（含同名分片）全部问答按标题分组的树形结构，无需先查剧本 ID。\n\n"
         "名称到业务 code 的换算与入库时完全一致（中文转拼音 slug），同名分片自动聚合。\n"
         "也可以直接传 `code`（DM 聚合编码）。两者至少传一个，同时传时以 `code` 为准。\n\n"

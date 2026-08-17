@@ -326,10 +326,12 @@ python run_worker.py
 | GET | `/api/v1/scripts/{id_or_code}/dm-guide` | 手册索引状态（公开）：`hasGuide` / `indexed` / 进度 |
 | GET | `/api/v1/scripts/{id_or_code}/dm-guide/jobs/{job_id}` | 某次解析任务进度（公开） |
 | GET | `/api/v1/scripts/{id_or_code}/dm-guide/search` | 向量检索（公开）：`q` / `mode=chunk|qa|hybrid` / `topK` / `minSimilarity` / `category` |
-| GET | `/api/v1/scripts/{id_or_code}/dm-guide/qa-titles` | 手册标题链（公开）：全部 QA 按标题树分组、行文顺序，含同名分片聚合 |
-| GET | `/api/v1/dm-guide/qa-titles?title={剧本名}` | 按剧本杀名称直接提取标题链（公开），也可传 `code` |
+| GET | `/api/v1/scripts/{id_or_code}/dm-guide/qa-titles` | 玩家问答标题链（公开）：面向玩家的全部 QA 按标题树分组、行文顺序，含同名分片聚合 |
+| GET | `/api/v1/dm-guide/qa-titles?title={剧本名}` | 按剧本杀名称直接提取玩家问答标题链（公开），也可传 `code` |
 
 标题链说明（需先执行 `sql/dm_qa_title.sql` 迁移）：
+
+- QA 由 LLM 从手册片段生成时即以**玩家视角**撰写：玩家口吻提问、向玩家作答，不含主持侧术语，不生成剧透真相类问答；
 
 - QA 落库时把来源块的**末级章节标题**写入 `script_dm_qa.title`，完整层级仍在 `sectionPath`；
 - 响应 `titles` 为根级标题节点，节点含 `title` / `path` / `qa`（本标题下的问答，行文顺序）/ `children`（子标题）；
