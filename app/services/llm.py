@@ -29,6 +29,7 @@ import json
 import logging
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -223,6 +224,12 @@ class SiliconFlowClient:
         self._settings = settings or get_settings()
         self._sync: Optional[httpx.Client] = None
         self._async: Optional[httpx.AsyncClient] = None
+        # 单进程内对 LLM 的并发闸门：并发请求超出配额上限会被 429 打爆，
+        # 这里在发送前就用信号量限流（config.llm_max_concurrency），
+        # 并发起来后 worker 数可以放心往上加。
+        self._sync_sem = threading.BoundedSemaphore(
+            max(1, self._settings.llm_max_concurrency)
+        )
 
     # ---------------- 基础设施 ----------------
     @property
@@ -313,34 +320,37 @@ class SiliconFlowClient:
         raise LLMError(f"大模型服务返回 {resp.status_code}", details=detail)
 
     def _post_sync(self, endpoint: str, payload: Dict[str, Any], *, max_retries: int) -> Dict[str, Any]:
-        last_exc: Optional[Exception] = None
-        for attempt in range(max_retries + 1):
-            try:
-                resp = self.sync_client().post(endpoint, json=payload)
-            except httpx.HTTPError as exc:
-                last_exc = exc
-                if attempt >= max_retries:
-                    break
-                delay = self._backoff(attempt, None)
-                logger.warning("硅基流动 %s 网络异常(%s)，%.1fs 后重试", endpoint, exc, delay)
-                time.sleep(delay)
-                continue
+        # 信号量把整个「请求+退避重试」周期都算进并发占用，避免超时/退避期间
+        # 又被别的线程放进来叠请求，把限流窗口撞得更响。
+        with self._sync_sem:
+            last_exc: Optional[Exception] = None
+            for attempt in range(max_retries + 1):
+                try:
+                    resp = self.sync_client().post(endpoint, json=payload)
+                except httpx.HTTPError as exc:
+                    last_exc = exc
+                    if attempt >= max_retries:
+                        break
+                    delay = self._backoff(attempt, None)
+                    logger.warning("硅基流动 %s 网络异常(%s)，%.1fs 后重试", endpoint, exc, delay)
+                    time.sleep(delay)
+                    continue
 
-            if resp.status_code < 400:
-                return resp.json()
+                if resp.status_code < 400:
+                    return resp.json()
 
-            if resp.status_code in _RETRYABLE_STATUS and attempt < max_retries:
-                delay = self._backoff(attempt, self._retry_after(resp))
-                logger.warning(
-                    "硅基流动 %s 返回 %s，%.1fs 后重试(%s/%s)",
-                    endpoint, resp.status_code, delay, attempt + 1, max_retries,
-                )
-                time.sleep(delay)
-                continue
+                if resp.status_code in _RETRYABLE_STATUS and attempt < max_retries:
+                    delay = self._backoff(attempt, self._retry_after(resp))
+                    logger.warning(
+                        "硅基流动 %s 返回 %s，%.1fs 后重试(%s/%s)",
+                        endpoint, resp.status_code, delay, attempt + 1, max_retries,
+                    )
+                    time.sleep(delay)
+                    continue
 
-            self._raise_for_response(resp, endpoint)
+                self._raise_for_response(resp, endpoint)
 
-        raise LLMError(f"大模型服务请求失败: {last_exc}") from last_exc
+            raise LLMError(f"大模型服务请求失败: {last_exc}") from last_exc
 
     async def _post_async(self, endpoint: str, payload: Dict[str, Any], *, max_retries: int) -> Dict[str, Any]:
         import asyncio
@@ -448,13 +458,16 @@ class SiliconFlowClient:
         self,
         messages: List[Dict[str, str]],
         *,
+        model: Optional[str] = None,
         temperature: float = 0.3,
         max_tokens: int = 4096,
         max_retries: int = 3,
         response_format_json: bool = False,
     ) -> str:
         payload: Dict[str, Any] = {
-            "model": self._settings.siliconflow_chat_model,
+            # 允许按调用覆盖模型：QA 提取走轻量的 siliconflow_qa_model，
+            # RAG 问答等推理场景仍用默认的 chat model
+            "model": model or self._settings.siliconflow_chat_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -482,26 +495,46 @@ class SiliconFlowClient:
 
         解析失败不抛异常而是返回空列表：单批问答对生成失败属于**可降级**故障，
         正文 chunk 的向量照样能入库检索，没必要让整条流水线红掉。
+
+        模型走 ``siliconflow_qa_model``（轻量、免费、快）；先尝试 ``json_object``
+        结构化输出，个别模型不支持时自动退回纯提示词约束，避免整批白跑。
         """
         if not chunks:
             return []
         per_chunk = qa_per_chunk or self._settings.dm_qa_per_chunk
+        qa_model = self._settings.siliconflow_qa_model or self._settings.siliconflow_chat_model
         user_prompt = build_qa_user_prompt(
             chunks, script_title=script_title, qa_per_chunk=per_chunk
         )
+        messages = [
+            {"role": "system", "content": _QA_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
         try:
             content = self.chat(
-                [
-                    {"role": "system", "content": _QA_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages,
+                model=qa_model,
                 temperature=0.3,
                 max_tokens=8192,
                 max_retries=max_retries,
+                response_format_json=True,
             )
         except LLMError as exc:
-            logger.warning("问答对生成失败（跳过本批 %s 个片段）: %s", len(chunks), exc)
-            return []
+            logger.warning(
+                "问答对生成 json_object 模式失败(%s)，退回纯文本模式重试一次", exc
+            )
+            try:
+                content = self.chat(
+                    messages,
+                    model=qa_model,
+                    temperature=0.3,
+                    max_tokens=8192,
+                    max_retries=1,
+                    response_format_json=False,
+                )
+            except LLMError as exc2:
+                logger.warning("问答对生成失败（跳过本批 %s 个片段）: %s", len(chunks), exc2)
+                return []
 
         pairs = parse_qa_response(content, max_index=len(chunks) - 1)
         logger.info("问答对生成: %s 个片段 -> %s 条", len(chunks), len(pairs))

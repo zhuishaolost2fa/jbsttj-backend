@@ -91,7 +91,8 @@ def _build_app() -> Any:
             # 必须用「确实有 worker 在消费」的队列，否则任务进 orphan 队列永远不执行：
             # 成功时 job 卡在 embedding 不翻 completed，失败时 job 永远不翻 failed。
             # 早期版本路由到 default，但 4 个 worker 都各自独占一条队列、无人消费 default，
-            # 导致所有任务卡在 embedding。这里改挂到 dm.chunk 控制队列（worker_chunk 常驻）。
+            # 导致所有任务卡在 embedding。这里改挂到 dm.chunk 控制队列（单 worker 消费全部
+            # 队列时该队列常驻；拆分为独立 worker 时也保证 dm.chunk 一定有人消费）。
             "dm.finalize": {"queue": QUEUE_CHUNK},
             "dm.on_pipeline_error": {"queue": QUEUE_CHUNK},
         },

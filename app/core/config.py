@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     siliconflow_api_key: str = ""
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
     siliconflow_chat_model: str = "Qwen/Qwen2.5-72B-Instruct"
+    # QA 提取专用模型：抽取/改写任务不需要顶级推理，轻量模型快且省。
+    # 默认 GLM-4-Flash（免费）；若发现生成质量不足，可切 Qwen/Qwen2.5-14B-Instruct。
+    siliconflow_qa_model: str = "THUDM/GLM-4-Flash"
     siliconflow_embed_model: str = "BAAI/bge-large-zh-v1.5"
     # bge-large-zh-v1.5 固定 1024 维，改模型时必须同步改 SQL 里的 vector(N)
     embedding_dim: int = 1024
@@ -160,11 +163,13 @@ class Settings(BaseSettings):
     dm_simhash_threshold: int = 3
     # 页眉页脚判定：同一文本在超过该比例的页面重复出现即视为版式噪声
     dm_header_footer_ratio: float = 0.6
-    # 每批送给 LLM 生成问答对的块数
-    dm_qa_batch_size: int = 6
+    # 每批送给 LLM 生成问答对的块数。
+    # 原来 6 块/批 × 每块 5 条 = 单批最多 30 条，输出逼近 8192 token 上限经常截断、
+    # JSON 解析失败整批丢。收窄到 3×3：单批输出 3-5k token 稳在截断线内，单次调用更快。
+    dm_qa_batch_size: int = 3
     # 每个块期望生成的问答对数量上限（提示词已要求「尽可能多」、
     # 多角度生成；此处为安全上限，避免单批 token 爆炸）
-    dm_qa_per_chunk: int = 5
+    dm_qa_per_chunk: int = 3
     # 检索默认返回条数与相似度下限
     dm_search_top_k: int = 8
     dm_search_min_similarity: float = 0.25

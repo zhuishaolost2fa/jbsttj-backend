@@ -1,18 +1,20 @@
 """本地联调 Celery worker 启动脚本: python run_worker.py
 
-与线上（supervisord 4 个 worker 各自独占一条队列）不同，本地联调用
-**单进程消费全部队列**，少开 3 个进程，调试时日志也集中在一处。
+与线上一致：**单 worker（threads 池）消费全部队列**（supervisord.conf 的
+[program:worker] 同样 --pool=threads 消费 dm.extract,dm.chunk,dm.qa,dm.embed,default），
+本地调试时日志集中在一处、内存占用也贴合免费档（约 450MB）。
 
 Windows 注意事项：
   - Celery 默认的 prefork 池在 Windows 上不可用，必须用 threads / solo；
-  - 本脚本默认 ``--pool=threads --concurrency=4``，IO 密集的 qa/embed 阶段够用；
+  - 本脚本默认 ``--pool=threads --concurrency=6``，IO 密集的 qa/embed 阶段够用
+    （LLM 客户端内部有 llm_max_concurrency=4 的信号量闸门，不会把配额打爆）；
   - 若调试 PDF 解析（CPU 密集 + PyMuPDF 在子线程不稳定），可改用 solo：
         set LOCAL_WORKER_POOL=solo && python run_worker.py
 
 可用环境变量覆盖默认值：
   LOCAL_WORKER_QUEUES       消费的队列，默认全部 5 条
   LOCAL_WORKER_POOL         执行池，默认 threads
-  LOCAL_WORKER_CONCURRENCY  并发数，默认 4
+  LOCAL_WORKER_CONCURRENCY  并发数，默认 6
 """
 
 import os
@@ -27,7 +29,7 @@ if __name__ == "__main__":
 
     queues = os.environ.get("LOCAL_WORKER_QUEUES", ",".join(ALL_QUEUES))
     pool = os.environ.get("LOCAL_WORKER_POOL", "threads")
-    concurrency = os.environ.get("LOCAL_WORKER_CONCURRENCY", "4")
+    concurrency = os.environ.get("LOCAL_WORKER_CONCURRENCY", "6")
 
     argv = [
         "worker",
