@@ -182,6 +182,9 @@ class SupabaseClient:
             return False
 
 
+# 认证代理出网超时：宁可快速失败返回明确错误，也不要卡 15s 后冒泡成 500。
+AUTH_REQUEST_TIMEOUT = 5.0
+
 class SupabaseAuth:
     """GoTrue 代理：仅用于方便调试与轻量前端，正式前端建议直接用 supabase-js。"""
 
@@ -198,8 +201,17 @@ class SupabaseAuth:
 
     async def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self._settings.supabase_auth_url}{path}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, json=payload, headers=self._headers())
+        try:
+            async with httpx.AsyncClient(timeout=AUTH_REQUEST_TIMEOUT) as client:
+                resp = await client.post(url, json=payload, headers=self._headers())
+        except httpx.HTTPError as exc:
+            # 连接超时 / 被防火墙丢弃等：典型为后端出网无法抵达 supabase.co
+            # （如国内网络环境）。快速失败并返回明确错误，避免卡 15s 后冒泡成 500。
+            logger.error("调用 GoTrue 失败（%s）：%s", url, exc)
+            raise AuthError(
+                "无法连接认证服务，请检查 SUPABASE_URL 出网连通性（如国内网络访问 supabase.co 被阻断）",
+                status_code=502,
+            ) from exc
         data: Any
         try:
             data = resp.json()

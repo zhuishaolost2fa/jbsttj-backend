@@ -489,6 +489,15 @@ class DMStore:
         )
         return _parse_content_range(resp.headers.get("Content-Range"))
 
+    def list_qa_titles(self, script_code: str) -> List[Dict[str, Any]]:
+        """按业务 code 取全部 QA（含标题与章节路径），行文顺序输出。
+
+        行序即手册的原始行文顺序（文档创建时间 → 块序号 → QA 创建时间），
+        由 SQL 函数 list_dm_qa_titles 保证，应用层直接按 section_path 组装标题树。
+        """
+        result = self.rpc("list_dm_qa_titles", {"p_script_code": script_code})
+        return result if isinstance(result, list) else []
+
     # ---------------- 检索 ----------------
     def match_chunks(
         self,

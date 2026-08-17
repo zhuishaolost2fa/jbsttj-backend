@@ -356,3 +356,51 @@ class AskResponse(BaseModel):
     mode: str = Field(description="实际使用的检索模式")
     document_id: Optional[str] = Field(default=None, description="命中的文档 ID")
     took_ms: int = Field(default=0, description="耗时（毫秒，含检索与生成）")
+
+
+# ------------------------------------------------------------
+# 标题链（QA 按手册标题分组）
+# ------------------------------------------------------------
+class QATitleItem(BaseModel):
+    """挂在标题节点下的一条问答对。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    id: str = Field(description="问答对 ID")
+    question: str = Field(description="问")
+    answer: str = Field(description="答")
+    category: str = Field(default="other", description="类别：rule/plot/role/clue/flow/other")
+    page_start: Optional[int] = Field(default=None, description="起始页（伪页码，docx 无真页码）")
+    page_end: Optional[int] = Field(default=None, description="结束页")
+
+
+class QATitleNode(BaseModel):
+    """标题链中的一个节点。
+
+    层级来自手册的章节面包屑（section_path）：`path` 是从根到本节点的完整路径，
+    `title` 即末级标题；本节点**直接**挂着的问答在 `qa` 里（行文顺序），
+    子标题在 `children` 里。没有章节信息的问答统一归入「未分节」节点。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    title: str = Field(description="标题文本（面包屑末级）")
+    path: List[str] = Field(default_factory=list, description="从根到本节点的完整标题路径")
+    qa_count: int = Field(default=0, description="本节点直接挂着的问答数（不含子节点）")
+    qa: List[QATitleItem] = Field(default_factory=list, description="本标题下的问答，行文顺序")
+    children: List["QATitleNode"] = Field(default_factory=list, description="子标题节点")
+
+
+class QATitleChain(BaseModel):
+    """按剧本聚合的标题链响应：一部剧本（含同名分片）的全部问答按标题树分组。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    script_code: str = Field(description="DM 聚合业务编码（由剧本名派生）")
+    script_title: Optional[str] = Field(default=None, description="剧本名（按名称查询时回显）")
+    total_titles: int = Field(default=0, description="叶子标题数（直接挂有问答的节点）")
+    total_qa: int = Field(default=0, description="问答对总数")
+    titles: List[QATitleNode] = Field(default_factory=list, description="根级标题节点，行文顺序")
+
+
+QATitleNode.model_rebuild()

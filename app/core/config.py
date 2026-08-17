@@ -17,8 +17,11 @@ def _split_csv(raw: Optional[str]) -> List[str]:
 
 
 class Settings(BaseSettings):
+    # 分层加载：.env 为共享基线，.env.local 为本地联调私有覆盖（已被 gitignore）。
+    # pydantic-settings 按列表顺序读取，后读的文件优先级更高 —— 即 .env.local 覆盖 .env，
+    # 而真正的环境变量（Railway 注入）优先级又高于两个文件。
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -28,7 +31,7 @@ class Settings(BaseSettings):
     app_name: str = "File Upload Service"
     app_env: str = "development"
     debug: bool = False
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
     api_prefix: str = "/api/v1"
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
@@ -108,6 +111,9 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://127.0.0.1:6379/0"
     # 去重指纹的全局集合也放 Redis，跨 shard、跨任务共享
     celery_redis_url: str = "redis://127.0.0.1:6379/1"
+    # Railway Redis 插件注入的标准变量。若上面两项仍是内置默认值、而本变量存在
+    # （典型场景：Railway 环境只挂了 REDIS_URL），则自动派生，免去手工换算 db 编号。
+    redis_url: str = ""
     celery_task_soft_time_limit: int = 1500  # 单任务软超时（秒），超时抛异常可捕获收尾
     celery_task_time_limit: int = 1800  # 硬超时，直接杀进程
     celery_worker_prefetch: int = 1  # 长任务必须设 1，否则任务会堆在某个 worker 上排队
@@ -244,6 +250,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate(self) -> "Settings":
+        # ---- Railway REDIS_URL 派生：仅在用户未显式配置时生效 ----
+        if self.redis_url:
+            base = self.redis_url.rstrip("/")
+            if self.celery_result_backend == "redis://127.0.0.1:6379/0":
+                self.celery_result_backend = f"{base}/0"
+            if self.celery_redis_url == "redis://127.0.0.1:6379/1":
+                self.celery_redis_url = f"{base}/1"
+
         if self.upload_chunk_size < self.min_part_size:
             raise ValueError(f"UPLOAD_CHUNK_SIZE 不能小于 {self.min_part_size} 字节")
         if self.max_part_count > 10000:

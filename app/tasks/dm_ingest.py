@@ -815,6 +815,10 @@ def embed_and_store(
             source = chunks[idx] if 0 <= idx < len(chunks) else chunks[0]
             chunk_id = hash_to_id.get(source.get("content_hash"))
             question = item["question"]
+            section_path = source.get("section_path") or []
+            # 标题 = 来源块的最近一级标题（面包屑末级），多个 QA 共享同一标题；
+            # 完整层级仍留在 section_path，标题链树由查询侧按路径重建。
+            title = str(section_path[-1]).strip() if section_path else ""
             qa_rows.append(
                 {
                     "document_id": document_id,
@@ -827,9 +831,10 @@ def embed_and_store(
                         question.strip().encode("utf-8")
                     ).hexdigest(),
                     "category": item.get("category") or "general",
+                    "title": title,
                     "page_start": source.get("page_start"),
                     "page_end": source.get("page_end"),
-                    "section_path": source.get("section_path") or [],
+                    "section_path": section_path,
                     "created_by": created_by or None,
                     "embedding": to_pgvector(vector),
                 }

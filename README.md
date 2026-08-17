@@ -96,6 +96,7 @@ pip install -r requirements.txt
 > 本地快速起一套：`docker run -d --name rabbitmq -p 5672:5672 rabbitmq:management` 与
 > `docker run -d --name redis -p 6379:6379 redis:7`。对应环境变量见 `.env.example` 的
 > 「DM 主持人手册 RAG 流水线」一节。
+> **本地联调也可以只用 Redis**（broker 同样走 Redis），见下方「本地联调」一节。
 
 若需**剧本杀筛选维度字典**（玩法/题材/发行方式/难度/人数/时长 6 维列表接口），
 在 SQL Editor 中再执行 `sql/script_options.sql` 建表，随后灌数据：
@@ -181,6 +182,38 @@ celery -A app.tasks worker -Q dm.embed   -c 6 -n embed@%h
 > 默认 `task_acks_late=True` + `task_reject_on_worker_lost=True`，worker 被 kill 时任务会
 > 重回队列，依赖 `script_dm_chunks.content_hash` 唯一约束保证幂等，不会重复写库。
 > 本地自测不想起 broker 时，设 `CELERY_EAGER=true` 让任务同步执行（仅测试用）。
+
+### 7. 本地联调（前端 H5 → 本地后端）
+
+配置分层：**真实环境变量（Railway 注入）> `.env.local`（本地私有，已 gitignore）> `.env`（共享基线）**。
+仓库已带一份 `.env.local`，开箱即「单 Redis」联调模式，无需 RabbitMQ：
+
+| 模式 | 依赖 | 用法 |
+| --- | --- | --- |
+| 零依赖自测 | 无 | `.env.local` 里 `CELERY_EAGER=true`，任务在 API 进程内同步执行（接口会被阻塞，仅调 API 用） |
+| **本地联调（推荐）** | 本地 Redis（6379） | `.env.local` 默认即此模式：broker/result/去重分别走本地 Redis 的 db2/db0/db1 |
+| 完整镜像线上 | docker-compose | `docker compose up -d` 起 RabbitMQ + Redis，把 `.env.local` 的 broker 改回 `amqp://dm:dm123456@127.0.0.1:5672//` |
+
+本地联调启动步骤（两个终端）：
+
+```bash
+# 终端 1：API（热重载）
+python run.py
+
+# 终端 2：Celery worker，单进程消费全部队列，Windows 用 threads 池
+python run_worker.py
+```
+
+要点：
+
+- `.env.local` 的 `CORS_ORIGINS` 已放行前端 H5 本地源 `http://localhost:8010` / `http://127.0.0.1:8010`；
+  前端侧把 API 基地址指向 `http://127.0.0.1:8000` 即可联调，改完不用部署 Railway。
+- `python run_worker.py` 默认 `--pool=threads -c 4`（prefork 在 Windows 不可用）；
+  可用 `LOCAL_WORKER_QUEUES` / `LOCAL_WORKER_POOL` / `LOCAL_WORKER_CONCURRENCY` 覆盖。
+- Supabase / OSS / SiliconFlow 本地与线上共用同一套云端资源，数据互通 ——
+  本地解析入库的手册，线上检索也能命中（注意别用脏数据污染线上库）。
+- Railway 侧若挂了 Redis 插件，注入的 `REDIS_URL` 会被自动派生为
+  `CELERY_RESULT_BACKEND` / `CELERY_REDIS_URL`（仅在未显式配置时生效）。
 
 ## 接口一览
 
@@ -293,6 +326,14 @@ celery -A app.tasks worker -Q dm.embed   -c 6 -n embed@%h
 | GET | `/api/v1/scripts/{id_or_code}/dm-guide` | 手册索引状态（公开）：`hasGuide` / `indexed` / 进度 |
 | GET | `/api/v1/scripts/{id_or_code}/dm-guide/jobs/{job_id}` | 某次解析任务进度（公开） |
 | GET | `/api/v1/scripts/{id_or_code}/dm-guide/search` | 向量检索（公开）：`q` / `mode=chunk|qa|hybrid` / `topK` / `minSimilarity` / `category` |
+| GET | `/api/v1/scripts/{id_or_code}/dm-guide/qa-titles` | 手册标题链（公开）：全部 QA 按标题树分组、行文顺序，含同名分片聚合 |
+| GET | `/api/v1/dm-guide/qa-titles?title={剧本名}` | 按剧本杀名称直接提取标题链（公开），也可传 `code` |
+
+标题链说明（需先执行 `sql/dm_qa_title.sql` 迁移）：
+
+- QA 落库时把来源块的**末级章节标题**写入 `script_dm_qa.title`，完整层级仍在 `sectionPath`；
+- 响应 `titles` 为根级标题节点，节点含 `title` / `path` / `qa`（本标题下的问答，行文顺序）/ `children`（子标题）；
+- 无章节信息的问答归入「未分节」节点；同名分片剧本（相同 `script_code`）的 QA 聚合到同一棵树。
 
 检索返回要点：
 

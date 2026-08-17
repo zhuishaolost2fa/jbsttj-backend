@@ -37,6 +37,9 @@ from app.schemas.dm_guide import (
     IngestResponse,
     JobProgress,
     QAHit,
+    QATitleChain,
+    QATitleItem,
+    QATitleNode,
     RetrievedHit,
     SearchResult,
 )
@@ -181,9 +184,14 @@ class DMGuideService:
 
         # 同一剧本同时跑两条流水线没有意义：两边都会往同一批唯一约束上撞，
         # 后完成的那条大部分写入会被 on_conflict 吞掉，白烧一遍 API 额度。
-        active = await run_in_threadpool(
-            store.find_active_job, script_id, script_code=script_code
-        )
+        #
+        # ★ 防重的粒度必须是「剧本实例 script_id」，绝不能按 script_code 查：
+        #   同名剧本拆成的多个分片是不同的 script_id、共享同一个 script_code。
+        #   若按 code 查，分片 B 导入时会把分片 A 正在跑的任务误判成
+        #   「本剧本文件已更换」并取消掉 —— 后导入的分片杀掉先导入的流水线，
+        #   先导入那份的 QA 就永远建不起来（表现为「后导入覆盖先导入」）。
+        #   各分片的任务互不影响，检索层按 script_code 聚合，QA 全部保留。
+        active = await run_in_threadpool(store.find_active_job, script_id)
         if active and not payload.force:
             active_key = active.get("object_key")
             # 文件已变更（用户删掉旧文件、换了一份新文件重传）：旧任务对应的是老文件，
@@ -733,6 +741,100 @@ class DMGuideService:
             document_id=result.document_id,
             took_ms=took,
         )
+
+    # --------------------------------------------------------
+    # 标题链（QA 按手册标题分组）
+    # --------------------------------------------------------
+    async def qa_title_chain(
+        self, *, script_code: str, script_title: str = ""
+    ) -> QATitleChain:
+        """按剧本业务 code 取出全部问答，按手册标题组装成嵌套标题链。
+
+        与向量检索不同，这里**不做语义匹配、不调 embedding**：
+        就是把该剧本（含同名分片）已入库的 QA 按行文顺序全量列出、按标题分组，
+        供前端做「手册目录 + 标题下问答」的结构化浏览。
+        """
+        code = (script_code or "").strip().lower()
+        if not code:
+            raise ValidationError("剧本标识缺失，无法定位标题链", code="script_code_required")
+
+        store = store_mod.get_dm_store()
+        rows = await run_in_threadpool(store.list_qa_titles, code)
+        titles, total_titles, total_qa = _build_title_tree(rows)
+        return QATitleChain(
+            script_code=code,
+            script_title=script_title or None,
+            total_titles=total_titles,
+            total_qa=total_qa,
+            titles=titles,
+        )
+
+
+# 没有章节信息的问答统一归入这个节点，避免前端收到空标题
+_UNTITLED_NODE = "未分节"
+
+
+def _build_title_tree(rows: List[Dict[str, Any]]) -> Tuple[List[QATitleNode], int, int]:
+    """把 list_dm_qa_titles 的扁平行组装成嵌套标题树。
+
+    入参行序必须是手册行文顺序（SQL 函数已保证），这里严格按首次出现顺序
+    建树，不做二次排序。返回 (根节点列表, 叶子标题数, 问答总数)。
+
+    层级来源是 section_path（章节面包屑）：逐前缀补出中间节点，
+    QA 挂到完整路径对应的叶节点上；同一路径的多条 QA 自然聚合在同一标题下。
+    """
+    roots: List[Dict[str, Any]] = []
+    index: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    total_qa = 0
+
+    def ensure_node(path: List[str]) -> Dict[str, Any]:
+        for i in range(1, len(path) + 1):
+            key = tuple(path[:i])
+            if key not in index:
+                node: Dict[str, Any] = {
+                    "title": path[i - 1],
+                    "path": list(key),
+                    "qa": [],
+                    "children": [],
+                }
+                index[key] = node
+                parent = index.get(tuple(key[:-1]))
+                (parent["children"] if parent is not None else roots).append(node)
+        return index[tuple(path)]
+
+    for row in rows:
+        raw_path = row.get("section_path")
+        if isinstance(raw_path, str):
+            # 与 _to_qa_hit 同款兼容：历史脏数据可能是逗号串
+            path = [p for p in (s.strip() for s in raw_path.split(",")) if p]
+        else:
+            path = [str(p).strip() for p in (raw_path or []) if str(p).strip()]
+        if not path:
+            path = [_UNTITLED_NODE]
+        node = ensure_node(path)
+        node["qa"].append(
+            QATitleItem(
+                id=str(row.get("qa_id") or row.get("id") or ""),
+                question=str(row.get("question") or ""),
+                answer=str(row.get("answer") or ""),
+                category=str(row.get("category") or "other"),
+                page_start=row.get("page_start"),
+                page_end=row.get("page_end"),
+            )
+        )
+        total_qa += 1
+
+    def to_model(node: Dict[str, Any]) -> QATitleNode:
+        return QATitleNode(
+            title=node["title"],
+            path=node["path"],
+            qa_count=len(node["qa"]),
+            qa=node["qa"],
+            children=[to_model(c) for c in node["children"]],
+        )
+
+    leaf_titles = sum(1 for n in index.values() if n["qa"])
+    return [to_model(n) for n in roots], leaf_titles, total_qa
 
 
 def _to_chunk_hit(row: Dict[str, Any]) -> ChunkHit:
