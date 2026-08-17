@@ -125,8 +125,11 @@ class Settings(BaseSettings):
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
     siliconflow_chat_model: str = "Qwen/Qwen2.5-72B-Instruct"
     # QA 提取专用模型：抽取/改写任务不需要顶级推理，轻量模型快且省。
-    # 默认 GLM-4-Flash（免费）；若发现生成质量不足，可切 Qwen/Qwen2.5-14B-Instruct。
-    siliconflow_qa_model: str = "THUDM/GLM-4-Flash"
+    # 注意：GLM-4-Flash 已在硅基流动下架（400 Model does not exist），平台也无免费模型。
+    # 另注意 json_object 模式会把输出强制包成 {"questions":[...]} 外壳，与解析器
+    # 的标准数组格式不兼容（实测 Qwen2.5-7B/14B、GLM-4-9B 全部中招，QA 静默丢 0 条），
+    # 所以 generate_qa 走纯文本模式。Qwen/Qwen3-8B 纯文本实测稳定输出标准 JSON 数组。
+    siliconflow_qa_model: str = "Qwen/Qwen3-8B"
     siliconflow_embed_model: str = "BAAI/bge-large-zh-v1.5"
     # bge-large-zh-v1.5 固定 1024 维，改模型时必须同步改 SQL 里的 vector(N)
     embedding_dim: int = 1024
@@ -157,8 +160,9 @@ class Settings(BaseSettings):
     dm_semantic_split_threshold: int = 1600
     # 语义分块的断点分位数，越大切得越少
     dm_semantic_breakpoint_percentile: int = 88
-    # 小于该长度的块直接丢弃（多为残留页码、孤立标点）
-    dm_min_chunk_chars: int = 40
+    # 小于该长度的块视为碎块（多为残留页码、孤立标点、纯标题型碎块）。
+    # 不再是简单丢弃，而是优先并入相邻块，保证内容不丢、块长度不碎。
+    dm_min_chunk_chars: int = 150
     # SimHash 汉明距离阈值，<= 该值判为近似重复
     dm_simhash_threshold: int = 3
     # 页眉页脚判定：同一文本在超过该比例的页面重复出现即视为版式噪声

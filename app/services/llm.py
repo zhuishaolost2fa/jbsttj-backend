@@ -496,8 +496,11 @@ class SiliconFlowClient:
         解析失败不抛异常而是返回空列表：单批问答对生成失败属于**可降级**故障，
         正文 chunk 的向量照样能入库检索，没必要让整条流水线红掉。
 
-        模型走 ``siliconflow_qa_model``（轻量、免费、快）；先尝试 ``json_object``
-        结构化输出，个别模型不支持时自动退回纯提示词约束，避免整批白跑。
+        模型走 ``siliconflow_qa_model``（轻量、快）；**固定纯文本模式**——
+        SiliconFlow 的 ``json_object`` 模式会把输出强制包成 ``{"questions":[...]}``
+        外壳，与 :func:`parse_qa_response` 的标准数组格式不兼容（实测多个模型全中招，
+        解析 0 条、QA 整批静默丢失）。纯文本模式靠 system prompt 约束 JSON 数组，
+        实测 Qwen3-8B 输出稳定。
         """
         if not chunks:
             return []
@@ -517,24 +520,11 @@ class SiliconFlowClient:
                 temperature=0.3,
                 max_tokens=8192,
                 max_retries=max_retries,
-                response_format_json=True,
+                response_format_json=False,
             )
         except LLMError as exc:
-            logger.warning(
-                "问答对生成 json_object 模式失败(%s)，退回纯文本模式重试一次", exc
-            )
-            try:
-                content = self.chat(
-                    messages,
-                    model=qa_model,
-                    temperature=0.3,
-                    max_tokens=8192,
-                    max_retries=1,
-                    response_format_json=False,
-                )
-            except LLMError as exc2:
-                logger.warning("问答对生成失败（跳过本批 %s 个片段）: %s", len(chunks), exc2)
-                return []
+            logger.warning("问答对生成失败（跳过本批 %s 个片段）: %s", len(chunks), exc)
+            return []
 
         pairs = parse_qa_response(content, max_index=len(chunks) - 1)
         logger.info("问答对生成: %s 个片段 -> %s 条", len(chunks), len(pairs))

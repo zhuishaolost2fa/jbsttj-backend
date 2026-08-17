@@ -515,9 +515,19 @@ def chunk_blocks(
         is_heading = block.block_type == "heading" and block.heading_level > 0
 
         if is_heading:
-            # 同级或更高级标题 → 上一节结束，断开（且不带 overlap：跨章节的
-            # 上下文续接没有意义，反而会把上一章的内容污染进下一章）
-            if buf.parts and (current_level == 0 or block.heading_level <= current_level):
+            # 更高级（更浅）标题 → 上一节结束，强制断开（且不带 overlap：跨章节的
+            # 上下文续接没有意义，反而会把上一章的内容污染进下一章）。
+            # 同级标题 → 只有当前缓冲已攒够 chunk_size 的一半才断开；否则并入继续攒。
+            # 这一条是关键防碎：手册里大量「小标题 + 一两句话」结构，若同级标题一律
+            # 断开，会产出满屏不足百字的 heading 型碎块，section_path 也随之失去意义。
+            if buf.parts and (
+                current_level == 0
+                or block.heading_level < current_level
+                or (
+                    block.heading_level == current_level
+                    and buf.length >= cfg.chunk_size // 2
+                )
+            ):
                 flush(carry_overlap=False)
             current_level = block.heading_level
             # 标题本身作为下一块的引导行，不单独成块
@@ -557,12 +567,40 @@ def chunk_blocks(
             )
 
     # 过滤过短块并重新编号。
-    # 过短块多半是残留的装饰行、孤立的角色名，向量化后会成为「万物相似」的噪声中心。
+    # 过短块多半是残留的装饰行、孤立的角色名、纯标题碎块，向量化后会成为
+    # 「万物相似」的噪声中心。但直接丢弃会丢内容 —— 改为「优先并入相邻块」：
+    # 先并入前一块，放不下则暂存（pending）待并入后一块，都放不下才丢弃。
     result: List[Chunk] = []
+    pending: Optional[Chunk] = None  # 暂存的过短块，等待并入后续块
+
+    def _absorb(target: Chunk, extra: Chunk) -> bool:
+        """把 extra 拼到 target 末尾；超过硬上限返回 False。"""
+        if len(target.text) + len(extra.text) > cfg.hard_max_chars:
+            return False
+        target.text = f"{target.text}\n{extra.text}"
+        target.page_end = max(target.page_end, extra.page_end)
+        return True
+
     for chunk in final:
         chunk.text = chunk.text.strip()
+
+        # 上一轮暂存的过短块，先尝试并入当前块（正文主体在后的场景更常见）
+        if pending is not None:
+            if _absorb(chunk, pending):
+                chunk.page_start = pending.page_start
+            elif not (result and _absorb(result[-1], pending)):
+                logger.info("过短块无处安放，丢弃 %s 字", len(pending.text))
+            pending = None
+
         if chunk.char_count < cfg.min_chunk_chars:
+            # 过短：先并入前一块，否则暂存等后一块。
+            # 连续碎块会在「并入当前块 → 仍过短 → 再暂存」的循环里链式累积，
+            # 聚成一条够长的块再落库。
+            if result and _absorb(result[-1], chunk):
+                continue
+            pending = chunk
             continue
+
         if chunk.char_count > cfg.hard_max_chars:
             # 兜底硬切，防止极端情况撑爆 embedding 入参
             for piece in recursive_split(
@@ -581,7 +619,13 @@ def chunk_blocks(
                     )
                 )
             continue
+
         result.append(chunk)
+
+    # 文末残留的过短块：并入最后一块，放不下才丢弃
+    if pending is not None:
+        if not (result and _absorb(result[-1], pending)):
+            logger.info("过短块无处安放，丢弃 %s 字", len(pending.text))
 
     for i, chunk in enumerate(result):
         chunk.chunk_index = i
