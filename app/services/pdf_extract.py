@@ -343,7 +343,10 @@ def classify_block(
     if _LIST_PREFIX.match(stripped):
         return "list", 0
 
-    ratio = font_size / body_size if body_size > 0 else 1.0
+    # font_size=0 表示字号未知（Word 文档中未显式设置字号的段落），
+    # 不能当成「字号为 0」处理——ratio 会算成 0 被误判为脚注。
+    # 未知字号时 ratio 取 1.0（假设与正文同字号），交给后续的文本特征 + 加粗判定。
+    ratio = font_size / body_size if body_size > 0 and font_size > 0 else 1.0
     numbered = _is_heading_like(stripped)
     short = len(stripped) <= 40
 
