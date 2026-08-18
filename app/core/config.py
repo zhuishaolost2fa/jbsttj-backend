@@ -186,7 +186,7 @@ class Settings(BaseSettings):
     # 此时照常返回答案（前端可自行决定是否展示），但问题会被沉淀到
     # script_dm_questions 等待真人解答，并在响应里置 needHumanAnswer=true。
     # 注意它必须高于 dm_search_min_similarity（召回下限），否则永远触发不到。
-    dm_ask_meaningful_similarity: float = 0.4
+    dm_ask_meaningful_similarity: float = 0.5
     # 剧本维度引导问题的条数上限（按 ask_count 人气排序）
     dm_guide_questions_limit: int = 3
     # PDF 本地缓存目录，同机多 worker 复用同一份下载
