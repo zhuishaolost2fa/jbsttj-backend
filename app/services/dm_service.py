@@ -31,6 +31,7 @@ from app.schemas.dm_guide import (
     ChunkHit,
     DMGuideRef,
     DMGuideStatus,
+    GuideQuestions,
     ImportPhase,
     ImportStatus,
     IngestRequest,
@@ -40,6 +41,8 @@ from app.schemas.dm_guide import (
     QATitleChain,
     QATitleItem,
     QATitleNode,
+    QuestionListResult,
+    QuestionRecord,
     RetrievedHit,
     SearchResult,
 )
@@ -641,6 +644,7 @@ class DMGuideService:
         min_similarity: Optional[float] = None,
         category: Optional[str] = None,
         use_llm: bool = False,
+        user_id: str = "",
     ) -> AskResponse:
         """检索手册相关内容，返回答案。
 
@@ -652,6 +656,11 @@ class DMGuideService:
 
         与 :meth:`search` 的区别：search 只返回原始命中（前端自己挑），ask 额外把
         答案凝练成一条可直接照着念的文本，并标注出处来源 `sources`。
+
+        低相似度处理：本次检索的最高原始相似度低于 `dm_ask_meaningful_similarity`
+        时，透出的答案基本不可信。此时照常返回答案，但会把问题按剧本维度沉淀到
+        用户提问库（等待真人解答），并在响应里置 `need_human_answer=True`。
+        落库是 best-effort：失败只记日志，绝不影响问答主链路。
         """
         self._require_rag_config()
         script_id = str(getattr(script, "id", "") or "")
@@ -733,6 +742,22 @@ class DMGuideService:
             answer = _compose_direct_answer(sources)
 
         took = int((time.perf_counter() - started) * 1000)
+
+        # 最高原始相似度（qa 与 chunk 一起比，不带 boost 加权）：
+        # 它是「这次检索到底有没有命中相关内容」的唯一可信判据。
+        best_similarity = max(
+            [h.similarity for h in result.qa] + [h.similarity for h in result.chunks],
+            default=0.0,
+        )
+        need_human = best_similarity < self._settings.dm_ask_meaningful_similarity
+        if need_human:
+            await self._record_low_similarity_question(
+                script=script,
+                question=question,
+                best_similarity=best_similarity,
+                user_id=user_id,
+            )
+
         return AskResponse(
             question=question,
             answer=answer,
@@ -740,7 +765,143 @@ class DMGuideService:
             mode=result.mode,
             document_id=result.document_id,
             took_ms=took,
+            best_similarity=round(best_similarity, 4),
+            need_human_answer=need_human,
         )
+
+    async def _record_low_similarity_question(
+        self,
+        *,
+        script: Any,
+        question: str,
+        best_similarity: float,
+        user_id: str = "",
+    ) -> None:
+        """把低相似度问题沉淀到提问库，**任何异常都不得向上冒泡**。
+
+        问答是带本现场的高频链路：提问库写挂了（表未建、网络抖动）绝不能
+        让主持人连答案都拿不到，所以这里吞掉全部异常、只留日志。
+        """
+        try:
+            from app.services.dedup import content_hash
+
+            store = store_mod.get_dm_store()
+            await run_in_threadpool(
+                store.record_question,
+                script_id=str(getattr(script, "id", "") or ""),
+                script_code=script_dm_code(script),
+                question=question[:500],
+                question_hash=content_hash(question),
+                best_similarity=best_similarity,
+                created_by=user_id or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - 落库失败不影响问答主链路
+            logger.warning("低相似度问题落库失败（已忽略）script=%s: %s",
+                           getattr(script, "id", "?"), exc)
+
+    # --------------------------------------------------------
+    # 用户提问库（真人解答 + 引导问题）
+    # --------------------------------------------------------
+    async def list_questions(
+        self,
+        *,
+        script_code: str,
+        status_filter: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> QuestionListResult:
+        """按剧本维度列出用户提问，供真人（主持人/运营）浏览与解答。"""
+        code = (script_code or "").strip().lower()
+        if not code:
+            raise ValidationError("剧本标识缺失", code="script_code_required")
+        if status_filter and status_filter not in store_mod.QUESTION_STATES:
+            raise ValidationError(
+                f"不支持的状态: {status_filter}",
+                code="invalid_question_status",
+                details={"allowed": sorted(store_mod.QUESTION_STATES)},
+            )
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+        store = store_mod.get_dm_store()
+        rows, total = await run_in_threadpool(
+            store.list_questions,
+            script_code=code,
+            status_filter=status_filter,
+            limit=limit,
+            offset=offset,
+        )
+        items = [_to_question_record(r) for r in rows]
+        await self._attach_profiles(items)
+        return QuestionListResult(total=total, items=items)
+
+    async def answer_question(
+        self, question_id: str, *, answer: str, answered_by: str
+    ) -> QuestionRecord:
+        """真人解答一条提问。解答后该问题可带答案透出为引导问题。"""
+        store = store_mod.get_dm_store()
+        existing = await run_in_threadpool(store.get_question, question_id)
+        if not existing:
+            raise NotFoundError(f"提问记录不存在: {question_id}", code="dm_question_not_found")
+        if existing.get("status") == store_mod.QUESTION_DISMISSED:
+            raise ConflictError(
+                "该问题已被标记为无效，无法解答",
+                code="dm_question_dismissed",
+            )
+        row = await run_in_threadpool(
+            store.answer_question,
+            question_id,
+            answer=answer,
+            answered_by=answered_by or None,
+        )
+        if not row:
+            raise NotFoundError(f"提问记录不存在: {question_id}", code="dm_question_not_found")
+        record = _to_question_record(row)
+        await self._attach_profiles([record])
+        return record
+
+    async def guide_questions(
+        self, *, script_code: str, script_title: str = "", limit: Optional[int] = None
+    ) -> GuideQuestions:
+        """剧本维度的引导问题：用户真实提问中人气最高的前 N 条。"""
+        code = (script_code or "").strip().lower()
+        if not code:
+            raise ValidationError("剧本标识缺失", code="script_code_required")
+        top = limit or self._settings.dm_guide_questions_limit
+        top = max(1, min(top, 10))
+        store = store_mod.get_dm_store()
+        rows = await run_in_threadpool(store.list_guide_questions, code, limit=top)
+        items = [_to_question_record(r) for r in rows]
+        await self._attach_profiles(items)
+        return GuideQuestions(
+            script_code=code,
+            script_title=script_title or None,
+            items=items,
+        )
+
+    async def _attach_profiles(self, records: List[QuestionRecord]) -> None:
+        """读取时批量关联 profiles，把最新昵称/头像合并进记录。
+
+        提问记录只存 user id：资料以 profiles 表为唯一事实源，读取时一次
+        ``id=in.(...)`` 批量查询覆盖整页 —— 头像改了下次读就是新的，
+        不需要冗余快照，也不需要任何异步同步。
+
+        profiles 查询失败只记日志、按无资料返回，绝不拖垮提问列表本身。
+        """
+        ids: List[str] = []
+        for r in records:
+            if r.created_by:
+                ids.append(r.created_by)
+            if r.answered_by:
+                ids.append(r.answered_by)
+        if not ids:
+            return
+        try:
+            store = store_mod.get_dm_store()
+            profiles = await run_in_threadpool(store.get_profiles, ids)
+        except Exception as exc:  # noqa: BLE001 - 资料合并不影响提问主数据返回
+            logger.warning("批量读取 profiles 失败（按无资料返回）: %s", exc)
+            return
+        _merge_profiles(records, profiles)
 
     # --------------------------------------------------------
     # 标题链（QA 按手册标题分组）
@@ -875,6 +1036,46 @@ def _to_qa_hit(row: Dict[str, Any]) -> QAHit:
         page_end=int(row.get("page_end") or 0),
         similarity=round(float(row.get("similarity") or 0.0), 4),
     )
+
+
+def _to_question_record(row: Dict[str, Any]) -> QuestionRecord:
+    """数据库行 → 提问记录。昵称/头像不在行里，由 _merge_profiles 读取时合并。"""
+    return QuestionRecord(
+        id=str(row.get("id") or ""),
+        script_id=str(row.get("script_id") or ""),
+        script_code=str(row.get("script_code") or ""),
+        question=str(row.get("question") or ""),
+        ask_count=int(row.get("ask_count") or 1),
+        best_similarity=round(float(row.get("best_similarity") or 0.0), 4),
+        status=str(row.get("status") or store_mod.QUESTION_PENDING),
+        answer=row.get("answer"),
+        answered_by=(str(row["answered_by"]) if row.get("answered_by") else None),
+        answered_at=row.get("answered_at"),
+        created_by=(str(row["created_by"]) if row.get("created_by") else None),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
+
+def _merge_profiles(
+    records: List[QuestionRecord], profiles: Dict[str, Dict[str, Any]]
+) -> None:
+    """把 profiles 行按 user id 合并进提问记录的展示字段（原地修改）。
+
+    纯函数、无副作用，便于单测：合并逻辑与「怎么取到 profiles」解耦。
+    资料为空的用户保持 None，前端按渐变头像兜底。
+    """
+    for r in records:
+        creator = profiles.get(r.created_by or "")
+        if creator:
+            r.created_by_nickname = creator.get("nickname")
+            r.created_by_avatar_url = creator.get("avatar_url")
+            r.created_by_avatar_color = creator.get("avatar_color")
+        answerer = profiles.get(r.answered_by or "")
+        if answerer:
+            r.answered_by_nickname = answerer.get("nickname")
+            r.answered_by_avatar_url = answerer.get("avatar_url")
+            r.answered_by_avatar_color = answerer.get("avatar_color")
 
 
 def _coarse_progress(job: "JobProgress") -> float:

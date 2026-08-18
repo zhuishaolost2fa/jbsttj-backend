@@ -182,6 +182,13 @@ class Settings(BaseSettings):
     dm_search_qa_supplement_k: int = 3
     # 合并为扁平 hits 时给 qa 相似度乘的权重，使其稳定排在 chunk 之前。
     dm_search_qa_boost: float = 1.12
+    # ask 的「有意义」相似度线：最高原始相似度低于该值时，透出的答案基本不可信。
+    # 此时照常返回答案（前端可自行决定是否展示），但问题会被沉淀到
+    # script_dm_questions 等待真人解答，并在响应里置 needHumanAnswer=true。
+    # 注意它必须高于 dm_search_min_similarity（召回下限），否则永远触发不到。
+    dm_ask_meaningful_similarity: float = 0.4
+    # 剧本维度引导问题的条数上限（按 ask_count 人气排序）
+    dm_guide_questions_limit: int = 3
     # PDF 本地缓存目录，同机多 worker 复用同一份下载
     dm_cache_dir: str = ""
     dm_max_pdf_bytes: int = 200 * 1024 * 1024

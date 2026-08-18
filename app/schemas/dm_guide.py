@@ -346,7 +346,11 @@ class AskResponse(BaseModel):
 
     `answer` 默认是向量检索到的「最近命中」答案文本（直接透出、不调 LLM，速度最优）；
     仅当请求 `useLlm=true` 时才是 LLM 把命中内容合成、带引用出处的答案。
-    `sources` 是参与作答的引用出处（qa 优先）。"""
+    `sources` 是参与作答的引用出处（qa 优先）。
+
+    `bestSimilarity` 是本次检索的最高原始相似度；低于服务端「有意义」阈值时
+    `needHumanAnswer=true`，表示透出的答案基本不可信 —— 该问题已自动沉淀到
+    用户提问库，等待真人解答（前端可提示「已记录，等待主持人补充答案」）。"""
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
@@ -356,6 +360,11 @@ class AskResponse(BaseModel):
     mode: str = Field(description="实际使用的检索模式")
     document_id: Optional[str] = Field(default=None, description="命中的文档 ID")
     took_ms: int = Field(default=0, description="耗时（毫秒，含检索与生成）")
+    best_similarity: float = Field(default=0.0, description="本次检索的最高原始余弦相似度")
+    need_human_answer: bool = Field(
+        default=False,
+        description="true 表示相似度过低、答案不可信，问题已沉淀到提问库等待真人解答",
+    )
 
 
 # ------------------------------------------------------------
@@ -404,3 +413,83 @@ class QATitleChain(BaseModel):
 
 
 QATitleNode.model_rebuild()
+
+
+# ------------------------------------------------------------
+# 用户提问沉淀（低相似度问题 → 真人解答 → 引导问题）
+# ------------------------------------------------------------
+QUESTION_STATUSES = ("pending", "answered", "dismissed")
+
+
+class QuestionRecord(BaseModel):
+    """一条用户提问记录。
+
+    同一剧本同一问题只存一行，`askCount` 是被问次数（重复提问原子累加），
+    是引导问题的排序依据；`bestSimilarity` 记录历次提问检索到的最高相似度，
+    用于评估手册盲区的严重程度。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    id: str = Field(description="提问记录 ID")
+    script_id: str = Field(description="首次提问时的剧本实例 ID")
+    script_code: str = Field(description="DM 聚合业务编码")
+    question: str = Field(description="问题原文")
+    ask_count: int = Field(default=1, description="被问次数")
+    best_similarity: float = Field(default=0.0, description="历次提问的最高检索相似度")
+    status: str = Field(description="pending 待解答 / answered 已解答 / dismissed 已忽略")
+    answer: Optional[str] = Field(default=None, description="真人解答（answered 时有值）")
+    answered_by: Optional[str] = Field(default=None, description="解答人用户 ID")
+    answered_at: Optional[datetime] = Field(default=None, description="解答时间")
+    created_by: Optional[str] = Field(default=None, description="首个提问者用户 ID")
+    created_at: Optional[datetime] = Field(default=None, description="首次提问时间")
+    updated_at: Optional[datetime] = Field(default=None, description="最近提问/解答时间")
+    # 提问者 / 解答者的昵称与头像：记录里只存 user id，这几个展示字段由服务层
+    # 读取时批量关联 profiles 实时合并，永远是最新资料。
+    # 前端优先用 avatarUrl 渲染，为空时按 avatarColor 渲染渐变首字母头像。
+    created_by_nickname: Optional[str] = Field(default=None, description="提问者昵称（读取时关联 profiles）")
+    created_by_avatar_url: Optional[str] = Field(default=None, description="提问者头像（读取时关联 profiles）")
+    created_by_avatar_color: Optional[int] = Field(default=None, description="提问者默认头像配色（0~7）")
+    answered_by_nickname: Optional[str] = Field(default=None, description="解答者昵称（读取时关联 profiles）")
+    answered_by_avatar_url: Optional[str] = Field(default=None, description="解答者头像（读取时关联 profiles）")
+    answered_by_avatar_color: Optional[int] = Field(default=None, description="解答者默认头像配色（0~7）")
+
+
+class QuestionListResult(BaseModel):
+    """提问记录分页列表。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    total: int = Field(default=0, description="满足条件的总条数")
+    items: List[QuestionRecord] = Field(default_factory=list, description="当前页记录")
+
+
+class AnswerQuestionRequest(BaseModel):
+    """真人提交解答。提交后问题转为 answered，可在引导问题接口里带着答案透出。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    answer: str = Field(min_length=1, max_length=2000, description="真人解答内容")
+
+    @field_validator("answer")
+    @classmethod
+    def _answer_not_blank(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("answer 不能为空")
+        return v
+
+
+class GuideQuestions(BaseModel):
+    """剧本维度的引导问题：用户真实提问中人气最高的前 N 条。
+
+    已解答的带 `answer`，前端可直接展开；未解答的 `answer` 为空，
+    可标注「等待解答」。与问答标题链（手册自动生成的 QA）互补：
+    标题链是「手册写了什么」，引导问题是「玩家真的在问什么」。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    script_code: str = Field(description="DM 聚合业务编码")
+    script_title: Optional[str] = Field(default=None, description="剧本名（按名称查询时回显）")
+    items: List[QuestionRecord] = Field(default_factory=list, description="按人气排序的引导问题")

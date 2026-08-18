@@ -16,14 +16,18 @@ from fastapi import APIRouter, Depends, Path, Query, status
 from app.core.exceptions import ValidationError
 from app.core.security import CurrentUser, get_current_user, get_current_user_optional
 from app.schemas.dm_guide import (
+    AnswerQuestionRequest,
     AskRequest,
     AskResponse,
     DMGuideStatus,
+    GuideQuestions,
     ImportStatus,
     IngestRequest,
     IngestResponse,
     JobProgress,
     QATitleChain,
+    QuestionListResult,
+    QuestionRecord,
     SearchResult,
 )
 from app.services.dm_service import DMGuideService, get_dm_guide_service, script_dm_code
@@ -287,6 +291,7 @@ async def ask_dm_guide_by_code(
         min_similarity=payload.min_similarity,
         category=payload.category,
         use_llm=payload.use_llm,
+        user_id=user.id,
     )
 
 
@@ -322,3 +327,109 @@ async def list_qa_titles_by_name(
                 f"剧本名无法派生有效编码: {name}", code="invalid_script_title"
             )
     return await service.qa_title_chain(script_code=resolved, script_title=name)
+
+
+# ------------------------------------------------------------
+# 用户提问沉淀：低相似度问题 → 真人解答 → 引导问题
+# ------------------------------------------------------------
+# ask 检索到的最高相似度低于服务端阈值时，答案没有意义，但问题本身会按剧本
+# 维度沉淀到 script_dm_questions（同一问题只存一行、askCount 原子累加）。
+# 这组接口覆盖后续两个动作：
+#   1. 真人（主持人/运营）浏览待解答问题并补充答案（questions + answer）；
+#   2. 前端在剧本问答页取人气最高的前三条作为引导问题（guide-questions）。
+
+
+def _resolve_script_code(code: Optional[str], title: Optional[str]) -> tuple[str, str]:
+    """code / title 二选一解析出 DM 聚合编码，与 qa-titles 接口同一套口径。"""
+    resolved = (code or "").strip().lower()
+    name = (title or "").strip()
+    if not resolved:
+        if not name:
+            raise ValidationError("code 与 title 至少传一个", code="code_or_title_required")
+        resolved = slugify(name).strip().lower()
+        if not resolved:
+            raise ValidationError(
+                f"剧本名无法派生有效编码: {name}", code="invalid_script_title"
+            )
+    return resolved, name
+
+
+@ask_router.get(
+    "/questions",
+    response_model=QuestionListResult,
+    response_model_by_alias=True,
+    summary="用户提问列表（待解答问题池）",
+    description=(
+        "按剧本维度列出用户真实提问（ask 低相似度时自动沉淀的），供主持人/运营浏览与解答。\n\n"
+        "同一问题只存一行，`askCount` 是被问次数 —— 重复提问越多排得越前，"
+        "解答优先级一目了然。`status` 过滤：`pending` 待解答（默认全部）/ "
+        "`answered` 已解答 / `dismissed` 已忽略。\n\n"
+        "剧本标识与 qa-titles 同口径：`code` 优先，或传 `title`（剧本中文名）自动派生。需登录。"
+    ),
+)
+async def list_dm_questions(
+    code: Optional[str] = Query(default=None, description="DM 聚合业务编码，优先级高于 title"),
+    title: Optional[str] = Query(default=None, description="剧本杀名称（中文名原文）"),
+    status_filter: Optional[str] = Query(
+        default=None,
+        alias="status",
+        pattern="^(pending|answered|dismissed)$",
+        description="按状态过滤，不传返回全部状态",
+    ),
+    limit: int = Query(default=20, ge=1, le=100, description="每页条数"),
+    offset: int = Query(default=0, ge=0, description="分页偏移"),
+    user: CurrentUser = Depends(get_current_user),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> QuestionListResult:
+    resolved, _ = _resolve_script_code(code, title)
+    return await service.list_questions(
+        script_code=resolved, status_filter=status_filter, limit=limit, offset=offset
+    )
+
+
+@ask_router.post(
+    "/questions/{question_id}/answer",
+    response_model=QuestionRecord,
+    response_model_by_alias=True,
+    summary="真人解答用户提问",
+    description=(
+        "主持人/运营对一条待解答问题提交真人答案。提交后问题转为 `answered`，"
+        "之后会在引导问题接口里带着答案透出，直接服务后续玩家。\n\n"
+        "对 `answered` 状态的问题再次提交视为**修改答案**；"
+        "已被标记为无效（`dismissed`）的问题返回 409。需登录。"
+    ),
+)
+async def answer_dm_question(
+    payload: AnswerQuestionRequest,
+    question_id: str = Path(description="提问记录 ID"),
+    user: CurrentUser = Depends(get_current_user),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> QuestionRecord:
+    return await service.answer_question(
+        question_id, answer=payload.answer, answered_by=user.id
+    )
+
+
+@ask_router.get(
+    "/guide-questions",
+    response_model=GuideQuestions,
+    response_model_by_alias=True,
+    summary="剧本引导问题（用户真实提问 Top3）",
+    description=(
+        "按剧本维度取用户真实提问中人气最高的前三条（`askCount` 倒序，已解答的优先），"
+        "作为剧本问答页的**引导问题**：新用户点一下就能发起提问，已解答的直接展开答案。\n\n"
+        "与问答标题链互补：标题链是「手册自动生成了什么」，引导问题是「玩家真的在问什么」。\n\n"
+        "剧本标识与 qa-titles 同口径：`code` 优先，或传 `title`（剧本中文名）自动派生。"
+        "条数默认取服务端配置（3），可用 `limit` 覆盖（1-10）。"
+    ),
+)
+async def list_guide_questions(
+    code: Optional[str] = Query(default=None, description="DM 聚合业务编码，优先级高于 title"),
+    title: Optional[str] = Query(default=None, description="剧本杀名称（中文名原文）"),
+    limit: Optional[int] = Query(default=None, ge=1, le=10, description="条数上限，默认 3"),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> GuideQuestions:
+    resolved, name = _resolve_script_code(code, title)
+    return await service.guide_questions(
+        script_code=resolved, script_title=name, limit=limit
+    )

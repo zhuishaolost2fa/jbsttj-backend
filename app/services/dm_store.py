@@ -31,6 +31,13 @@ TABLE_DOCUMENTS = "script_dm_documents"
 TABLE_CHUNKS = "script_dm_chunks"
 TABLE_QA = "script_dm_qa"
 TABLE_JOBS = "script_dm_jobs"
+TABLE_QUESTIONS = "script_dm_questions"
+
+# 用户提问状态机：pending 待解答 → answered 已解答 / dismissed 无效问题
+QUESTION_PENDING = "pending"
+QUESTION_ANSWERED = "answered"
+QUESTION_DISMISSED = "dismissed"
+QUESTION_STATES = frozenset({QUESTION_PENDING, QUESTION_ANSWERED, QUESTION_DISMISSED})
 
 # 任务状态机：pending → downloading → extracting → chunking → generating_qa
 #            → embedding → completed / failed / cancelled
@@ -546,6 +553,143 @@ class DMStore:
             },
         )
         return result if isinstance(result, list) else []
+
+    # ---------------- 用户提问沉淀 ----------------
+    def get_profiles(self, user_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """按 id 批量取用户资料（profiles 表），返回 {user_id: row}。
+
+        提问记录只存 user id，昵称/头像在读取时由服务层批量关联合并 ——
+        一次 ``id=in.(...)`` 查询覆盖整页记录，永远拿到最新资料，
+        不需要任何冗余快照与异步同步。
+        """
+        ids = [uid for uid in dict.fromkeys(user_ids) if uid]
+        if not ids:
+            return {}
+        resp = self._request(
+            "GET",
+            "/profiles",
+            params={
+                "id": f"in.({','.join(ids)})",
+                "select": "id,nickname,avatar_url,avatar_color",
+            },
+        )
+        return {str(r.get("id")): r for r in self._rows(resp) if r.get("id")}
+
+    def record_question(
+        self,
+        *,
+        script_id: str,
+        script_code: str,
+        question: str,
+        question_hash: str,
+        best_similarity: float = 0.0,
+        created_by: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """记录一条低相似度提问（幂等 + 原子计数）。
+
+        去重与计数下推到 SQL 函数 ``record_dm_question``：同一剧本同一问题
+        只存一行，重复提问 ask_count 原子 +1 —— 两个用户同时问同一问题时，
+        应用层「先查再插」会写出重复行或丢一次计数。
+        """
+        result = self.rpc(
+            "record_dm_question",
+            {
+                "p_script_id": script_id,
+                "p_script_code": script_code,
+                "p_question": question,
+                "p_question_hash": question_hash,
+                "p_best_similarity": best_similarity,
+                "p_created_by": created_by,
+            },
+        )
+        if isinstance(result, list):
+            return result[0] if result else None
+        return result
+
+    def get_question(self, question_id: str) -> Optional[Dict[str, Any]]:
+        resp = self._request(
+            "GET",
+            f"/{TABLE_QUESTIONS}",
+            params={"id": f"eq.{question_id}", "select": "*", "limit": 1},
+        )
+        rows = self._rows(resp)
+        return rows[0] if rows else None
+
+    def list_questions(
+        self,
+        *,
+        script_code: str,
+        status_filter: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """按剧本维度列出提问记录，默认人气优先（ask_count 倒序）。
+
+        返回 (当前页行, 总条数)。总数走 PostgREST 的 Content-Range，
+        与 count_chunks 同款解析方式，避免再发一次 count 请求。
+        """
+        params: Dict[str, Any] = {
+            "script_code": f"eq.{script_code}",
+            "select": "*",
+            "order": "ask_count.desc,created_at.desc",
+            "limit": limit,
+            "offset": offset,
+        }
+        if status_filter:
+            params["status"] = f"eq.{status_filter}"
+        resp = self._request(
+            "GET",
+            f"/{TABLE_QUESTIONS}",
+            params=params,
+            headers={"Prefer": "count=exact"},
+        )
+        total = _parse_content_range(resp.headers.get("Content-Range"))
+        return self._rows(resp), total
+
+    def answer_question(
+        self, question_id: str, *, answer: str, answered_by: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """真人解答：写入答案并转为 answered 态。
+
+        只允许从 pending / answered（改答案）进入 answered；
+        dismissed 的记录被视为无效问题，先回到 pending 才能解答 ——
+        由服务层显式控制，这里不静默翻状态。
+        """
+        resp = self._request(
+            "PATCH",
+            f"/{TABLE_QUESTIONS}",
+            params={"id": f"eq.{question_id}"},
+            headers={"Prefer": "return=representation"},
+            json={
+                "answer": answer,
+                "answered_by": answered_by,
+                "answered_at": "now()",
+                "status": QUESTION_ANSWERED,
+            },
+        )
+        rows = self._rows(resp)
+        return rows[0] if rows else None
+
+    def list_guide_questions(
+        self, script_code: str, *, limit: int = 3
+    ) -> List[Dict[str, Any]]:
+        """剧本维度的引导问题：按人气取前 N 条（已解答的优先展示价值最高）。
+
+        排序规则：已解答的排前面（有答案可直接展示），同状态内按被问次数倒序。
+        """
+        resp = self._request(
+            "GET",
+            f"/{TABLE_QUESTIONS}",
+            params={
+                "script_code": f"eq.{script_code}",
+                "status": f"in.({QUESTION_ANSWERED},{QUESTION_PENDING})",
+                "select": "*",
+                # PostgREST 多列排序：先按状态（answered 字典序在 pending 前），再按人气
+                "order": f"status.asc,ask_count.desc,created_at.desc",
+                "limit": limit,
+            },
+        )
+        return self._rows(resp)
 
 
 def _parse_content_range(value: Optional[str]) -> int:
