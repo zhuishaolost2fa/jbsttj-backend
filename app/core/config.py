@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     api_prefix: str = "/api/v1"
-    cors_origins: str = "http://localhost:5173,http://localhost:3000"
+    cors_origins: str = "http://localhost:5173,http://localhost:3000,https://www.jbs-ttj.store"
 
     # ---------------- Supabase ----------------
     supabase_url: str = ""
