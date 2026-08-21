@@ -450,7 +450,7 @@ class ScriptRepository:
 
         # 只看已关联 DM 主持人手册的剧本：extra 是 jsonb，用路径过滤判断 dmGuide 键存在
         if has_guide:
-            filters["extra->dmGuide"] = "is.not.null"
+            filters["extra->dmGuide"] = "not.is.null"
         elif has_guide is False:
             filters["extra->dmGuide"] = "is.null"
 
