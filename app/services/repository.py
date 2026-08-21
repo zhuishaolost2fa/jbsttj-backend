@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.services.supabase import SupabaseClient, get_supabase
 
@@ -14,6 +14,8 @@ TABLE_FILES = "files"
 TABLE_OPTION_CATEGORIES = "script_option_categories"
 TABLE_OPTIONS = "script_options"
 TABLE_SCRIPTS = "scripts"
+TABLE_SCRIPT_REQUESTS = "script_requests"
+TABLE_DM_DOCUMENTS = "script_dm_documents"
 
 
 def _now() -> str:
@@ -372,6 +374,27 @@ class ScriptRepository:
             filters["deleted_at"] = "is.null"
         return await self.db.select_one(TABLE_SCRIPTS, filters=filters)
 
+    async def get_scripts(
+        self, script_ids: Sequence[str], *, include_deleted: bool = False
+    ) -> List[Dict[str, Any]]:
+        """按 ID 批量取剧本基础信息（求解析列表 / 榜单组装展示字段）。
+
+        与 get 的过滤一致：默认排除软删除记录。选列覆盖两类消费方：
+        - 列表 / 榜单展示：code、title、cover_url；
+        - 库外诉求标题回填：aliases 参与归一化标题匹配（同导入去重规则）。
+        """
+        ids = [str(i) for i in dict.fromkeys(script_ids) if i]
+        if not ids:
+            return []
+        filters = {"id": f"in.({','.join(ids)})"}
+        if not include_deleted:
+            filters["deleted_at"] = "is.null"
+        return await self.db.select(
+            TABLE_SCRIPTS,
+            filters=filters,
+            columns="id,code,title,aliases,cover_url",
+        )
+
     async def list_scripts(
         self,
         *,
@@ -384,6 +407,7 @@ class ScriptRepository:
         duration: Optional[int] = None,
         min_rating: Optional[float] = None,
         recommended_only: bool = False,
+        has_guide: Optional[bool] = None,
         status: Optional[str] = "published",
         created_by: Optional[str] = None,
         sort: str = "hot",
@@ -423,6 +447,12 @@ class ScriptRepository:
             filters["rating"] = f"gte.{min_rating}"
         if recommended_only:
             filters["is_recommended"] = "is.true"
+
+        # 只看已关联 DM 主持人手册的剧本：extra 是 jsonb，用路径过滤判断 dmGuide 键存在
+        if has_guide:
+            filters["extra->dmGuide"] = "is.not.null"
+        elif has_guide is False:
+            filters["extra->dmGuide"] = "is.null"
 
         if keyword:
             safe = _escape_like(keyword)
@@ -576,3 +606,128 @@ class ScriptRepository:
         if not rows:
             return []
         return await self.db.upsert(TABLE_SCRIPTS, rows, on_conflict="code")
+
+
+class ScriptRequestRepository:
+    """剧本「求解析」诉求的读写。
+
+    - 去重键是 (user_id, match_key)：库中剧本 match_key=script_id，
+      库外剧本 match_key=归一化标题键，保证同一用户对同一剧本只有一条诉求；
+    - 「剧本是否已解析」的判定放在这里对照 ``script_dm_documents``
+      （is_active=true 且 total_chunks>0），读取时惰性同步回写本表。
+    """
+
+    def __init__(self, db: Optional[SupabaseClient] = None) -> None:
+        self.db = db or get_supabase()
+
+    # ---------------- 读 ----------------
+    async def get(
+        self, request_id: str, user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        filters = {"id": f"eq.{request_id}"}
+        if user_id:
+            filters["user_id"] = f"eq.{user_id}"
+        return await self.db.select_one(TABLE_SCRIPT_REQUESTS, filters=filters)
+
+    async def find_by_match_key(
+        self, user_id: str, match_key: str
+    ) -> Optional[Dict[str, Any]]:
+        return await self.db.select_one(
+            TABLE_SCRIPT_REQUESTS,
+            filters={"user_id": f"eq.{user_id}", "match_key": f"eq.{match_key}"},
+        )
+
+    async def list_by_user(
+        self,
+        user_id: str,
+        *,
+        status: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        filters = {"user_id": f"eq.{user_id}"}
+        if status:
+            filters["status"] = f"eq.{status}"
+        return await self.db.select_with_count(
+            TABLE_SCRIPT_REQUESTS,
+            filters=filters,
+            order="created_at.desc",
+            limit=limit,
+            offset=offset,
+        )
+
+    async def list_pending(self) -> List[Dict[str, Any]]:
+        """拉取全部待解析诉求，供「惰性同步已完成状态」使用。
+
+        只取同步所需的列；表数据量小（用户诉求量级），一次全量拉取可接受。
+        """
+        return await self.db.select(
+            TABLE_SCRIPT_REQUESTS,
+            filters={"status": "eq.pending"},
+            columns="id,user_id,script_id,script_code,script_title,match_key",
+        )
+
+    async def list_indexed_script_ids(self) -> set:
+        """已解析（可问答）剧本的 ID 集合。
+
+        判定与 DMGuideService.get_status 一致：``script_dm_documents`` 中存在
+        激活、未删除且 total_chunks>0 的文档，即视为该剧本已完成解析。
+        """
+        rows = await self.db.select(
+            TABLE_DM_DOCUMENTS,
+            filters={"is_active": "eq.true", "deleted_at": "is.null"},
+            columns="script_id,total_chunks",
+        )
+        return {
+            str(r["script_id"])
+            for r in rows
+            if r.get("script_id") and int(r.get("total_chunks") or 0) > 0
+        }
+
+    async def leaderboard_rows(self) -> List[Dict[str, Any]]:
+        """求解析排行榜的原始聚合：pending 诉求按剧本（match_key）分组计数。
+
+        直接用 PostgREST 的服务端聚合（``select=...,count()`` 自动按非聚合列
+        group by），避免把全表拉回内存再数一遍。只统计 pending ——
+        已取消与已完成的诉求不再占榜。
+        """
+        return await self.db.select(
+            TABLE_SCRIPT_REQUESTS,
+            filters={"status": "eq.pending"},
+            columns="match_key,script_title,script_code,script_id,count()",
+        )
+
+    # ---------------- 写 ----------------
+    async def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await self.db.insert(TABLE_SCRIPT_REQUESTS, payload)
+
+    async def update(
+        self, request_id: str, data: Dict[str, Any], user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        data = {**data, "updated_at": _now()}
+        filters = {"id": f"eq.{request_id}"}
+        if user_id:
+            filters["user_id"] = f"eq.{user_id}"
+        rows = await self.db.update(TABLE_SCRIPT_REQUESTS, filters=filters, data=data)
+        return rows[0] if rows else None
+
+    async def mark_completed_by_script_ids(
+        self, script_ids: Sequence[str], completed_at: str
+    ) -> int:
+        """把一批剧本下的全部 pending 诉求一次性置为 completed。
+
+        PostgREST 一次 ``PATCH ... script_id=in.(...)&status=eq.pending`` 即完成，
+        是「剧本已解析 → 诉求自动完成」的核心回写，避免逐条更新。
+        """
+        ids = [str(i) for i in dict.fromkeys(script_ids) if i]
+        if not ids:
+            return 0
+        rows = await self.db.update(
+            TABLE_SCRIPT_REQUESTS,
+            filters={
+                "script_id": f"in.({','.join(ids)})",
+                "status": "eq.pending",
+            },
+            data={"status": "completed", "completed_at": completed_at},
+        )
+        return len(rows)

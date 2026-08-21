@@ -58,6 +58,9 @@ async def list_scripts(
     ),
     min_rating: Optional[float] = Query(default=None, ge=0, le=10, description="最低评分"),
     recommended_only: bool = Query(default=False, description="只看推荐位剧本"),
+    has_guide: Optional[bool] = Query(
+        default=None, description="只看已关联 DM 主持人手册（已完成解析）的剧本"
+    ),
     mine: bool = Query(
         default=False,
         description="只看我上传/创建的剧本（需登录，自动按当前用户过滤并包含草稿）",
@@ -90,6 +93,7 @@ async def list_scripts(
         duration=duration,
         min_rating=min_rating,
         recommended_only=recommended_only,
+        has_guide=has_guide,
         sort=sort,
         limit=limit,
         offset=offset,
