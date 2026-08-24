@@ -219,6 +219,13 @@ class DMGuideStatus(BaseModel):
     indexed: bool = Field(description="是否已有可检索的活跃文档")
     document_id: Optional[str] = Field(default=None, description="活跃文档 ID")
     file_name: Optional[str] = Field(default=None, description="手册文件名")
+    # 导入者（上传手册的人）展示信息：script 只存 created_by user id，
+    # 昵称/头像由服务层读取时关联 profiles 实时合并，永远是最新资料。
+    # 问答页据此展示「感谢 xx 导入手册」。老数据或系统导入时字段为空。
+    imported_by: Optional[str] = Field(default=None, description="导入者用户 ID")
+    imported_by_nickname: Optional[str] = Field(default=None, description="导入者昵称（读取时关联 profiles）")
+    imported_by_avatar_url: Optional[str] = Field(default=None, description="导入者头像（读取时关联 profiles）")
+    imported_by_avatar_color: Optional[int] = Field(default=None, description="导入者默认头像配色（0~7）")
     total_pages: int = Field(default=0, description="总页数")
     total_chunks: int = Field(default=0, description="分块数")
     total_qa: int = Field(default=0, description="问答对数")

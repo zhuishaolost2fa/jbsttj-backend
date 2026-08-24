@@ -586,6 +586,7 @@ class ScriptService:
             source=row.get("source"),
             extra=dict(row.get("extra") or {}),
             has_guide=bool(DMGuideRef.from_extra(row.get("extra"))),
+            created_by=(str(row["created_by"]) if row.get("created_by") else None),
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
         )

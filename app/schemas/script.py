@@ -246,6 +246,9 @@ class ScriptItem(BaseModel):
     # 是否挂了 DM 主持人手册（extra.dmGuide.objectKey 存在即视为已上传手册），
     # 供 H5「我的导入」列表直接判断该剧本是否进入了解析流程，免去逐条再查进度接口
     has_guide: bool = Field(default=False, description="是否已关联 DM 主持人手册（PDF/Word）")
+    # 导入者（创建人）用户 ID：手册是 TA 上传的，问答页据此展示「感谢 xx 导入手册」。
+    # 只透出 ID 本身，昵称/头像等展示信息由 DM 手册状态接口关联 profiles 后下发。
+    created_by: Optional[str] = Field(default=None, description="导入者用户 ID（上传 DM 手册的人）")
 
     created_at: Optional[str] = Field(default=None, description="创建时间")
     updated_at: Optional[str] = Field(default=None, description="更新时间")

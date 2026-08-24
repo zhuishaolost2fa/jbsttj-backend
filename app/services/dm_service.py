@@ -363,10 +363,17 @@ class DMGuideService:
         script_id = str(getattr(script, "id", "") or "")
         script_code = script_dm_code(script)
         ref = DMGuideRef.from_extra(getattr(script, "extra", None))
+        imported_by, importer_profile = await self._importer_profile(script)
 
         if not self._settings.dm_rag_enabled:
             return DMGuideStatus(
-                script_id=script_id, has_guide=bool(ref), indexed=False
+                script_id=script_id,
+                has_guide=bool(ref),
+                indexed=False,
+                imported_by=imported_by,
+                imported_by_nickname=importer_profile.get("nickname"),
+                imported_by_avatar_url=importer_profile.get("avatar_url"),
+                imported_by_avatar_color=importer_profile.get("avatar_color"),
             )
 
         store = store_mod.get_dm_store()
@@ -415,7 +422,29 @@ class DMGuideService:
             total_qa=total_qa,
             version=version,
             job=self._to_progress(job_row) if job_row else None,
+            imported_by=imported_by,
+            imported_by_nickname=importer_profile.get("nickname"),
+            imported_by_avatar_url=importer_profile.get("avatar_url"),
+            imported_by_avatar_color=importer_profile.get("avatar_color"),
         )
+
+    async def _importer_profile(self, script: Any) -> Tuple[Optional[str], Dict[str, Any]]:
+        """解析剧本导入者的展示资料（问答页「感谢 xx 导入手册」用）。
+
+        剧本行只存 created_by user id，昵称/头像以 profiles 表为唯一事实源，
+        读取时关联一次。查询失败或找不到资料时静默降级为「无导入者信息」，
+        绝不影响状态接口本身。
+        """
+        imported_by = getattr(script, "created_by", None)
+        if not imported_by:
+            return None, {}
+        try:
+            store = store_mod.get_dm_store()
+            profiles = await run_in_threadpool(store.get_profiles, [str(imported_by)])
+        except Exception as exc:  # noqa: BLE001 - 资料合并不影响状态主数据返回
+            logger.warning("读取手册导入者资料失败（按无资料返回）: %s", exc)
+            return str(imported_by), {}
+        return str(imported_by), profiles.get(str(imported_by)) or {}
 
     async def get_import_status(
         self, script: Any, *, upload_task_id: Optional[str] = None
