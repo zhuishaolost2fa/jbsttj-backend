@@ -147,31 +147,13 @@ class FakeRequestRepo:
         return n
 
     async def leaderboard_rows(self):
-        from collections import Counter
-
-        counts = Counter()
-        titles = {}
-        for row in self.rows.values():
-            if row.get("status") != STATUS_PENDING:
-                continue
-            key = row["match_key"]
-            counts[key] += 1
-            titles[key] = row["script_title"]
-        out = []
-        for key, cnt in counts.items():
-            row = next(
-                (r for r in self.rows.values() if r.get("match_key") == key), {}
-            )
-            out.append(
-                {
-                    "match_key": key,
-                    "script_title": titles[key],
-                    "script_code": row.get("script_code"),
-                    "script_id": row.get("script_id"),
-                    "count": cnt,
-                }
-            )
-        return out
+        """模拟真实 repository 契约：返回全部 pending 原始行（不做聚合，
+        由 service 在内存按 match_key 分组计数）。"""
+        return [
+            {k: r.get(k) for k in ("match_key", "script_title", "script_code", "script_id")}
+            for r in self.rows.values()
+            if r.get("status") == STATUS_PENDING
+        ]
 
     async def list_by_user(self, user_id, *, status=None, limit=20, offset=0):
         rows = [dict(r) for r in self.rows.values() if r.get("user_id") == user_id]

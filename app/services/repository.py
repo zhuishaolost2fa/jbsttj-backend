@@ -685,16 +685,18 @@ class ScriptRequestRepository:
         }
 
     async def leaderboard_rows(self) -> List[Dict[str, Any]]:
-        """求解析排行榜的原始聚合：pending 诉求按剧本（match_key）分组计数。
+        """求解析排行榜的原始数据：全部 pending 诉求（含去重键 match_key）。
 
-        直接用 PostgREST 的服务端聚合（``select=...,count()`` 自动按非聚合列
-        group by），避免把全表拉回内存再数一遍。只统计 pending ——
-        已取消与已完成的诉求不再占榜。
+        说明：Supabase 托管的 PostgREST 默认禁用服务端聚合函数
+        （``db-aggregates-enabled=false``），select 里写 ``count()`` 会直接报
+        PGRST123，且托管端无法开启该配置。因此这里改为拉取原始行、
+        由 service 在内存按 match_key 分组计数 —— 诉求表是用户量级，
+        全量拉取完全可接受。只统计 pending，已取消与已完成的诉求不再占榜。
         """
         return await self.db.select(
             TABLE_SCRIPT_REQUESTS,
             filters={"status": "eq.pending"},
-            columns="match_key,script_title,script_code,script_id,count()",
+            columns="match_key,script_title,script_code,script_id",
         )
 
     # ---------------- 写 ----------------

@@ -247,15 +247,43 @@ class ScriptRequestService:
     ) -> ScriptRequestLeaderboardResult:
         await self._sync_completed()
         rows = await self.repo.leaderboard_rows()
-        # PostgREST 服务端已按剧本分组；这里按诉求人数降序、同分按标题排序
-        rows.sort(
+
+        # 内存聚合：按 match_key 分组（库内=script_id、库外=归一化标题键），
+        # 每组统计诉求人数，并合并出代表行（script_id/script_code/规范标题优先非空）。
+        # 说明：Supabase 托管 PostgREST 默认禁用服务端聚合函数（select 里写
+        # count() 会报 PGRST123），且诉求表是用户量级，全量拉取在内存分组可行；
+        # 按 match_key 分组也比 PostgREST 的 GROUP BY 全列更准 —— 同一剧本的
+        # 不同标题变体会合并计数。
+        groups: Dict[str, Dict[str, Any]] = {}
+        counts: Dict[str, int] = {}
+        for r in rows:
+            key = r.get("match_key") or ""
+            if not key:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            merged = groups.get(key)
+            if merged is None:
+                groups[key] = {
+                    k: r.get(k) for k in ("script_id", "script_code", "script_title")
+                }
+                continue
+            # 同组内合并：script_id / script_code 优先取非空；标题取更长（更规范）者
+            for field in ("script_id", "script_code"):
+                if not merged.get(field) and r.get(field):
+                    merged[field] = r[field]
+            if len(str(r.get("script_title") or "")) > len(str(merged.get("script_title") or "")):
+                merged["script_title"] = r["script_title"]
+
+        ranked = [{**row, "count": counts[key]} for key, row in groups.items()]
+        # 诉求人数降序、同分按标题升序
+        ranked.sort(
             key=lambda r: (
                 -(int(r.get("count") or 0)),
                 (r.get("script_title") or "").lower(),
             )
         )
-        total = len(rows)
-        page = rows[offset : offset + limit]
+        total = len(ranked)
+        page = ranked[offset : offset + limit]
 
         script_ids = [str(r["script_id"]) for r in page if r.get("script_id")]
         script_map = {str(s["id"]): s for s in await self.scripts.get_scripts(script_ids)}
