@@ -260,3 +260,32 @@ select
     s.updated_at
 from public.scripts s
 where s.deleted_at is null;
+
+-- ------------------------------------------------------------
+-- 7. 浏览量（view_count）
+--    列表接口透出、详情接口每次访问 +1。
+--    计数走 RPC 原子自增（increment_script_view），避免「读-改-写」竞态。
+--    函数默认只授权 service_role：anon / authenticated 直接调会被刷浏览量。
+-- ------------------------------------------------------------
+alter table public.scripts add column if not exists view_count integer not null default 0;
+
+create or replace function public.increment_script_view(p_script_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_count integer;
+begin
+    update public.scripts
+       set view_count = view_count + 1
+     where id = p_script_id
+       and deleted_at is null
+    returning view_count into v_count;
+    return coalesce(v_count, 0);
+end;
+$$;
+
+revoke execute on function public.increment_script_view(uuid) from public;
+grant execute on function public.increment_script_view(uuid) to service_role;

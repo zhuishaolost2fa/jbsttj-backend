@@ -237,6 +237,8 @@ class ScriptItem(BaseModel):
     rating: Optional[float] = Field(default=None, description="评分")
     rating_count: int = Field(default=0, description="评分人数")
     play_count: int = Field(default=0, description="玩过人数")
+    # 详情页被浏览的次数，列表接口透出供前端展示人气
+    view_count: int = Field(default=0, description="浏览量（详情页访问次数）")
     published_year: Optional[int] = Field(default=None, description="发行年份")
     cover_url: Optional[str] = Field(default=None, description="封面图")
     is_recommended: bool = Field(default=False, description="是否推荐位")

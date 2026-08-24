@@ -172,6 +172,20 @@ class SupabaseClient:
     async def delete(self, table: str, *, filters: Dict[str, str]) -> None:
         await self._request("DELETE", f"/{table}", params=filters)
 
+    async def rpc(self, name: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+        """调用 Postgres 函数（``POST /rpc/{name}``）。
+
+        用于 PostgREST 表达不了的原子操作，如 `increment_script_view` 的
+        ``view_count = view_count + 1`` 自增。无返回体时返回 None。
+        """
+        resp = await self._request("POST", f"/rpc/{name}", json=payload or {})
+        if not resp.content:
+            return None
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return resp.text
+
     async def ping(self) -> bool:
         if not self.available:
             return False

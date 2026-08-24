@@ -226,13 +226,20 @@ async def autocomplete_scripts(
     "/{id_or_code}",
     response_model=ScriptItem,
     summary="剧本详情",
-    description="路径参数传剧本 UUID 或业务编码 code 均可。",
+    description=(
+        "路径参数传剧本 UUID 或业务编码 code 均可。\n\n"
+        "每次访问会把该剧本的浏览量 `view_count` +1（后台异步执行，不阻塞响应）。"
+    ),
 )
 async def get_script(
     id_or_code: str = Path(description="剧本 UUID 或业务编码，如 `nian-lun`"),
+    background: BackgroundTasks = BackgroundTasks(),
     service: ScriptService = Depends(get_script_service),
 ) -> ScriptItem:
-    return await service.get_script(id_or_code)
+    item = await service.get_script(id_or_code)
+    # 响应返回后再异步计数，避免 +1 的 RPC 拖慢详情页首屏
+    background.add_task(service.record_view, id_or_code)
+    return item
 
 
 @router.patch(

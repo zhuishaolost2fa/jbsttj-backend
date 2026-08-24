@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import unicodedata
@@ -20,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pypinyin import lazy_pinyin
 
+from app.core.config import settings
 from app.core.exceptions import DatabaseError, NotFoundError, ValidationError
 from app.data import script_options_seed as opt_seed
 from app.schemas.common import Pagination
@@ -33,6 +36,7 @@ from app.schemas.script import (
     ScriptSearchByNameResult,
     ScriptUpdate,
 )
+from app.services import redis_cache as cache
 from app.services.repository import ScriptRepository, normalize_title_key
 from app.services.script_option_service import ScriptOptionService, get_script_option_service
 from app.schemas.dm_guide import DMGuideRef
@@ -120,6 +124,39 @@ class ScriptService:
             difficulty=difficulties,
         )
 
+        # 公开列表走 Redis 缓存（cache-aside）；「我的剧本」是个人私有数据，
+        # 变化频繁且无共享价值，不缓存。版本号 + 参数 hash 组成 key：
+        # 写操作 bump 版本号即整体失效，筛选条件不同则命中不同缓存。
+        cache_key = None
+        if not created_by:
+            version = await cache.get_version()
+            cache_key = self._list_cache_key(
+                version=version,
+                params={
+                    "keyword": keyword,
+                    "playstyles": sorted(playstyles or []),
+                    "themes": sorted(themes or []),
+                    "release_types": sorted(release_types or []),
+                    "difficulties": sorted(difficulties or []),
+                    "players": players,
+                    "duration": duration,
+                    "min_rating": min_rating,
+                    "recommended_only": recommended_only,
+                    "has_guide": has_guide,
+                    "status": status,
+                    "sort": sort,
+                    "limit": limit,
+                    "offset": offset,
+                },
+            )
+            cached = await cache.cache_get(cache_key)
+            if cached is not None:
+                try:
+                    return ScriptListResult.model_validate_json(cached)
+                except Exception:  # noqa: BLE001
+                    # 缓存内容损坏（版本升级等）当作 miss 重新查询并回填
+                    logger.warning("剧本列表缓存反序列化失败，重新查询: %s", cache_key)
+
         rows, total = await self.repo.list_scripts(
             keyword=keyword,
             playstyles=playstyles,
@@ -139,7 +176,7 @@ class ScriptService:
         )
         labels = await self._label_map()
         items = [self._to_item(row, labels) for row in rows]
-        return ScriptListResult(
+        result = ScriptListResult(
             items=items,
             pagination=Pagination(
                 total=total,
@@ -148,6 +185,14 @@ class ScriptService:
                 has_more=offset + len(items) < total,
             ),
         )
+
+        if cache_key is not None:
+            await cache.cache_set(
+                cache_key,
+                result.model_dump_json(),
+                ttl_seconds=settings.script_list_cache_ttl,
+            )
+        return result
 
     async def get_script(self, id_or_code: str) -> ScriptItem:
         """按 UUID 或业务 code 取详情，前端拿哪个都能查。"""
@@ -159,6 +204,40 @@ class ScriptService:
         if row is None:
             raise NotFoundError(f"剧本不存在: {id_or_code}", code="script_not_found")
         return self._to_item(row, await self._label_map())
+
+    async def record_view(self, id_or_code: str) -> None:
+        """剧本详情被浏览时浏览量 +1。
+
+        由详情接口通过 BackgroundTasks 在响应返回后异步调用，
+        失败静默（浏览量是尽力而为的指标，绝不能让详情接口因计数报错）。
+        """
+        try:
+            script_id = id_or_code
+            if not _looks_like_uuid(id_or_code):
+                row = await self.repo.get_by_code((id_or_code or "").lower())
+                if row is None:
+                    return
+                script_id = row["id"]
+            await self.repo.increment_view(script_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("剧本浏览量计数失败（%s）: %s", id_or_code, exc)
+
+    @staticmethod
+    def _list_cache_key(*, version: int, params: Dict[str, Any]) -> str:
+        """列表缓存的 key：版本号 + 规范化参数哈希。
+
+        参数按 key 排序、列表排序后序列化，语义相同的请求命中同一份缓存。
+        """
+        canonical = json.dumps(
+            params, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+        return f"jbs:cache:scripts:list:v1:{version}:{digest}"
+
+    @staticmethod
+    async def _invalidate_list_cache() -> None:
+        """剧本数据变化后使列表缓存整体失效（版本号 +1）。失败静默。"""
+        await cache.bump_version()
 
     # ================= 新增 / 导入 =================
     async def create_script(
@@ -194,6 +273,7 @@ class ScriptService:
                 # 极端竞态：查到之后被软删了，退化为新建，避免导入静默失败
                 return await self._create_or_supplement(payload, data, user_id=user_id)
             logger.info("导入关联到已有剧本 %s (%s)", row.get("title"), row.get("code"))
+            await self._invalidate_list_cache()
             return self._to_item(row, await self._label_map()), False
 
         # 2) 库里没有 -> 新建（若 code 撞唯一约束则自动转为补充更新）
@@ -264,6 +344,7 @@ class ScriptService:
             if row is None:
                 row = await self.repo.update_by_code(code, merged, include_deleted=True)
             logger.info("code 已存在，补充更新剧本 %s (%s)", row.get("title"), row.get("code"))
+            await self._invalidate_list_cache()
             return self._to_item(row, await self._label_map()), False
 
         # 2) 库里没有该 code -> 新建；若并发写入仍撞唯一约束，兜底转补充更新
@@ -283,6 +364,7 @@ class ScriptService:
             return self._to_item(row, await self._label_map()), False
 
         logger.info("新增剧本 %s (%s)", row.get("title"), row.get("code"))
+        await self._invalidate_list_cache()
         return self._to_item(row, await self._label_map()), True
 
     @staticmethod
@@ -371,6 +453,7 @@ class ScriptService:
         if row is None:
             raise NotFoundError(f"剧本不存在: {script_id}", code="script_not_found")
         logger.info("更新剧本 %s，字段: %s", script_id, ", ".join(sorted(data)))
+        await self._invalidate_list_cache()
         return self._to_item(row, await self._label_map())
 
     async def delete_script(self, script_id: str) -> None:
@@ -378,6 +461,7 @@ class ScriptService:
         if row is None:
             raise NotFoundError(f"剧本不存在: {script_id}", code="script_not_found")
         logger.info("下架剧本 %s", script_id)
+        await self._invalidate_list_cache()
 
     # ================= 内部：校验 =================
     async def _assert_codes(
@@ -579,6 +663,7 @@ class ScriptService:
             rating=float(row["rating"]) if row.get("rating") is not None else None,
             rating_count=int(row.get("rating_count") or 0),
             play_count=int(row.get("play_count") or 0),
+            view_count=int(row.get("view_count") or 0),
             published_year=row.get("published_year"),
             cover_url=row.get("cover_url"),
             is_recommended=bool(row.get("is_recommended")),

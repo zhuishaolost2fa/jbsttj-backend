@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     celery_worker_prefetch: int = 1  # 长任务必须设 1，否则任务会堆在某个 worker 上排队
     celery_eager: bool = False  # 开启后任务同步执行，供测试用
 
+    # ---------------- 剧本列表缓存 ----------------
+    # 公开列表接口（GET /scripts）的 Redis 缓存 TTL（秒）。
+    # 新增 / 修改 / 下架等写操作会立即失效缓存；浏览量这类小数值变化靠 TTL 自然过期，
+    # 不触发高频失效。Redis 不可用时列表接口自动降级直查数据库。
+    script_list_cache_ttl: int = 60
+
     # ---------------- 硅基流动（SiliconFlow）----------------
     # OpenAI 兼容协议，chat 与 embedding 共用同一个 base_url 与 API Key
     siliconflow_api_key: str = ""

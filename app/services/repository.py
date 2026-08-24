@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.services.supabase import SupabaseClient, get_supabase
+
+logger = logging.getLogger("app.repository")
 
 TABLE_TASKS = "upload_tasks"
 TABLE_PARTS = "upload_parts"
@@ -600,6 +603,21 @@ class ScriptRepository:
             data={"deleted_at": _now(), "updated_at": _now(), "status": "offline"},
         )
         return rows[0] if rows else None
+
+    async def increment_view(self, script_id: str) -> Optional[int]:
+        """剧本详情浏览 +1（数据库端原子自增，避免读-改-写竞态）。
+
+        依赖 ``sql/scripts.sql`` 里的 ``increment_script_view`` 函数；
+        函数不存在 / 未授权时抛 :class:`DatabaseError`，由 service 层吞掉
+        （浏览量是尽力而为的指标，绝不能让详情接口因计数失败而报错）。
+        """
+        value = await self.db.rpc("increment_script_view", {"p_script_id": script_id})
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     async def upsert_many(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """按 code 幂等写入，灌数据脚本可重复执行。"""
