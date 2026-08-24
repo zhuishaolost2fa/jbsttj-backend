@@ -6,6 +6,9 @@
   失败后进入 30s 冷却窗口，期间直接跳过缓存，避免每次请求都尝试重连；
 - 版本号失效：写操作（新增 / 修改 / 下架）后 ``bump_version()`` 让旧缓存 key 整体失效，
   无需逐条扫描删除 —— 读缓存前先取版本号拼进 key，版本一变自然 miss；
+- 域级版本号（scope）：写操作只影响某一部分数据时（如某剧本的 QA），用
+  ``get_scope_version`` / ``bump_scope_version_sync`` 只失效那一部分缓存；
+  同步版 bump 供 Celery 任务（同步上下文）使用，失败静默靠 TTL 兜底；
 - 小数值变化（如浏览量 +1）不 bump 版本号，靠 TTL 自然过期，避免高频写把缓存打穿。
 
 连接复用 ``CELERY_REDIS_URL``（去重指纹所在实例），不新增任何凭据配置。
@@ -109,3 +112,70 @@ async def bump_version() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Redis 缓存版本号自增失败: %s", exc)
         _mark_failed()
+
+
+# ------------------------------------------------------------
+# 域级（scope）版本号：细粒度失效
+# ------------------------------------------------------------
+# 全局版本号一 bump，所有列表缓存全体失效；写操作只影响某一部分数据时
+# （如某剧本的 QA 标题链），用「scope 版本号」只失效那一部分：
+# 读侧把 scope 版本号拼进 key，写侧 bump 对应 scope，其它缓存不受牵连。
+
+def scope_version_key(scope: str) -> str:
+    return f"{_KEY_PREFIX}:ver:{scope}"
+
+
+async def get_scope_version(scope: str) -> int:
+    """读取某个域的缓存版本号；读不到 / 缓存不可用时按 0 处理（无副作用）。"""
+    client = _get_client()
+    if client is None:
+        return 0
+    try:
+        raw = await client.get(scope_version_key(scope))
+        return int(raw) if raw else 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis 缓存版本号读取失败（scope=%s）: %s", scope, exc)
+        _mark_failed()
+        return 0
+
+
+# Celery worker 是同步上下文（任务全是同步函数），没法用 async 客户端，
+# bump 需要一份独立的同步客户端。
+_sync_client: Any = None
+_sync_last_fail: float = 0.0
+
+
+def _get_sync_client() -> Any:
+    """延迟初始化同步 Redis 客户端；不可用返回 None（调用方放弃失效，靠 TTL 兜底）。"""
+    global _sync_client, _sync_last_fail
+    if _sync_client is not None:
+        return _sync_client
+    if time.monotonic() - _sync_last_fail < _FALLBACK_SECONDS:
+        return None
+    url = settings.celery_redis_url
+    if not url:
+        return None
+    try:
+        import redis  # 延迟导入：未装 redis 包时跳过失效，缓存靠 TTL 自然过期
+
+        # from_url 惰性建连，连接问题会在首次 incr 时暴露并被捕获降级
+        _sync_client = redis.Redis.from_url(url, decode_responses=True)
+        return _sync_client
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("同步 Redis 客户端不可用，缓存失效退化为 TTL 过期: %s", exc)
+        _sync_last_fail = time.monotonic()
+        return None
+
+
+def bump_scope_version_sync(scope: str) -> None:
+    """同步版 scope 版本号 +1：给 Celery 任务在写库后失效对应域缓存用。失败静默。"""
+    client = _get_sync_client()
+    if client is None:
+        return
+    global _sync_client, _sync_last_fail
+    try:
+        client.incr(scope_version_key(scope))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis 缓存版本号自增失败（scope=%s）: %s", scope, exc)
+        _sync_client = None
+        _sync_last_fail = time.monotonic()

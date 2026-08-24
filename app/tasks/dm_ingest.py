@@ -58,6 +58,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from app.core.config import get_settings
 from app.core.exceptions import AppError, DatabaseError, LLMError, StorageError
 from app.services import dm_store as store_mod
+from app.services import redis_cache as cache
 from app.services.chunking import Chunk, ChunkConfig, chunk_blocks, chunks_from_payload
 from app.services.dedup import Deduplicator, build_backend, to_signed_64
 from app.services.dm_store import (
@@ -69,6 +70,7 @@ from app.services.dm_store import (
     JOB_GENERATING_QA,
     JOB_SKIPPED,
     get_dm_store,
+    qa_titles_cache_scope,
     to_pgvector,
 )
 from app.services.llm import QAPair, get_llm_client
@@ -357,6 +359,8 @@ def prepare_document(
         if declared > 0 and store.count_chunks(document_id) >= declared:
             store.update_document(document_id, {"is_active": True})
             store.deactivate_other_versions(script_id, document_id)
+            # 旧版本被下线、当前版本转正，该剧本可见的 QA 集合变了，缓存要失效
+            _invalidate_qa_titles_cache(script_code)
             store.update_job(
                 job_id,
                 {
@@ -386,6 +390,8 @@ def prepare_document(
     if force:
         logger.info("force=True，清空文档 %s 的历史 chunk 与 QA", document_id)
         store.purge_document(document_id)
+        # 库里旧 QA 已删，缓存里的标题树立刻作废（重跑期间读到的是逐批增长的半成品）
+        _invalidate_qa_titles_cache(script_code)
 
     # 注意：分片已在上面按格式各自规划好（PDF 按页、Word 按文本单元），
     # 这里不能再统一重规划——否则 Word 的分片区间会被当成「伪页码」区间，
@@ -706,6 +712,22 @@ def _split_batches(items: List[Dict[str, Any]], size: int) -> List[List[Dict[str
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def _invalidate_qa_titles_cache(script_code: str) -> None:
+    """QA 数据发生变化后，让该剧本的问答标题链缓存立即失效。
+
+    qa-titles 接口按 script_code 缓存全量 QA 标题树，key 里拼了这个 scope 的
+    版本号 —— 这里 INCR 一次，旧 key 自然 miss，无需扫描删除。
+    失效失败只记日志：缓存靠 TTL 自然过期，最多短暂读到旧数据。
+    """
+    code = (script_code or "").strip().lower()
+    if not code:
+        return
+    try:
+        cache.bump_scope_version_sync(qa_titles_cache_scope(code))
+    except Exception as exc:  # noqa: BLE001 - 失效失败不中断流水线
+        logger.warning("失效问答标题链缓存失败 script_code=%s: %s", code, exc)
+
+
 # ============================================================
 # T3：问答对生成
 # ============================================================
@@ -918,6 +940,9 @@ def finalize(
     # 这里不能按 script_code 下线，否则同名分片的其它手册会被误置为 inactive。
     if script_id:
         store.deactivate_other_versions(script_id, document_id, script_code=script_code or None)
+
+    # 全部 QA 落库、旧版本下线完毕，该剧本可见的 QA 集合定格 —— 缓存就此失效重建
+    _invalidate_qa_titles_cache(script_code)
 
     batches = len(results) if results else 0
     logger.info(

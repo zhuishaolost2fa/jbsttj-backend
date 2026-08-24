@@ -33,6 +33,15 @@ TABLE_QA = "script_dm_qa"
 TABLE_JOBS = "script_dm_jobs"
 TABLE_QUESTIONS = "script_dm_questions"
 
+# 问答标题链（qa-titles 接口）Redis 缓存的 scope 前缀。
+# API 侧读缓存、ingest 流水线写库后失效缓存都从这一处取，保证两端口径一致。
+QA_TITLES_CACHE_SCOPE = "dm-qa-titles"
+
+
+def qa_titles_cache_scope(script_code: str) -> str:
+    """某个剧本的问答标题链缓存 scope（script_code 统一小写后拼接）。"""
+    return f"{QA_TITLES_CACHE_SCOPE}:{(script_code or '').strip().lower()}"
+
 # 用户提问状态机：pending 待解答 → answered 已解答 / dismissed 无效问题
 QUESTION_PENDING = "pending"
 QUESTION_ANSWERED = "answered"

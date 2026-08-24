@@ -47,6 +47,7 @@ from app.schemas.dm_guide import (
     SearchResult,
 )
 from app.services import dm_store as store_mod
+from app.services import redis_cache as cache
 from app.services.repository import UploadTaskRepository
 from app.services.script_service import slugify
 
@@ -943,21 +944,46 @@ class DMGuideService:
         与向量检索不同，这里**不做语义匹配、不调 embedding**：
         就是把该剧本（含同名分片）已入库的 QA 按行文顺序全量列出、按标题分组，
         供前端做「玩家问答目录 + 标题下问答」的结构化浏览（QA 生成本身即面向玩家撰写）。
+
+        400 页手册动辄上千条 QA，这棵树每次现查现组装开销不小，而结果只在
+        ingest 流水线落库后才会变化，所以走 Redis 缓存（cache-aside）：
+        key 里带剧本维度的 scope 版本号，流水线写库后 bump 即失效，
+        其余时间靠 TTL 兜底；Redis 不可用时自动降级直查数据库。
+        ``script_title`` 随调用方而定（路径式接口传剧本名、按名式接口可能为空），
+        不进缓存，命中后用本次调用的值覆写。
         """
         code = (script_code or "").strip().lower()
         if not code:
             raise ValidationError("剧本标识缺失，无法定位标题链", code="script_code_required")
 
+        scope = store_mod.qa_titles_cache_scope(code)
+        version = await cache.get_scope_version(scope)
+        cache_key = f"{store_mod.QA_TITLES_CACHE_SCOPE}:{code}:{version}"
+        cached = await cache.cache_get(cache_key)
+        if cached is not None:
+            try:
+                chain = QATitleChain.model_validate_json(cached)
+                chain.script_title = script_title or None
+                return chain
+            except Exception:  # noqa: BLE001 - 缓存内容损坏当作 miss 重新查询
+                logger.warning("问答标题链缓存反序列化失败，重新查询: %s", cache_key)
+
         store = store_mod.get_dm_store()
         rows = await run_in_threadpool(store.list_qa_titles, code)
         titles, total_titles, total_qa = _build_title_tree(rows)
-        return QATitleChain(
+        chain = QATitleChain(
             script_code=code,
             script_title=script_title or None,
             total_titles=total_titles,
             total_qa=total_qa,
             titles=titles,
         )
+        await cache.cache_set(
+            cache_key,
+            chain.model_dump_json(),
+            ttl_seconds=self._settings.dm_qa_cache_ttl,
+        )
+        return chain
 
 
 # 没有章节信息的问答统一归入这个节点，避免前端收到空标题

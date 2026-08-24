@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     # 不触发高频失效。Redis 不可用时列表接口自动降级直查数据库。
     script_list_cache_ttl: int = 60
 
+    # ---------------- 问答标题链缓存 ----------------
+    # qa-titles 接口（全量 QA 按标题组装成树）的 Redis 缓存 TTL（秒）。
+    # QA 数据只被 ingest 流水线写入，流水线落库后会主动失效对应剧本的缓存，
+    # TTL 只是兜底（防止失效失败后长期读到旧数据）。Redis 不可用时自动降级直查数据库。
+    dm_qa_cache_ttl: int = 600
+
     # ---------------- 硅基流动（SiliconFlow）----------------
     # OpenAI 兼容协议，chat 与 embedding 共用同一个 base_url 与 API Key
     siliconflow_api_key: str = ""
