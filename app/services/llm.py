@@ -79,6 +79,59 @@ class QAPair:
         )
 
 
+# 与 sql/dm_story.sql 的 ck_dm_story_type 保持一致
+STORY_TYPES = ("timeline", "truth", "role", "clue", "ending", "other")
+
+
+@dataclass
+class StoryItem:
+    """一条「故事还原」条目（LLM 从手册还原/复盘类片段中采集）。
+
+    与问答对并列：问答对面向玩家答疑，故事还原面向「整本剧本的真实脉络」，
+    包括时间线、真相、角色背景、线索关联、结局。story_type 取值见
+    :data:`STORY_TYPES`。``meta`` 承载结构化补充（时间线事件、人物关系对等），
+    落库进 jsonb 列，供前端做时间线/关系图谱等富展示。
+    """
+
+    story_type: str = "other"
+    title: str = ""
+    content: str = ""
+    summary: str = ""
+    meta: Dict[str, Any] = None  # type: ignore[assignment]
+    # 来源 chunk 在本批次里的序号，用于回写外键
+    source_index: int = 0
+
+    def __post_init__(self) -> None:
+        if self.meta is None:
+            self.meta = {}
+        if self.story_type not in STORY_TYPES:
+            self.story_type = "other"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "story_type": self.story_type,
+            "title": self.title,
+            "content": self.content,
+            "summary": self.summary,
+            "meta": self.meta,
+            "source_index": self.source_index,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StoryItem":
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        return cls(
+            story_type=str(data.get("story_type", "other")).strip() or "other",
+            title=str(data.get("title", "")).strip(),
+            content=str(data.get("content", "")).strip(),
+            summary=str(data.get("summary", "")).strip(),
+            meta=meta,
+            source_index=int(data.get("source_index", 0)),
+        )
+
+
 # ============================================================
 # 提示词
 # ============================================================
@@ -217,6 +270,150 @@ def parse_qa_response(content: str, *, max_index: int) -> List[QAPair]:
             )
         )
     return pairs
+
+
+# ============================================================
+# 故事还原（LLM 在生成问答对的同时，从还原/复盘类片段采集故事脉络）
+# ============================================================
+# 只在「可能含还原内容」的片段上才值得烧一次 LLM 调用：
+# 手册里大量篇幅是玩法规则、流程、目录，命中关键词才会派发。
+# 关键词刻意宽泛（命中即候选，宁多勿漏），最终由 LLM 判断是否真的输出。
+_STORY_HINT_KEYWORDS = (
+    "还原", "复盘", "真相", "时间线", "结局", "凶手", "动机",
+    "手法", "伏笔", "剧情", "故事", "背景", "前世", "身世",
+)
+
+_STORY_SYSTEM_PROMPT = """你是一名资深的剧本杀内容编辑，擅长从《主持人手册》里整理「故事还原」——即整本剧本真实脉络的复盘性内容。
+它和「面向玩家的问答」不同：问答是玩家游戏中能公开知道的信息，而故事还原是**主持人带本到最后需要复盘的完整真相**（时间线、真凶、动机、手法、人物关系、结局走向）。
+
+你的任务：从所给片段中，识别并整理属于故事还原的内容，输出为结构化条目。
+
+生成原则：
+1. **只输出还原/复盘类内容**：时间线梳理、真相与凶手、核心诡计、动机手法、角色隐藏背景、线索与真相的关联、结局收束。
+   纯玩法规则、搜证流程、目录、页眉页脚等不输出（返回空数组 []）。
+2. 严格忠于片段原文：不编造片段外的细节、人名、时间、物品；片段没写清的就概括「手册未展开」。
+3. content 用主持人复盘的口吻整理，完整连贯；title 用一句话概括本条目；summary 再压缩成一句话摘要。
+4. story_type 从以下枚举选最贴切的一个：
+   timeline（时间线）/ truth（真相还原）/ role（角色背景）/
+   clue（线索关联）/ ending（结局收束）/ other（其他）。
+5. meta 里放结构化补充，例如时间线事件列表：
+   {"events": [{"when": "案发前夜 23:00", "what": "沈墨潜入书房"}, ...]}
+   没有结构化信息就返回空对象 {}。
+6. 一条片段可能同时含多个还原维度（时间线 + 真相），可以输出多条，但不要重复输出同一内容。
+
+只输出 JSON 数组，不要任何解释文字、不要 markdown 围栏。
+格式：[{"index": 片段序号, "story_type": "...", "title": "...", "content": "...", "summary": "...", "meta": {...}}]"""
+
+
+def build_story_user_prompt(
+    chunks: Sequence[Dict[str, Any]],
+    *,
+    script_title: str = "",
+) -> str:
+    """拼装批量提取故事还原的用户提示词（与问答对共用同一批 chunk 文本）。"""
+    lines: List[str] = []
+    if script_title:
+        lines.append(f"剧本名称：《{script_title}》")
+    lines.append(
+        f"请从下面 {len(chunks)} 个片段中提取**故事还原**内容。"
+        f"只提取还原/复盘类信息（时间线、真相、角色背景、线索关联、结局），"
+        f"其余内容直接跳过。信息丰富的片段可输出多条，单薄的片段可以少输出或不输出。"
+    )
+    lines.append("")
+
+    for i, chunk in enumerate(chunks):
+        section = " > ".join(chunk.get("section_path") or [])
+        header = f"【片段 {i}】"
+        if section:
+            header += f" 章节：{section}"
+        page_start = chunk.get("page_start")
+        page_end = chunk.get("page_end")
+        if page_start:
+            header += f"（P{page_start}" + (f"-{page_end}" if page_end and page_end != page_start else "") + "）"
+        lines.append(header)
+        lines.append(str(chunk.get("text", "")).strip())
+        lines.append("")
+
+    lines.append('务必用片段序号填写 index 字段。只输出 JSON 数组。')
+    return "\n".join(lines)
+
+
+def _batch_has_story_hints(chunks: Sequence[Dict[str, Any]]) -> bool:
+    """启发式预筛：批次内任一片段文本命中还原关键词才值得调 LLM。
+
+    手册 400 页里，还原/复盘通常只占一小部分章节；每个 batch 都打一次
+    LLM 会把生成阶段的成本翻倍，而多数 batch 里根本没有还原内容。
+    关键词刻意宽泛（宁多勿漏），最终是否输出由模型判断。
+    """
+    for chunk in chunks:
+        text = str(chunk.get("text") or "")
+        if any(kw in text for kw in _STORY_HINT_KEYWORDS):
+            return True
+    return False
+
+
+def parse_story_response(content: str, *, max_index: int) -> List[StoryItem]:
+    """解析模型返回的故事还原 JSON 数组，容错逻辑与 parse_qa_response 同构。"""
+    if not content or not content.strip():
+        return []
+
+    raw = content.strip()
+    fence = _JSON_FENCE.search(raw)
+    if fence:
+        raw = fence.group(1).strip()
+
+    data: Any = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("["), raw.rfind("]")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                logger.warning("故事还原 JSON 解析失败，原始输出前 200 字: %s", raw[:200])
+                return []
+        else:
+            logger.warning("故事还原响应中未找到 JSON 数组: %s", raw[:200])
+            return []
+
+    if isinstance(data, dict):
+        for key in ("data", "stories", "result", "items", "list"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            data = [data]
+    if not isinstance(data, list):
+        return []
+
+    items: List[StoryItem] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        # 空内容或短于 30 字的碎片不落库，避免把「手册未展开」这类占位当成果
+        if len(content) < 30:
+            continue
+        try:
+            idx = int(item.get("index", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        idx = max(0, min(idx, max_index))
+        meta = item.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        items.append(
+            StoryItem(
+                story_type=str(item.get("story_type") or "other").strip().lower() or "other",
+                title=str(item.get("title") or "").strip(),
+                content=content,
+                summary=str(item.get("summary") or "").strip(),
+                meta=meta,
+                source_index=idx,
+            )
+        )
+    return items
 
 
 # ============================================================
@@ -534,6 +731,46 @@ class SiliconFlowClient:
         pairs = parse_qa_response(content, max_index=len(chunks) - 1)
         logger.info("问答对生成: %s 个片段 -> %s 条", len(chunks), len(pairs))
         return pairs
+
+    def generate_stories(
+        self,
+        chunks: Sequence[Dict[str, Any]],
+        *,
+        script_title: str = "",
+        max_retries: int = 2,
+    ) -> List[StoryItem]:
+        """为一批 chunk 提取故事还原条目。
+
+        与 :meth:`generate_qa` 独立成一次调用、而不是塞进同一个 JSON 响应：
+        ① 两套输出各有独立的解析与降级策略 —— 问答对失败不影响故事条目，反之亦然；
+        ② 故事还原只在含还原/复盘关键词的批次上派发（:func:`_batch_has_story_hints`），
+        全手册只在这些批次上多花一次 LLM 调用，成本增量可控。
+        解析失败同样返回空列表，视为可降级故障，不让整条流水线红掉。
+        """
+        if not chunks or not _batch_has_story_hints(chunks):
+            return []
+        qa_model = self._settings.siliconflow_qa_model or self._settings.siliconflow_chat_model
+        user_prompt = build_story_user_prompt(chunks, script_title=script_title)
+        messages = [
+            {"role": "system", "content": _STORY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            content = self.chat(
+                messages,
+                model=qa_model,
+                temperature=0.3,
+                max_tokens=8192,
+                max_retries=max_retries,
+                response_format_json=False,
+            )
+        except LLMError as exc:
+            logger.warning("故事还原提取失败（跳过本批 %s 个片段）: %s", len(chunks), exc)
+            return []
+
+        items = parse_story_response(content, max_index=len(chunks) - 1)
+        logger.info("故事还原提取: %s 个片段 -> %s 条", len(chunks), len(items))
+        return items
 
 
 # ============================================================

@@ -23,15 +23,24 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import ConfigError, ConflictError, NotFoundError, ValidationError
+from app.core.exceptions import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
 from app.schemas.dm_guide import (
     AskRequest,
     AskResponse,
     AskSource,
     ChunkHit,
+    CreateHighlightRequest,
     DMGuideRef,
     DMGuideStatus,
     GuideQuestions,
+    HighlightListResult,
+    HighlightRecord,
     ImportPhase,
     ImportStatus,
     IngestRequest,
@@ -45,6 +54,10 @@ from app.schemas.dm_guide import (
     QuestionRecord,
     RetrievedHit,
     SearchResult,
+    StoryDetail,
+    StoryItem,
+    StoryListResult,
+    UpdateHighlightRequest,
 )
 from app.services import dm_store as store_mod
 from app.services import redis_cache as cache
@@ -347,6 +360,8 @@ class DMGuideService:
             embedded_chunks=int(row.get("embedded_chunks") or 0),
             total_qa=int(row.get("total_qa") or 0),
             embedded_qa=int(row.get("embedded_qa") or 0),
+            total_stories=int(row.get("total_stories") or 0),
+            embedded_stories=int(row.get("embedded_stories") or 0),
             error_message=row.get("error_message"),
             started_at=row.get("started_at"),
             finished_at=row.get("finished_at"),
@@ -409,6 +424,7 @@ class DMGuideService:
         total_pages = sum(int(d.get("total_pages") or 0) for d in docs)
         total_chunks = sum(int(d.get("total_chunks") or 0) for d in docs)
         total_qa = sum(int(d.get("total_qa") or 0) for d in docs)
+        total_stories = sum(int(d.get("total_stories") or 0) for d in docs)
         version = int(latest_doc.get("version") or 0) if latest_doc else 0
         indexed = bool(total_chunks > 0)
 
@@ -421,6 +437,7 @@ class DMGuideService:
             total_pages=total_pages,
             total_chunks=total_chunks,
             total_qa=total_qa,
+            total_stories=total_stories,
             version=version,
             job=self._to_progress(job_row) if job_row else None,
             imported_by=imported_by,
@@ -934,6 +951,235 @@ class DMGuideService:
         _merge_profiles(records, profiles)
 
     # --------------------------------------------------------
+    # 故事还原（LLM 采集的剧本脉络条目）
+    # --------------------------------------------------------
+    async def list_stories(
+        self,
+        *,
+        script_code: str,
+        script_title: str = "",
+        story_type: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> StoryListResult:
+        """按剧本聚合故事还原条目（仅活跃文档），支持 story_type 过滤与分页。
+
+        列表本身只读手册衍生内容、不含任何用户数据，与 qa-titles 同权限口径，
+        无需登录。每行的公开划线数由 SQL 函数一次算好，列表页不产生 N+1。
+        """
+        code = (script_code or "").strip().lower()
+        if not code:
+            raise ValidationError("剧本标识缺失", code="script_code_required")
+        if story_type and story_type not in store_mod.STORY_TYPES:
+            raise ValidationError(
+                f"不支持的故事类型: {story_type}",
+                code="invalid_story_type",
+                details={"allowed": list(store_mod.STORY_TYPES)},
+            )
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+        store = store_mod.get_dm_store()
+        rows, total = await run_in_threadpool(
+            store.list_stories,
+            script_code=code,
+            story_type=story_type,
+            limit=limit,
+            offset=offset,
+        )
+        return StoryListResult(
+            script_code=code,
+            script_title=script_title or None,
+            total=total,
+            items=[_to_story_item(r) for r in rows],
+        )
+
+    async def get_story(
+        self, story_id: str, *, highlight_limit: int = 50, highlight_offset: int = 0
+    ) -> StoryDetail:
+        """故事条目详情：条目本体 + 该条目下的公开划线（共读时间线）。
+
+        `highlight_count` 是含私有在内的全部活跃划线数（作者自己看得到），
+        `public_highlights` 是公开数 —— 两个数字分开算，前端按视角取用。
+        """
+        store = store_mod.get_dm_store()
+        row = await run_in_threadpool(store.get_story, story_id)
+        if not row:
+            raise NotFoundError(f"故事条目不存在: {story_id}", code="dm_story_not_found")
+        item = _to_story_item(row)
+        item.highlight_count = await run_in_threadpool(store.count_highlights, story_id)
+        hl_rows, hl_total = await run_in_threadpool(
+            store.list_highlights,
+            story_id=story_id,
+            visibility="public",
+            limit=highlight_limit,
+            offset=highlight_offset,
+        )
+        highlights = [_to_highlight_record(r) for r in hl_rows]
+        item.public_highlights = hl_total
+        await self._enrich_highlights(highlights)
+        return StoryDetail(**item.model_dump(), highlights=highlights)
+
+    # --------------------------------------------------------
+    # 划线评论（Web Annotation 式文本锚点）
+    # --------------------------------------------------------
+    async def list_highlights(
+        self,
+        *,
+        script_code: Optional[str] = None,
+        story_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        visibility: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> HighlightListResult:
+        """列出划线评论（组合过滤）。
+
+        三种典型视角共用一个方法：
+        - 共读时间线：script_code + visibility=public（公开划线跨条目按时间倒序）；
+        - 我的划线：user_id（任意可见性）；
+        - 条目详情：story_id + visibility=public（见 :meth:`get_story`）。
+        """
+        if not (script_code or story_id or user_id):
+            raise ValidationError(
+                "scriptCode / storyId / userId 至少传一个以界定查询范围",
+                code="highlight_scope_required",
+            )
+        if visibility and visibility not in store_mod.HL_VISIBILITY:
+            raise ValidationError(
+                f"不支持的可见性: {visibility}",
+                code="invalid_highlight_visibility",
+                details={"allowed": sorted(store_mod.HL_VISIBILITY)},
+            )
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+        store = store_mod.get_dm_store()
+        rows, total = await run_in_threadpool(
+            store.list_highlights,
+            script_code=(script_code or "").strip().lower() or None,
+            story_id=story_id,
+            user_id=user_id,
+            visibility=visibility,
+            limit=limit,
+            offset=offset,
+        )
+        items = [_to_highlight_record(r) for r in rows]
+        await self._enrich_highlights(items)
+        return HighlightListResult(total=total, items=items)
+
+    async def create_highlight(
+        self, *, user_id: str, payload: CreateHighlightRequest
+    ) -> HighlightRecord:
+        """提交一条划线评论：校验故事存在，把剧本/文档冗余字段一并写入。"""
+        store = store_mod.get_dm_store()
+        story = await run_in_threadpool(store.get_story, payload.story_id)
+        if not story:
+            raise NotFoundError(
+                f"故事条目不存在: {payload.story_id}", code="dm_story_not_found"
+            )
+        try:
+            row = await run_in_threadpool(
+                store.create_highlight,
+                {
+                    "script_id": str(story.get("script_id") or ""),
+                    "script_code": str(story.get("script_code") or ""),
+                    "document_id": str(story.get("document_id") or ""),
+                    "story_id": payload.story_id,
+                    "user_id": user_id,
+                    "quote": payload.quote,
+                    "start_offset": payload.start_offset,
+                    "end_offset": payload.end_offset,
+                    "prefix": payload.prefix or "",
+                    "suffix": payload.suffix or "",
+                    "comment": payload.comment,
+                    "visibility": payload.visibility,
+                },
+            )
+        except store_mod.DatabaseError as exc:
+            # 同一用户在相同条目上的同一段文本重复划线会撞唯一约束
+            raise ConflictError(
+                "你已经在该位置划过线了，可直接编辑原有评论",
+                code="highlight_duplicate",
+            ) from exc
+        record = _to_highlight_record(row)
+        await self._enrich_highlights([record])
+        return record
+
+    async def update_highlight(
+        self,
+        *,
+        highlight_id: str,
+        user_id: str,
+        payload: UpdateHighlightRequest,
+    ) -> HighlightRecord:
+        """修改自己的划线（评论 / 可见性）。只能改自己的，否则 403。"""
+        store = store_mod.get_dm_store()
+        existing = await run_in_threadpool(store.get_highlight, highlight_id)
+        if not existing:
+            raise NotFoundError(f"划线不存在: {highlight_id}", code="dm_highlight_not_found")
+        if str(existing.get("user_id") or "") != user_id:
+            raise ForbiddenError(
+                "只能修改自己的划线评论", code="highlight_not_owner"
+            )
+        patch: Dict[str, Any] = {}
+        for field in ("comment", "visibility"):
+            if field in payload.model_fields_set:
+                patch[field] = getattr(payload, field)
+        if not patch:
+            return _to_highlight_record(existing)
+        row = await run_in_threadpool(store.update_highlight, highlight_id, patch)
+        if not row:
+            raise NotFoundError(f"划线不存在: {highlight_id}", code="dm_highlight_not_found")
+        record = _to_highlight_record(row)
+        await self._enrich_highlights([record])
+        return record
+
+    async def delete_highlight(self, *, highlight_id: str, user_id: str) -> None:
+        """软删自己的划线（deleted_at 置 now）。只能删自己的，否则 403。"""
+        store = store_mod.get_dm_store()
+        existing = await run_in_threadpool(store.get_highlight, highlight_id)
+        if not existing:
+            raise NotFoundError(f"划线不存在: {highlight_id}", code="dm_highlight_not_found")
+        if str(existing.get("user_id") or "") != user_id:
+            raise ForbiddenError(
+                "只能删除自己的划线评论", code="highlight_not_owner"
+            )
+        await run_in_threadpool(store.soft_delete_highlight, highlight_id)
+
+    async def _enrich_highlights(self, records: List[HighlightRecord]) -> None:
+        """给划线记录补挂接条目标题/类型 + 作者资料（一次批量查询）。
+
+        划线表是平铺的：故事信息与用户资料都在别的表里。列表页 / 共读时间线
+        一次 ``id=in.(...)`` 批量取回，避免逐条 N+1；查询失败只记日志、
+        按缺省返回，绝不拖垮划线列表本身。
+        """
+        story_ids: List[str] = []
+        author_ids: List[str] = []
+        for r in records:
+            if r.story_id:
+                story_ids.append(r.story_id)
+            if r.user_id:
+                author_ids.append(r.user_id)
+        store = store_mod.get_dm_store()
+        try:
+            if story_ids:
+                stories = await run_in_threadpool(store.get_stories_by_ids, story_ids)
+                for r in records:
+                    meta = stories.get(r.story_id or "")
+                    if meta:
+                        r.story_title = meta.get("title")
+                        r.story_type = meta.get("story_type")
+            if author_ids:
+                profiles = await run_in_threadpool(store.get_profiles, author_ids)
+                for r in records:
+                    p = profiles.get(r.user_id or "")
+                    if p:
+                        r.user_nickname = p.get("nickname")
+                        r.user_avatar_url = p.get("avatar_url")
+                        r.user_avatar_color = p.get("avatar_color")
+        except Exception as exc:  # noqa: BLE001 - 增强信息失败不影响划线主数据返回
+            logger.warning("划线记录增强信息关联失败（按缺省返回）: %s", exc)
+
+    # --------------------------------------------------------
     # 标题链（QA 按手册标题分组）
     # --------------------------------------------------------
     async def qa_title_chain(
@@ -1131,6 +1377,63 @@ def _merge_profiles(
             r.answered_by_nickname = answerer.get("nickname")
             r.answered_by_avatar_url = answerer.get("avatar_url")
             r.answered_by_avatar_color = answerer.get("avatar_color")
+
+
+def _to_story_item(row: Dict[str, Any]) -> StoryItem:
+    """数据库行 → 故事条目视图。
+
+    `section_path` 兼容两种形态：PostgREST 对 text[] 正常返回 JSON 数组，
+    历史脏数据可能是逗号串；`meta` 是 jsonb，正常是 dict，脏数据兜底为空。
+    """
+    raw_path = row.get("section_path")
+    if isinstance(raw_path, str):
+        section_path = [p for p in (s.strip() for s in raw_path.split(",")) if p]
+    else:
+        section_path = list(raw_path or [])
+    meta = row.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    return StoryItem(
+        id=str(row.get("id") or ""),
+        document_id=str(row.get("document_id") or ""),
+        script_code=str(row.get("script_code") or ""),
+        chunk_id=(str(row["chunk_id"]) if row.get("chunk_id") else None),
+        story_index=int(row.get("story_index") or 0),
+        story_type=str(row.get("story_type") or "other"),
+        title=str(row.get("title") or ""),
+        content=str(row.get("content") or ""),
+        summary=row.get("summary"),
+        meta=meta,
+        section_path=section_path,
+        page_start=row.get("page_start"),
+        page_end=row.get("page_end"),
+        char_count=int(row.get("char_count") or 0),
+        created_at=row.get("created_at"),
+        public_highlights=int(row.get("public_highlights") or 0),
+    )
+
+
+def _to_highlight_record(row: Dict[str, Any]) -> HighlightRecord:
+    """数据库行 → 划线记录。故事信息与作者资料由 _enrich_highlights 读取时合并。"""
+    return HighlightRecord(
+        id=str(row.get("id") or ""),
+        script_id=str(row.get("script_id") or ""),
+        script_code=str(row.get("script_code") or ""),
+        document_id=str(row.get("document_id") or ""),
+        story_id=(str(row["story_id"]) if row.get("story_id") else None),
+        user_id=str(row.get("user_id") or ""),
+        quote=str(row.get("quote") or ""),
+        start_offset=int(row.get("start_offset") or 0),
+        end_offset=int(row.get("end_offset") or 0),
+        prefix=str(row.get("prefix") or ""),
+        suffix=str(row.get("suffix") or ""),
+        comment=row.get("comment"),
+        visibility=str(row.get("visibility") or "private"),
+        status=str(row.get("status") or store_mod.HL_STATUS_ACTIVE),
+        like_count=int(row.get("like_count") or 0),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
 
 
 def _coarse_progress(job: "JobProgress") -> float:

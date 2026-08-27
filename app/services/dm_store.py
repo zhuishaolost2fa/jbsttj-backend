@@ -32,6 +32,14 @@ TABLE_CHUNKS = "script_dm_chunks"
 TABLE_QA = "script_dm_qa"
 TABLE_JOBS = "script_dm_jobs"
 TABLE_QUESTIONS = "script_dm_questions"
+TABLE_STORIES = "script_dm_stories"
+TABLE_HIGHLIGHTS = "script_dm_highlights"
+
+# 故事还原 / 划线评论的状态与可见性枚举（与 sql/dm_story.sql 保持一致）
+STORY_TYPES = ("timeline", "truth", "role", "clue", "ending", "other")
+HL_VISIBILITY = frozenset({"private", "public"})
+HL_STATUS_ACTIVE = "active"
+HL_STATUS_ORPHANED = "orphaned"
 
 # 问答标题链（qa-titles 接口）Redis 缓存的 scope 前缀。
 # API 侧读缓存、ingest 流水线写库后失效缓存都从这一处取，保证两端口径一致。
@@ -402,6 +410,8 @@ class DMStore:
         total_qa: int = 0,
         embedded_chunks: int = 0,
         embedded_qa: int = 0,
+        total_stories: int = 0,
+        embedded_stories: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """原子自增任务进度。
 
@@ -418,6 +428,8 @@ class DMStore:
             "p_total_qa": total_qa,
             "p_embedded_chunks": embedded_chunks,
             "p_embedded_qa": embedded_qa,
+            "p_total_stories": total_stories,
+            "p_embedded_stories": embedded_stories,
         }
         if status:
             params["p_status"] = status
@@ -504,6 +516,212 @@ class DMStore:
             headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"},
         )
         return _parse_content_range(resp.headers.get("Content-Range"))
+
+    # ---------------- 故事还原 ----------------
+    def insert_stories(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """批量写入故事还原条目，按 (document_id, content_hash) 去重。
+
+        与 insert_qa 同策略：同批次内先按 content_hash 去重（避免 PostgREST
+        单条 ON CONFLICT 报「cannot affect row a second time」），跨批次由
+        on_conflict 兜底合并。
+        """
+        if not rows:
+            return []
+        seen: set = set()
+        uniq: List[Dict[str, Any]] = []
+        for r in rows:
+            key = r.get("content_hash")
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(r)
+        if len(uniq) != len(rows):
+            logger.info("insert_stories 同批次去重：%s -> %s 条", len(rows), len(uniq))
+        resp = self._request(
+            "POST",
+            f"/{TABLE_STORIES}",
+            params={"on_conflict": "document_id,content_hash"},
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+            json=list(uniq),
+        )
+        return self._rows(resp)
+
+    def count_stories(self, document_id: str) -> int:
+        resp = self._request(
+            "GET",
+            f"/{TABLE_STORIES}",
+            params={"document_id": f"eq.{document_id}", "select": "id"},
+            headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"},
+        )
+        return _parse_content_range(resp.headers.get("Content-Range"))
+
+    def list_stories(
+        self,
+        *,
+        script_code: str,
+        story_type: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """按剧本聚合故事还原条目（仅活跃文档），返回 (items, total)。
+
+        走 SQL 函数 list_dm_stories：需要过滤「文档 is_active」并按 story 聚合
+        公开划线数，PostgREST 的平铺查询做不到，函数里一次算好。
+        """
+        result = self.rpc(
+            "list_dm_stories",
+            {
+                "p_script_code": script_code,
+                "p_story_type": story_type,
+                "p_limit": limit,
+                "p_offset": offset,
+            },
+        )
+        if isinstance(result, dict):
+            items = result.get("items") or []
+            total = int(result.get("total") or 0)
+            return items if isinstance(items, list) else [], total
+        return [], 0
+
+    def get_story(self, story_id: str) -> Optional[Dict[str, Any]]:
+        resp = self._request(
+            "GET", f"/{TABLE_STORIES}", params={"id": f"eq.{story_id}", "select": "*", "limit": 1}
+        )
+        rows = self._rows(resp)
+        return rows[0] if rows else None
+
+    def get_stories_by_ids(
+        self, story_ids: Sequence[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """按 id 批量取故事条目的标题/类型，返回 {story_id: row}。
+
+        共读时间线要展示「每条划线挂在哪个故事条目上」，但划线表是平铺的、
+        没有冗余条目标题；一次 ``id=in.(...)`` 查询覆盖整页划线，避免逐条 N+1。
+        """
+        ids = [sid for sid in dict.fromkeys(story_ids) if sid]
+        if not ids:
+            return {}
+        resp = self._request(
+            "GET",
+            f"/{TABLE_STORIES}",
+            params={
+                "id": f"in.({','.join(ids)})",
+                "select": "id,title,story_type",
+            },
+        )
+        return {str(r.get("id")): r for r in self._rows(resp) if r.get("id")}
+
+    def reanchor_highlights(self, document_id: str) -> Optional[Dict[str, Any]]:
+        """把 orphaned 划线按 quote 重新挂回新生成的故事条目。
+
+        force 重跑 / 换新版本手册后，旧 story 被 purge 删除、划线标记为
+        orphaned；T4 写完新 story 后调这个 RPC 重锚定。返回 {relined, still_orphaned}。
+        """
+        try:
+            result = self.rpc("reanchor_dm_highlights", {"p_document_id": document_id})
+        except DatabaseError as exc:
+            # 重锚失败只是让部分划线暂时停留在 orphaned 状态，不该拖垮收尾
+            logger.warning("划线重锚定失败 doc=%s: %s", document_id, exc)
+            return None
+        if isinstance(result, list):
+            return result[0] if result else None
+        return result
+
+    # ---------------- 划线评论 ----------------
+    def count_highlights(self, story_id: str, *, user_id: Optional[str] = None) -> int:
+        params: Dict[str, Any] = {
+            "story_id": f"eq.{story_id}",
+            "deleted_at": "is.null",
+            "select": "id",
+        }
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        resp = self._request(
+            "GET",
+            f"/{TABLE_HIGHLIGHTS}",
+            params=params,
+            headers={"Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"},
+        )
+        return _parse_content_range(resp.headers.get("Content-Range"))
+
+    def create_highlight(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        resp = self._request(
+            "POST",
+            f"/{TABLE_HIGHLIGHTS}",
+            headers={"Prefer": "return=representation"},
+            json=[payload],
+        )
+        rows = self._rows(resp)
+        if not rows:
+            raise DatabaseError("划线评论写入后未返回数据")
+        return rows[0]
+
+    def get_highlight(self, highlight_id: str) -> Optional[Dict[str, Any]]:
+        resp = self._request(
+            "GET", f"/{TABLE_HIGHLIGHTS}", params={"id": f"eq.{highlight_id}", "select": "*", "limit": 1}
+        )
+        rows = self._rows(resp)
+        return rows[0] if rows else None
+
+    def list_highlights(
+        self,
+        *,
+        script_code: Optional[str] = None,
+        story_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        visibility: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """列出划线评论（组合过滤），返回 (rows, total)。
+
+        按需组合过滤维度：剧本（script_code）、条目（story_id）、作者（user_id）、
+        可见性（visibility）。总数走 Content-Range，与 list_questions 同款解析。
+        """
+        params: Dict[str, Any] = {
+            "deleted_at": "is.null",
+            "select": "*",
+            "order": "created_at.desc",
+            "limit": limit,
+            "offset": offset,
+        }
+        if script_code:
+            params["script_code"] = f"eq.{script_code}"
+        if story_id:
+            params["story_id"] = f"eq.{story_id}"
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        if visibility:
+            params["visibility"] = f"eq.{visibility}"
+        resp = self._request(
+            "GET",
+            f"/{TABLE_HIGHLIGHTS}",
+            params=params,
+            headers={"Prefer": "count=exact"},
+        )
+        total = _parse_content_range(resp.headers.get("Content-Range"))
+        return self._rows(resp), total
+
+    def update_highlight(self, highlight_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        resp = self._request(
+            "PATCH",
+            f"/{TABLE_HIGHLIGHTS}",
+            params={"id": f"eq.{highlight_id}"},
+            headers={"Prefer": "return=representation"},
+            json=patch,
+        )
+        rows = self._rows(resp)
+        return rows[0] if rows else None
+
+    def soft_delete_highlight(self, highlight_id: str) -> None:
+        """软删划线：deleted_at 置 now，列表与计数一律按 deleted_at is null 过滤。"""
+        self._request(
+            "PATCH",
+            f"/{TABLE_HIGHLIGHTS}",
+            params={"id": f"eq.{highlight_id}"},
+            headers={"Prefer": "return=minimal"},
+            json={"deleted_at": "now()"},
+        )
 
     def list_qa_titles(self, script_code: str) -> List[Dict[str, Any]]:
         """按业务 code 取全部 QA（含标题与章节路径），行文顺序输出。

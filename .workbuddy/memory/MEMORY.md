@@ -12,3 +12,4 @@
 - 表名前缀 `script_dm_`：`script_dm_jobs`、`script_dm_documents`、`script_dm_chunks`、`script_dm_qa`、`script_dm_questions`
 - Redis/worker 未运行时，prepare_document 会把任务派发到 Redis 队列但无人消费，job 卡在 `extracting` 状态。
 - Redis 重启后内存数据丢失，队列中的任务不会自动恢复，需手动重新派发（force=true）。
+- 2026-08-27 新增故事还原设计（sql/dm_story.sql，待在 Supabase 执行）：`script_dm_stories`（LLM 采集还原条目，story_type 六分类，content_hash 去重，1024 维 HNSW）+ `script_dm_highlights`（用户划线评论，Web Annotation 式锚点 quote/offset/prefix/suffix，story_id on delete set null，orphaned 状态 + reanchor_dm_highlights 重锚；user_id 沿用自建鉴权无外键；visibility private/public）。jobs/documents 补 total_stories/embedded_stories，bump_dm_job_progress 已扩展（带默认参数，旧调用兼容）。流水线待改造点：T3 prompt 同时产出 story items，T4 落库+向量化，finalize/purge 后调 reanchor。

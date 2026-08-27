@@ -114,6 +114,8 @@ class JobProgress(BaseModel):
     embedded_chunks: int = Field(default=0, description="已向量化并入库的分块数")
     total_qa: int = Field(default=0, description="生成的问答对数")
     embedded_qa: int = Field(default=0, description="已向量化并入库的问答对数")
+    total_stories: int = Field(default=0, description="采集的故事还原条目数")
+    embedded_stories: int = Field(default=0, description="已向量化并入库的故事还原条目数")
     error_message: Optional[str] = Field(default=None, description="失败原因")
     started_at: Optional[datetime] = Field(default=None, description="开始时间")
     finished_at: Optional[datetime] = Field(default=None, description="结束时间")
@@ -229,6 +231,7 @@ class DMGuideStatus(BaseModel):
     total_pages: int = Field(default=0, description="总页数")
     total_chunks: int = Field(default=0, description="分块数")
     total_qa: int = Field(default=0, description="问答对数")
+    total_stories: int = Field(default=0, description="故事还原条目数")
     version: int = Field(default=0, description="当前版本号")
     job: Optional[JobProgress] = Field(default=None, description="最近一次任务的进度")
 
@@ -500,3 +503,165 @@ class GuideQuestions(BaseModel):
     script_code: str = Field(description="DM 聚合业务编码")
     script_title: Optional[str] = Field(default=None, description="剧本名（按名称查询时回显）")
     items: List[QuestionRecord] = Field(default_factory=list, description="按人气排序的引导问题")
+
+
+# ------------------------------------------------------------
+# 故事还原（LLM 从手册还原/复盘片段采集）与用户划线评论
+# ------------------------------------------------------------
+STORY_TYPES = ("timeline", "truth", "role", "clue", "ending", "other")
+HIGHLIGHT_VISIBILITIES = ("private", "public")
+HIGHLIGHT_STATUSES = ("active", "orphaned")
+
+
+class StoryItem(BaseModel):
+    """一条故事还原条目（LLM 采集，与问答对并列）。
+
+    与 QA 的服务对象不同：QA 面向玩家答疑，故事还原面向「整本剧本的真实脉络」——
+    时间线、真相、角色背景、线索关联、结局。`meta` 承载结构化补充（时间线事件、
+    人物关系对等），前端可据此做时间线 / 关系图谱等富展示。
+
+    `publicHighlights` 是挂在条目下的公开划线数（共读时间线计数），
+    由 SQL 函数 list_dm_stories 一次算好，避免列表页 N+1。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    id: str = Field(description="故事条目 ID")
+    document_id: str = Field(description="所属文档 ID")
+    script_code: str = Field(description="DM 聚合业务编码")
+    chunk_id: Optional[str] = Field(default=None, description="来源分块 ID")
+    story_index: int = Field(default=0, description="条目序号（文档内行文顺序）")
+    story_type: str = Field(
+        default="other", description="类型：timeline / truth / role / clue / ending / other"
+    )
+    title: str = Field(default="", description="条目标题")
+    content: str = Field(description="还原正文（LLM 从手册原文整理）")
+    summary: Optional[str] = Field(default=None, description="一句话摘要")
+    meta: Dict[str, Any] = Field(default_factory=dict, description="结构化补充（时间线事件、人物关系等）")
+    section_path: List[str] = Field(default_factory=list, description="章节面包屑")
+    page_start: Optional[int] = Field(default=None, description="起始页")
+    page_end: Optional[int] = Field(default=None, description="结束页")
+    char_count: int = Field(default=0, description="正文字符数")
+    created_at: Optional[datetime] = Field(default=None, description="入库时间")
+    public_highlights: int = Field(default=0, description="公开划线数（共读时间线计数）")
+    highlight_count: int = Field(default=0, description="全部活跃划线数（含私有，详情页用）")
+
+
+class StoryDetail(StoryItem):
+    """故事条目详情：在 StoryItem 基础上附公开划线（共读时间线）。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    highlights: List["HighlightRecord"] = Field(default_factory=list, description="公开划线列表，时间倒序")
+
+
+class StoryListResult(BaseModel):
+    """剧本维度的故事还原分页列表。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    script_code: str = Field(description="DM 聚合业务编码")
+    script_title: Optional[str] = Field(default=None, description="剧本名（按名称查询时回显）")
+    total: int = Field(default=0, description="满足条件的总条数")
+    items: List[StoryItem] = Field(default_factory=list, description="当前页条目")
+
+
+class HighlightRecord(BaseModel):
+    """一条用户划线评论（Web Annotation 式文本锚点）。
+
+    锚点三要素：`quote`（划线原文）+ `startOffset/endOffset`（字符偏移，按
+    story.content 用 Array.from 统计，避免 surrogate pair 错位）+
+    `prefix/suffix`（前后文指纹）。手册重跑后 story 内容变化时靠 quote 两级
+    匹配重新锚定（reanchor_dm_highlights），锚不上则保持 `orphaned` 状态。
+
+    用户资料字段（昵称/头像）由服务层读取时关联 profiles 实时合并，永远最新。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    id: str = Field(description="划线 ID")
+    script_id: str = Field(description="剧本 ID")
+    script_code: str = Field(description="DM 聚合业务编码")
+    document_id: str = Field(description="划线诞生时的文档版本")
+    story_id: Optional[str] = Field(default=None, description="当前挂接的故事条目；orphaned 时为空")
+    story_title: Optional[str] = Field(default=None, description="挂接条目的标题（服务层关联填充）")
+    story_type: Optional[str] = Field(default=None, description="挂接条目的类型（服务层关联填充）")
+    user_id: str = Field(description="划线作者用户 ID")
+    quote: str = Field(description="划线原文")
+    start_offset: int = Field(default=0, description="起始字符偏移（含）")
+    end_offset: int = Field(default=0, description="结束字符偏移（不含）")
+    prefix: str = Field(default="", description="划线前文（≤64 字符指纹）")
+    suffix: str = Field(default="", description="划线后文（≤64 字符指纹）")
+    comment: Optional[str] = Field(default=None, description="评论内容，可为空（纯划线）")
+    visibility: str = Field(default="private", description="private 仅自己可见 / public 进入共读时间线")
+    status: str = Field(default="active", description="active 正常 / orphaned 待重锚")
+    like_count: int = Field(default=0, description="点赞数")
+    created_at: Optional[datetime] = Field(default=None, description="创建时间")
+    updated_at: Optional[datetime] = Field(default=None, description="最近更新时间")
+    user_nickname: Optional[str] = Field(default=None, description="作者昵称（读取时关联 profiles）")
+    user_avatar_url: Optional[str] = Field(default=None, description="作者头像（读取时关联 profiles）")
+    user_avatar_color: Optional[int] = Field(default=None, description="作者默认头像配色（0~7）")
+
+
+class HighlightListResult(BaseModel):
+    """划线评论分页列表（共读时间线 / 我的划线共用）。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    total: int = Field(default=0, description="满足条件的总条数")
+    items: List[HighlightRecord] = Field(default_factory=list, description="当前页记录，时间倒序")
+
+
+class CreateHighlightRequest(BaseModel):
+    """提交一条划线评论。
+
+    前端在故事还原详情页选中文本后提交：`quote` 是选中的原文，偏移量按
+    story.content 的字符数计算（JS 里用 Array.from 统计，避免 emoji 等
+    surrogate pair 把偏移算错）。`prefix/suffix` 各取划线前后 ≤64 字符，
+    供手册重跑后做上下文模糊重锚。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    story_id: str = Field(description="挂接的故事条目 ID")
+    quote: str = Field(min_length=1, max_length=1000, description="划线原文")
+    start_offset: int = Field(ge=0, description="起始字符偏移（含）")
+    end_offset: int = Field(gt=0, description="结束字符偏移（不含）")
+    prefix: str = Field(default="", max_length=64, description="划线前文（≤64 字符）")
+    suffix: str = Field(default="", max_length=64, description="划线后文（≤64 字符）")
+    comment: Optional[str] = Field(default=None, max_length=2000, description="评论内容，可为空")
+    visibility: str = Field(
+        default="private",
+        pattern="^(private|public)$",
+        description="private 仅自己可见（默认）/ public 进入共读时间线",
+    )
+
+    @field_validator("quote")
+    @classmethod
+    def _quote_not_blank(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("quote 不能为空")
+        return v
+
+    @field_validator("end_offset")
+    @classmethod
+    def _range_valid(cls, v: int, info) -> int:
+        start = info.data.get("start_offset")
+        if start is not None and v <= start:
+            raise ValueError("endOffset 必须大于 startOffset")
+        return v
+
+
+class UpdateHighlightRequest(BaseModel):
+    """修改一条划线评论：可只传 comment / visibility 之一，只更新传了的字段。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    comment: Optional[str] = Field(default=None, max_length=2000, description="评论内容；传 null 清除评论")
+    visibility: Optional[str] = Field(
+        default=None, pattern="^(private|public)$", description="private 仅自己可见 / public 公开"
+    )
+
+
+StoryDetail.model_rebuild()

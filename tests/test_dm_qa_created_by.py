@@ -34,6 +34,9 @@ def test_embed_and_store_writes_created_by_to_qa():
         def count_qa(self, document_id):
             return len(captured.get("qa", []))
 
+        def count_stories(self, document_id):
+            return 0
+
         def update_job(self, job_id, patch):
             captured.setdefault("jobs", []).append(patch)
 
@@ -106,6 +109,9 @@ def test_embed_and_store_null_created_by_when_missing():
 
         def count_qa(self, document_id):
             return len(captured.get("qa", []))
+
+        def count_stories(self, document_id):
+            return 0
 
         def update_job(self, job_id, patch):
             pass

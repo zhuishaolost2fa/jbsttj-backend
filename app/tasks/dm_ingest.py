@@ -32,6 +32,14 @@
 两个阶段真正重叠起来，总耗时 ≈ max(单批 T3 + 单批 T4)。
 400 页手册按 6 块一批能切出上百批，这个重叠收益相当可观。
 
+**故事还原与问答对同路产出**
+
+T3 除了问答对，还按关键词预筛（还原/复盘/真相/时间线等）为命中批次多采一路
+「故事还原」条目（script_dm_stories）；T4 把它们向量化后与 QA 一并落库。
+两路独立降级：故事还原失败只记日志，问答对照常入库。
+finalize 回写 total_stories，并在新 story 就绪后重锚定用户划线评论
+（force 重跑时旧 story 被删、划线转入 orphaned，靠 quote 重新挂回）。
+
 **幂等性**
 
 ``task_acks_late=True`` 意味着 worker 崩溃时任务会重投，所以每个任务都必须幂等：
@@ -369,6 +377,7 @@ def prepare_document(
                     "total_pages": total_pages,
                     "total_chunks": declared,
                     "total_qa": int(document.get("total_qa") or 0),
+                    "total_stories": int(document.get("total_stories") or 0),
                     "stage_detail": "内容指纹命中已完成的版本，复用现有索引",
                     "finished_at": "now()",
                 },
@@ -742,7 +751,7 @@ def generate_qa(
     script_code: str = "",
     script_title: str = "",
 ) -> Dict[str, Any]:
-    """给一批 chunk 生成问答对，把 chunk 原样透传给下游 T4。
+    """给一批 chunk 生成问答对与故事还原条目，把 chunk 原样透传给下游 T4。
 
     透传而非让 T4 重新查库，是为了让「生成 → 向量化」两步共享同一份内存数据，
     省掉一次往返。批次大小由 ``dm_qa_batch_size`` 控制，几个 chunk 的文本量
@@ -750,25 +759,38 @@ def generate_qa(
     """
     chunks = list(batch)
     if not chunks:
-        return {"chunks": [], "qa": []}
+        return {"chunks": [], "qa": [], "stories": []}
 
-    pairs: List[QAPair] = get_llm_client().generate_qa(chunks, script_title=script_title)
+    client = get_llm_client()
+    pairs: List[QAPair] = client.generate_qa(chunks, script_title=script_title)
 
-    if job_id and pairs:
+    # 故事还原与问答对并行采集，两者独立降级、互不拖累：
+    # generate_stories 内部已做关键词预筛 + LLMError 降级（无命中/失败返回空列表），
+    # 这里再兜一层异常，保证任何意外都不影响问答对入库（故事还原是可降级能力）。
+    story_items: List[Dict[str, Any]] = []
+    try:
+        story_items = [
+            p.to_dict() for p in client.generate_stories(chunks, script_title=script_title)
+        ]
+    except Exception as exc:  # noqa: BLE001 - 故事还原失败只记日志，不中断流水线
+        logger.warning("故事还原提取异常（跳过本批）: %s", exc)
+
+    if job_id and (pairs or story_items):
         store = get_dm_store()
-        row = store.bump_job(job_id, total_qa=len(pairs))
+        row = store.bump_job(job_id, total_qa=len(pairs), total_stories=len(story_items))
         # T3 是全流程最慢的一环（每批一次 LLM 调用），必须让 stage_detail
         # 体现累计进度，否则前端只看到状态长期停在 generating_qa 一动不动。
         # bump_job 的 RPC 返回累加后的整行，直接取累计值，避免读-改-写竞态。
         if row:
-            store.bump_job(
-                job_id,
-                stage_detail=f"问答对生成中：已累计 {row.get('total_qa', 0)} 条",
-            )
+            detail = f"问答对生成中：已累计 {row.get('total_qa', 0)} 条"
+            if row.get("total_stories"):
+                detail += f"，故事还原 {row.get('total_stories')} 条"
+            store.bump_job(job_id, stage_detail=detail)
 
     return {
         "chunks": chunks,
         "qa": [p.to_dict() for p in pairs],
+        "stories": story_items,
     }
 
 
@@ -787,11 +809,12 @@ def embed_and_store(
     total_chunks: int = 0,
     created_by: str = "",
 ) -> Dict[str, Any]:
-    """把一批 chunk 与其问答对向量化后写入 Supabase。"""
+    """把一批 chunk、问答对与故事还原向量化后写入 Supabase。"""
     chunks: List[Dict[str, Any]] = list(payload.get("chunks") or [])
     qa_items: List[Dict[str, Any]] = list(payload.get("qa") or [])
+    story_items: List[Dict[str, Any]] = list(payload.get("stories") or [])
     if not chunks:
-        return {"chunks": 0, "qa": 0}
+        return {"chunks": 0, "qa": 0, "stories": 0}
 
     store = get_dm_store()
     client = get_llm_client()
@@ -863,6 +886,46 @@ def embed_and_store(
             )
         store.insert_qa(qa_rows)
 
+    # ---------- 故事还原向量 ----------
+    # 向量化对象是「标题 + 正文」：故事条目的检索意图更接近整段脉络
+    # （"这个剧本的完整时间线"），标题做前缀能让 embedding 偏向主题词。
+    # 与 QA 同理，靠 source_index 回源 chunk，用 content_hash 映射外键。
+    story_rows: List[Dict[str, Any]] = []
+    if story_items:
+        story_texts = [
+            f"{item.get('title') or ''}\n{item.get('content') or ''}" for item in story_items
+        ]
+        story_vectors = client.embed_documents(story_texts)
+
+        for idx, (item, vector) in enumerate(zip(story_items, story_vectors)):
+            src_idx = int(item.get("source_index", 0))
+            source = chunks[src_idx] if 0 <= src_idx < len(chunks) else chunks[0]
+            chunk_id = hash_to_id.get(source.get("content_hash"))
+            content = item.get("content") or ""
+            story_rows.append(
+                {
+                    "document_id": document_id,
+                    "script_id": script_id,
+                    "script_code": script_code,
+                    "chunk_id": chunk_id,
+                    "story_index": idx,
+                    "story_type": item.get("story_type") or "other",
+                    "title": item.get("title") or "",
+                    "content": content,
+                    "summary": item.get("summary") or "",
+                    "meta": item.get("meta") or {},
+                    "content_hash": hashlib.sha256(
+                        content.strip().encode("utf-8")
+                    ).hexdigest(),
+                    "page_start": source.get("page_start"),
+                    "page_end": source.get("page_end"),
+                    "section_path": source.get("section_path") or [],
+                    "char_count": len(content),
+                    "embedding": to_pgvector(vector),
+                }
+            )
+        store.insert_stories(story_rows)
+
     if job_id:
         # 进度计数用**绝对值回写**而非 bump_job 的 += 自增：
         # ① += 一旦某批上报失败（bump_job 只记 warning 就跳过），自增量永久丢失，
@@ -873,21 +936,27 @@ def embed_and_store(
         # 最后完成的批次看到的行数必然最全。
         done_chunks = store.count_chunks(document_id)
         done_qa = store.count_qa(document_id)
+        done_stories = store.count_stories(document_id)
         total_txt = f"/{total_chunks}" if total_chunks else ""
+        detail = f"已向量化 {done_chunks}{total_txt} 块 / {done_qa} 问答"
+        if done_stories:
+            detail += f" / {done_stories} 故事还原"
         store.update_job(
             job_id,
             {
                 "status": JOB_EMBEDDING,
                 "embedded_chunks": done_chunks,
                 "embedded_qa": done_qa,
-                "stage_detail": f"已向量化 {done_chunks}{total_txt} 块 / {done_qa} 问答",
+                "embedded_stories": done_stories,
+                "stage_detail": detail,
             },
         )
 
     logger.info(
-        "入库完成 doc=%s: chunk=%s qa=%s", document_id, len(chunk_rows), len(qa_rows)
+        "入库完成 doc=%s: chunk=%s qa=%s stories=%s",
+        document_id, len(chunk_rows), len(qa_rows), len(story_rows),
     )
-    return {"chunks": len(chunk_rows), "qa": len(qa_rows)}
+    return {"chunks": len(chunk_rows), "qa": len(qa_rows), "stories": len(story_rows)}
 
 
 # ============================================================
@@ -900,15 +969,24 @@ def _mark_completed(
     *,
     chunk_count: int,
     qa_count: int,
+    story_count: int = 0,
 ) -> None:
     store.update_document(
-        document_id, {"total_chunks": chunk_count, "total_qa": qa_count}
+        document_id,
+        {
+            "total_chunks": chunk_count,
+            "total_qa": qa_count,
+            "total_stories": story_count,
+        },
     )
+    detail = f"完成：{chunk_count} 个块 / {qa_count} 条问答对"
+    if story_count:
+        detail += f" / {story_count} 条故事还原"
     store.update_job(
         job_id,
         {
             "status": JOB_COMPLETED,
-            "stage_detail": f"完成：{chunk_count} 个块 / {qa_count} 条问答对",
+            "stage_detail": detail,
             "finished_at": "now()",
             "error_message": None,
         },
@@ -933,8 +1011,12 @@ def finalize(
     store = get_dm_store()
     chunk_count = store.count_chunks(document_id)
     qa_count = store.count_qa(document_id)
+    story_count = store.count_stories(document_id)
 
-    _mark_completed(store, job_id, document_id, chunk_count=chunk_count, qa_count=qa_count)
+    _mark_completed(
+        store, job_id, document_id,
+        chunk_count=chunk_count, qa_count=qa_count, story_count=story_count,
+    )
 
     # 新版本入库成功后才让同一 script_id 的旧版本下线，避免中途失败时新旧都不可用。
     # 这里不能按 script_code 下线，否则同名分片的其它手册会被误置为 inactive。
@@ -944,12 +1026,28 @@ def finalize(
     # 全部 QA 落库、旧版本下线完毕，该剧本可见的 QA 集合定格 —— 缓存就此失效重建
     _invalidate_qa_titles_cache(script_code)
 
+    # force 重跑 / 换新版本手册时，旧 story 被 purge 删掉、用户划线落入 orphaned；
+    # 新 story 就绪后在这里重锚定（quote 精确匹配 → prefix/suffix 上下文模糊匹配）。
+    # 首次入库没有 orphaned 划线，RPC 快速空转，成本可忽略。
+    if story_count:
+        anchor = store.reanchor_highlights(document_id)
+        if anchor:
+            logger.info(
+                "划线重锚定 doc=%s: 重挂 %s 条，仍孤立 %s 条",
+                document_id, anchor.get("relined", 0), anchor.get("still_orphaned", 0),
+            )
+
     batches = len(results) if results else 0
     logger.info(
-        "流水线完成 doc=%s: %s 批次 -> %s 块 / %s 问答",
-        document_id, batches, chunk_count, qa_count,
+        "流水线完成 doc=%s: %s 批次 -> %s 块 / %s 问答 / %s 故事还原",
+        document_id, batches, chunk_count, qa_count, story_count,
     )
-    return {"document_id": document_id, "chunks": chunk_count, "qa": qa_count}
+    return {
+        "document_id": document_id,
+        "chunks": chunk_count,
+        "qa": qa_count,
+        "stories": story_count,
+    }
 
 
 @_task(bind=True, name="dm.on_pipeline_error")

@@ -37,6 +37,7 @@ def _fake_store(**overrides):
     ]
     store.count_chunks.return_value = overrides.get("done_chunks", 12)
     store.count_qa.return_value = overrides.get("done_qa", 20)
+    store.count_stories.return_value = overrides.get("done_stories", 0)
     store.bump_job.return_value = overrides.get("bump_return", None)
     return store
 

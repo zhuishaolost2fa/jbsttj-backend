@@ -13,14 +13,17 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Path, Query, status
 
-from app.core.exceptions import ValidationError
+from app.core.exceptions import AuthError, ValidationError
 from app.core.security import CurrentUser, get_current_user, get_current_user_optional
 from app.schemas.dm_guide import (
     AnswerQuestionRequest,
     AskRequest,
     AskResponse,
+    CreateHighlightRequest,
     DMGuideStatus,
     GuideQuestions,
+    HighlightListResult,
+    HighlightRecord,
     ImportStatus,
     IngestRequest,
     IngestResponse,
@@ -29,6 +32,9 @@ from app.schemas.dm_guide import (
     QuestionListResult,
     QuestionRecord,
     SearchResult,
+    StoryDetail,
+    StoryListResult,
+    UpdateHighlightRequest,
 )
 from app.services.dm_service import DMGuideService, get_dm_guide_service, script_dm_code
 from app.services.script_service import ScriptService, get_script_service, slugify
@@ -433,3 +439,180 @@ async def list_guide_questions(
     return await service.guide_questions(
         script_code=resolved, script_title=name, limit=limit
     )
+
+
+# ------------------------------------------------------------
+# 故事还原（LLM 采集的剧本脉络）与划线评论（Web Annotation 锚点）
+# ------------------------------------------------------------
+# 与问答标题链同一权限口径：故事条目是手册衍生内容，公开可读（不调 LLM、零成本）；
+# 划线评论是用户 UGC —— 读公开时间线无需登录，提交/修改/删除必须登录且只能动自己的。
+@ask_router.get(
+    "/stories",
+    response_model=StoryListResult,
+    response_model_by_alias=True,
+    summary="故事还原列表（剧本真实脉络：时间线/真相/角色/线索/结局）",
+    description=(
+        "按剧本聚合 LLM 从手册还原/复盘片段采集的**故事还原条目**，供前端做\n"
+        "「共读还原」页：时间线、真相还原、角色背景、线索关联、结局收束。\n\n"
+        "与问答标题链互补：标题链是面向玩家的规则问答，故事还原是整本剧本的脉络梳理；\n"
+        "条目按 `story_index`（手册行文顺序）排列，`storyType` 可过滤（timeline / truth / "
+        "role / clue / ending / other）。每行带 `publicHighlights`（公开划线数），"
+        "点击条目可进详情看共读时间线。\n\n"
+        "剧本标识与 qa-titles 同口径：`code` 优先，或传 `title`（剧本中文名）自动派生。"
+        "公开可读，无需登录。"
+    ),
+)
+async def list_dm_stories(
+    code: Optional[str] = Query(default=None, description="DM 聚合业务编码，优先级高于 title"),
+    title: Optional[str] = Query(default=None, description="剧本杀名称（中文名原文）"),
+    story_type: Optional[str] = Query(
+        default=None,
+        alias="storyType",
+        pattern="^(timeline|truth|role|clue|ending|other)$",
+        description="按故事类型过滤，不传返回全部",
+    ),
+    limit: int = Query(default=50, ge=1, le=100, description="每页条数"),
+    offset: int = Query(default=0, ge=0, description="分页偏移"),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> StoryListResult:
+    resolved, name = _resolve_script_code(code, title)
+    return await service.list_stories(
+        script_code=resolved, script_title=name, story_type=story_type, limit=limit, offset=offset
+    )
+
+
+@ask_router.get(
+    "/stories/{story_id}",
+    response_model=StoryDetail,
+    response_model_by_alias=True,
+    summary="故事还原详情（条目 + 共读时间线）",
+    description=(
+        "单个故事还原条目的完整内容（含 `meta` 结构化补充：时间线事件、人物关系对等），\n"
+        "并附该条目下的**公开划线评论**（共读时间线，按时间倒序）。\n\n"
+        "`highlightCount` 是含私有在内的全部活跃划线数（作者视角），`publicHighlights` "
+        "是公开数 —— 前端按视角取用。公开可读，无需登录。"
+    ),
+)
+async def get_dm_story(
+    story_id: str = Path(description="故事条目 ID"),
+    limit: int = Query(default=50, ge=1, le=100, description="划线每页条数"),
+    offset: int = Query(default=0, ge=0, description="划线分页偏移"),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> StoryDetail:
+    return await service.get_story(story_id, highlight_limit=limit, highlight_offset=offset)
+
+
+@ask_router.get(
+    "/highlights",
+    response_model=HighlightListResult,
+    response_model_by_alias=True,
+    summary="划线评论列表（共读时间线 / 我的划线）",
+    description=(
+        "划线评论的两种浏览视角：\n\n"
+        "- **共读时间线**（默认）：`code`（或 `title`）限定剧本，返回该剧本**全部公开**划线，\n"
+        "  跨故事条目按时间倒序 —— 玩家在剧本还原页看到所有人留下的高光时刻；\n"
+        "- **我的划线**：`mine=true` 时返回当前登录用户自己的全部划线（含 private），\n"
+        "  可用 `code`/`storyId` 再收窄范围。\n\n"
+        "也可用 `storyId` 单独限定某一条目（等价于故事详情页的划线区）。"
+        "读公开时间线无需登录；`mine=true` 必须登录。"
+    ),
+)
+async def list_dm_highlights(
+    code: Optional[str] = Query(default=None, description="DM 聚合业务编码，优先级高于 title"),
+    title: Optional[str] = Query(default=None, description="剧本杀名称（中文名原文）"),
+    story_id: Optional[str] = Query(
+        default=None, alias="storyId", description="故事条目 ID，限定单条目"
+    ),
+    mine: bool = Query(
+        default=False, description="true 返回我自己的划线（含 private），需登录"
+    ),
+    limit: int = Query(default=20, ge=1, le=100, description="每页条数"),
+    offset: int = Query(default=0, ge=0, description="分页偏移"),
+    user: Optional[CurrentUser] = Depends(get_current_user_optional),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> HighlightListResult:
+    if mine:
+        if user is None:
+            raise AuthError("查看我的划线需要登录", code="auth_required")
+        resolved, _ = _resolve_script_code(code, title) if (code or title) else ("", "")
+        return await service.list_highlights(
+            script_code=resolved or None,
+            story_id=story_id,
+            user_id=user.id,
+            limit=limit,
+            offset=offset,
+        )
+    resolved, _ = _resolve_script_code(code, title) if (code or title) else ("", "")
+    if not resolved and not story_id:
+        raise ValidationError(
+            "请至少传 code / title / storyId 之一以界定查询范围",
+            code="highlight_scope_required",
+        )
+    return await service.list_highlights(
+        script_code=resolved or None,
+        story_id=story_id,
+        visibility="public",
+        limit=limit,
+        offset=offset,
+    )
+
+
+@ask_router.post(
+    "/highlights",
+    response_model=HighlightRecord,
+    response_model_by_alias=True,
+    status_code=status.HTTP_201_CREATED,
+    summary="提交划线评论（Web Annotation 式文本锚点）",
+    description=(
+        "在故事还原详情页选中文本后提交：`quote` 是选中的原文，`startOffset/endOffset`\n"
+        "按 story.content 的字符数计算（JS 用 `Array.from` 统计，避免 emoji 等 surrogate pair "
+        "把偏移算错），`prefix/suffix` 各取划线前后 ≤64 字符 —— 手册重跑后 story 内容变化，\n"
+        "后端靠 quote 两级匹配重新锚定（reanchor），锚不上则划线保持 orphaned 不丢失。\n\n"
+        "`visibility`：private 仅自己可见（默认）/ public 进入共读时间线；`comment` 可为空\n"
+        "（纯划线点赞）。同一用户在同一条目同一段文本重复划线返回 409。需登录。"
+    ),
+)
+async def create_dm_highlight(
+    payload: CreateHighlightRequest,
+    user: CurrentUser = Depends(get_current_user),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> HighlightRecord:
+    return await service.create_highlight(user_id=user.id, payload=payload)
+
+
+@ask_router.patch(
+    "/highlights/{highlight_id}",
+    response_model=HighlightRecord,
+    response_model_by_alias=True,
+    summary="修改划线评论（评论 / 可见性）",
+    description=(
+        "只更新传入的字段：`comment`（传 null 清除评论）、`visibility`（private/public 互转）。\n"
+        "只能修改自己的划线，否则 403。需登录。"
+    ),
+)
+async def update_dm_highlight(
+    payload: UpdateHighlightRequest,
+    highlight_id: str = Path(description="划线评论 ID"),
+    user: CurrentUser = Depends(get_current_user),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> HighlightRecord:
+    return await service.update_highlight(
+        highlight_id=highlight_id, user_id=user.id, payload=payload
+    )
+
+
+@ask_router.delete(
+    "/highlights/{highlight_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除划线评论（软删）",
+    description=(
+        "把自己的划线置为已删除（deleted_at 置 now），列表与计数一律不再可见；\n"
+        "数据仍在库中可恢复。只能删除自己的划线，否则 403。需登录。"
+    ),
+)
+async def delete_dm_highlight(
+    highlight_id: str = Path(description="划线评论 ID"),
+    user: CurrentUser = Depends(get_current_user),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> None:
+    await service.delete_highlight(highlight_id=highlight_id, user_id=user.id)
