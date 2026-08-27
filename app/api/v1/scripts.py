@@ -288,13 +288,20 @@ async def put_script(
 @router.delete(
     "/{script_id}",
     response_model=MessageResponse,
-    summary="下架剧本",
-    description="软删除：置 `deleted_at` 并把状态改为 offline，记录仍保留在库中，可人工恢复。",
+    summary="删除剧本（含清理导入副作用）",
+    description=(
+        "删除后剧本从「我的剧本」列表移除（软删除，记录保留可人工恢复）。\n\n"
+        "**同时清理导入剧本产生的副作用**：\n"
+        "- 物理删除 DM 手册解析产物（解析任务 / 文档 / 分块 / 问答 / 用户提问 / "
+        "故事还原 / 划线评论）；\n"
+        "- 软删除上传的手册文件记录，并物理删除 OSS 上的手册对象"
+        "（仅当没有其它文件记录或剧本仍在引用时）。"
+    ),
 )
 async def delete_script(
     script_id: str = Path(description="剧本 UUID"),
-    _: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(get_current_user),
     service: ScriptService = Depends(get_script_service),
 ) -> MessageResponse:
-    await service.delete_script(script_id)
-    return MessageResponse(message="剧本已下架")
+    await service.delete_script(script_id, user_id=user.id)
+    return MessageResponse(message="剧本已删除，导入数据已清理")

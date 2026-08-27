@@ -596,13 +596,43 @@ class ScriptRepository:
         rows = await self.db.update(TABLE_SCRIPTS, filters=filters, data=payload)
         return rows[0] if rows else None
 
-    async def soft_delete(self, script_id: str) -> Optional[Dict[str, Any]]:
+    async def soft_delete(
+        self, script_id: str, *, extra: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """软删除剧本：置 deleted_at、状态改为 offline。
+
+        ``extra`` 可选：删除时一并覆写 extra（如摘掉 ``dmGuide`` 引用，
+        避免墓碑行残留一个指向已物理删除文件的指针）。
+        """
+        data: Dict[str, Any] = {"deleted_at": _now(), "updated_at": _now(), "status": "offline"}
+        if extra is not None:
+            data["extra"] = extra
         rows = await self.db.update(
             TABLE_SCRIPTS,
             filters={"id": f"eq.{script_id}", "deleted_at": "is.null"},
-            data={"deleted_at": _now(), "updated_at": _now(), "status": "offline"},
+            data=data,
         )
         return rows[0] if rows else None
+
+    async def count_dm_guide_refs(
+        self, object_key: str, *, exclude_script_id: Optional[str] = None
+    ) -> int:
+        """统计仍把该 OSS 对象当作 DM 手册引用的剧本数（排除已删除记录）。
+
+        同一份 PDF 经秒传可被多本剧本共用 ``extra.dmGuide.objectKey``；
+        删除其中一本时，只要还有其它剧本引用，OSS 对象就不能物理删除。
+        ``exclude_script_id`` 用于剔除正在删除的那本。
+        """
+        filters: Dict[str, str] = {
+            "deleted_at": "is.null",
+            "extra->dmGuide->>objectKey": f"eq.{object_key}",
+        }
+        if exclude_script_id:
+            filters["id"] = f"neq.{exclude_script_id}"
+        _, total = await self.db.select_with_count(
+            TABLE_SCRIPTS, filters=filters, columns="id", limit=1
+        )
+        return total
 
     async def increment_view(self, script_id: str) -> Optional[int]:
         """剧本详情浏览 +1（数据库端原子自增，避免读-改-写竞态）。

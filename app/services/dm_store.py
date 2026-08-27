@@ -348,6 +348,40 @@ class DMStore:
         """清空某文档已入库的 chunk 与 QA（重跑前调用）。"""
         self.rpc("purge_dm_document", {"p_document_id": document_id})
 
+    def purge_script_side_effects(self, script_id: str) -> None:
+        """物理删除某剧本的全部导入副作用（剧本删除时调用）。
+
+        剧本行走的是软删除（下架语义），不会触发 ``script_id`` 外键级联，
+        所以必须在这里手动把挂在 script_id 上的解析产物全部删掉：
+        jobs / documents / chunks / qa / questions / stories / highlights。
+
+        两个细节：
+        - 删除前先把仍在跑的任务标记为 cancelled —— 行删掉后 worker 的进度上报
+          会落到 0 行，但提前取消能让卡在守卫点位的任务尽早停下、少烧 API 额度；
+        - 删除顺序按外键依赖从叶子到根（highlights → stories → chunks → qa →
+          questions → documents → jobs），即使个别表没配级联也能安全删除。
+        """
+        self._request(
+            "PATCH",
+            f"/{TABLE_JOBS}",
+            params={
+                "script_id": f"eq.{script_id}",
+                "status": f"not.in.({','.join(sorted(TERMINAL_STATES))})",
+            },
+            headers={"Prefer": "return=minimal"},
+            json={"status": JOB_CANCELLED, "error_message": "剧本已删除，解析任务取消"},
+        )
+        for table in (
+            TABLE_HIGHLIGHTS,
+            TABLE_STORIES,
+            TABLE_CHUNKS,
+            TABLE_QA,
+            TABLE_QUESTIONS,
+            TABLE_DOCUMENTS,
+            TABLE_JOBS,
+        ):
+            self._request("DELETE", f"/{table}", params={"script_id": f"eq.{script_id}"})
+
     # ---------------- 任务 ----------------
     def create_job(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         resp = self._request(

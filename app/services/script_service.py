@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pypinyin import lazy_pinyin
 
+from fastapi.concurrency import run_in_threadpool
+
 from app.core.config import settings
 from app.core.exceptions import DatabaseError, NotFoundError, ValidationError
 from app.data import script_options_seed as opt_seed
@@ -36,8 +38,10 @@ from app.schemas.script import (
     ScriptSearchByNameResult,
     ScriptUpdate,
 )
+from app.services import dm_store as store_mod
 from app.services import redis_cache as cache
-from app.services.repository import ScriptRepository, normalize_title_key
+from app.services.oss import OSSService, get_oss_service
+from app.services.repository import FileRepository, ScriptRepository, normalize_title_key
 from app.services.script_option_service import ScriptOptionService, get_script_option_service
 from app.schemas.dm_guide import DMGuideRef
 
@@ -89,9 +93,13 @@ class ScriptService:
         self,
         repo: Optional[ScriptRepository] = None,
         option_service: Optional[ScriptOptionService] = None,
+        files: Optional[FileRepository] = None,
+        oss: Optional[OSSService] = None,
     ) -> None:
         self.repo = repo or ScriptRepository()
         self.options = option_service or get_script_option_service()
+        self.files = files or FileRepository()
+        self.oss = oss or get_oss_service()
 
     # ================= 查询 =================
     async def list_scripts(
@@ -456,12 +464,91 @@ class ScriptService:
         await self._invalidate_list_cache()
         return self._to_item(row, await self._label_map())
 
-    async def delete_script(self, script_id: str) -> None:
-        row = await self.repo.soft_delete(script_id)
+    async def delete_script(self, script_id: str, *, user_id: Optional[str] = None) -> None:
+        """删除剧本：从「我的剧本」列表移除 + 清理导入产生的全部副作用。
+
+        副作用分三类：
+        1. **DM 解析产物** —— jobs / documents / chunks / qa / questions /
+           stories / highlights 全部物理删除（这些行挂在 script_id 上，
+           软删除剧本不会触发外键级联，必须手动清）；
+        2. **上传的手册文件记录** —— 按 ``dmGuide.fileId`` 定位 files 表记录
+           软删除，让文件从「我的文件」列表消失（fileId 缺失或不属于当前用户时
+           跳过，跨用户删除场景绝不误删别人的文件）；
+        3. **OSS 上的手册对象** —— 仅在不再被任何文件记录 / 任何剧本引用时
+           物理删除（秒传会让同一对象被多本剧本共用，删前必须数引用）。
+
+        剧本行本身仍是软删除（下架语义，保留 code 唯一约束下的幂等复活能力），
+        但会把 ``extra.dmGuide`` 一并摘掉，避免墓碑行残留指向已删文件的引用。
+
+        清理是 best-effort：任一步失败只记日志、不影响剧本从列表移除
+        （与 ``file_service.delete_file`` 删除 OSS 对象失败时
+        「留给清理任务兜底」的口径一致）。
+        """
+        row = await self.repo.get(script_id)
         if row is None:
             raise NotFoundError(f"剧本不存在: {script_id}", code="script_not_found")
-        logger.info("下架剧本 %s", script_id)
+
+        ref = DMGuideRef.from_extra(row.get("extra"))
+
+        # 1) 物理清除 DM 解析产物（先取消在跑任务，再按外键依赖从叶子到根删行）
+        try:
+            store = store_mod.get_dm_store()
+            await run_in_threadpool(store.purge_script_side_effects, script_id)
+        except Exception as exc:  # noqa: BLE001 - 副作用清理失败不应让删除看起来失败
+            logger.warning("清理 DM 解析产物失败 script=%s: %s", script_id, exc)
+
+        # 2) 清理上传的手册文件：files 记录软删除 + OSS 对象按引用计数物理删除
+        if ref:
+            await self._delete_guide_object(ref, script_id=script_id, user_id=user_id or "")
+
+        # 3) 软删除剧本行，并摘掉 extra.dmGuide（避免残留指向已删文件的引用）
+        extra = dict(row.get("extra") or {})
+        has_guide_key = "dmGuide" in extra or "dm_guide" in extra
+        if has_guide_key:
+            extra.pop("dmGuide", None)
+            extra.pop("dm_guide", None)
+            await self.repo.soft_delete(script_id, extra=extra)
+        else:
+            await self.repo.soft_delete(script_id)
+
+        # 4) 失效该剧本的 QA 标题链缓存：同名分片剧本共用同一个 DM 聚合 code，
+        #    删掉一本后残留缓存会把已删分片的 QA 也展示出来，必须 bump scope。
+        try:
+            dm_code = (slugify(str(row.get("title") or "")) or str(script_id)).strip().lower()
+            await run_in_threadpool(
+                cache.bump_scope_version_sync, store_mod.qa_titles_cache_scope(dm_code)
+            )
+        except Exception as exc:  # noqa: BLE001 - Redis 不可用时靠 TTL 兜底
+            logger.warning("失效 QA 标题链缓存失败 script=%s: %s", script_id, exc)
+
+        logger.info("删除剧本 %s（含导入副作用清理）", script_id)
         await self._invalidate_list_cache()
+
+    async def _delete_guide_object(
+        self, ref: DMGuideRef, *, script_id: str, user_id: str
+    ) -> None:
+        """软删手册文件记录，并按引用计数物理删除 OSS 对象（尽力而为）。"""
+        try:
+            # a) 软删与本次导入绑定的文件记录：软删带 user_id 过滤，
+            #    不属于当前用户的文件自然 no-op，绝不错删。
+            if ref.file_id:
+                await self.files.soft_delete(ref.file_id, user_id)
+
+            # b) 引用计数 = files 表未删除记录 + 其它剧本的 dmGuide 引用，
+            #    全部为 0 才物理删除 OSS 对象。
+            remaining = await self.files.count_references(ref.object_key)
+            remaining += await self.repo.count_dm_guide_refs(
+                ref.object_key, exclude_script_id=script_id
+            )
+            if remaining == 0:
+                await self.oss.delete_object(ref.object_key)
+                logger.info("物理删除手册对象 %s", ref.object_key)
+            else:
+                logger.info(
+                    "手册对象 %s 仍被 %d 处引用，跳过物理删除", ref.object_key, remaining
+                )
+        except Exception as exc:  # noqa: BLE001 - 文件清理失败留给清理任务兜底
+            logger.warning("清理手册文件失败 key=%s: %s", ref.object_key, exc)
 
     # ================= 内部：校验 =================
     async def _assert_codes(
