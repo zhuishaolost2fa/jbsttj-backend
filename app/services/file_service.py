@@ -12,6 +12,7 @@ from app.core.security import CurrentUser
 from app.schemas.file import DownloadUrlResponse, FileInfo
 from app.services.oss import OSSService, get_oss_service
 from app.services.repository import FileRepository
+from app.services.script_service import purge_dm_guide_for_file
 from app.utils.files import (
     build_object_key,
     guess_content_type,
@@ -25,11 +26,14 @@ logger = logging.getLogger("app.file")
 
 class FileService:
     def __init__(
-        self, oss: Optional[OSSService] = None, settings: Optional[Settings] = None
+        self,
+        oss: Optional[OSSService] = None,
+        settings: Optional[Settings] = None,
+        files: Optional[FileRepository] = None,
     ) -> None:
         self.oss = oss or get_oss_service()
         self.settings = settings or get_settings()
-        self.files = FileRepository()
+        self.files = files or FileRepository()
 
     async def list_files(
         self, user: CurrentUser, *, keyword: Optional[str], limit: int, offset: int
@@ -69,6 +73,12 @@ class FileService:
         """软删除数据库记录；当没有其它记录引用该对象时才真正删除 OSS 对象。
 
         秒传会让多条记录共享同一个 object_key，所以物理删除必须先看引用计数。
+
+        删的若是某剧本的 DM 手册，还会**联动清空**该剧本的解析产物
+        （jobs / documents / chunks / qa / stories / highlights 全部物理删除，
+        剧本行保留、摘掉 ``extra.dmGuide`` 引用）—— 文件记录都没了，
+        解析产物留着只会让剧本详情挂一个失效的 DM 问答入口。
+        清理是 best-effort：失败只记日志，不影响文件删除本身。
         """
         row = await self.files.get(file_id, user_id=user.id)
         if not row:
@@ -76,9 +86,20 @@ class FileService:
 
         await self.files.soft_delete(file_id, user.id)
 
+        remaining = await self.files.count_references(row["object_key"])
+        object_dead = purge and remaining == 0
+
+        # DM 手册联动清理：fileId 直接命中必清；OSS 对象将物理删除时
+        # 连 objectKey 引用（秒传共享、旧记录无 fileId）一并作废。
+        try:
+            await purge_dm_guide_for_file(
+                file_id, str(row["object_key"]), object_dead=object_dead
+            )
+        except Exception as exc:  # noqa: BLE001 - 联动失败不阻塞文件删除
+            logger.warning("文件删除联动清理 DM 解析产物失败 file=%s: %s", file_id, exc)
+
         if not purge:
             return
-        remaining = await self.files.count_references(row["object_key"])
         if remaining == 0:
             try:
                 await self.oss.delete_object(row["object_key"])

@@ -811,6 +811,72 @@ def _format_duration(dmin: Optional[int], dmax: Optional[int]) -> Optional[str]:
     return f"{fmt(dmin)}-{fmt(dmax)}"
 
 
+async def purge_dm_guide_for_file(
+    file_id: str,
+    object_key: str,
+    *,
+    object_dead: bool = False,
+    repo: Optional[ScriptRepository] = None,
+) -> List[str]:
+    """删掉 DM 手册文件后，联动清空引用它的剧本的解析产物。
+
+    场景：用户从「我的文件」删掉手册 PDF/Word —— 文件记录没了，剧本
+    ``extra.dmGuide.fileId`` 指向死记录，解析产物（jobs / documents /
+    chunks / qa / stories / highlights）成了孤儿，必须一并清掉，否则
+    剧本详情还挂着已失效的 DM 问答入口。
+
+    与 :meth:`ScriptService.delete_script` 的清理口径一致（取消在跑任务 +
+    按叶子到根物理删 7 张表 + 摘 ``extra.dmGuide`` + 失效 QA 标题链缓存），
+    区别在于**剧本行保留**，只是失去手册能力、可重新上传导入。
+
+    匹配两级（见 ``find_dm_guide_scripts``）：主匹配 ``fileId``；仅当
+    OSS 对象也被物理删除（``object_dead``）时才把 ``objectKey`` 引用
+    一并作废，避免误伤秒传共享同一对象的其它存活剧本。
+
+    全程 best-effort：任一步失败只记日志，绝不让文件删除本身报错。
+    返回实际清理过的 script_id 列表。
+    """
+    repo = repo or ScriptRepository()
+    try:
+        scripts = await repo.find_dm_guide_scripts(
+            file_id, object_key=object_key, include_object_refs=object_dead
+        )
+    except Exception as exc:  # noqa: BLE001 - 查不到引用就当无联动，删除照常
+        logger.warning("查询 DM 手册引用剧本失败 file=%s: %s", file_id, exc)
+        return []
+
+    cleaned: List[str] = []
+    for row in scripts:
+        script_id = str(row["id"])
+        try:
+            store = store_mod.get_dm_store()
+            await run_in_threadpool(store.purge_script_side_effects, script_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清理 DM 解析产物失败 script=%s: %s", script_id, exc)
+
+        # 摘掉 extra.dmGuide（墓碑式引用会让详情页误判「已导入手册」）
+        extra = dict(row.get("extra") or {})
+        if "dmGuide" in extra or "dm_guide" in extra:
+            extra.pop("dmGuide", None)
+            extra.pop("dm_guide", None)
+            try:
+                await repo.update(script_id, {"extra": extra})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("摘除 dmGuide 引用失败 script=%s: %s", script_id, exc)
+
+        try:
+            dm_code = (slugify(str(row.get("title") or "")) or script_id).strip().lower()
+            await run_in_threadpool(
+                cache.bump_scope_version_sync, store_mod.qa_titles_cache_scope(dm_code)
+            )
+        except Exception as exc:  # noqa: BLE001 - Redis 不可用时靠 TTL 兜底
+            logger.warning("失效 QA 标题链缓存失败 script=%s: %s", script_id, exc)
+
+        cleaned.append(script_id)
+        logger.info("文件删除联动清理 DM 解析产物 script=%s file=%s", script_id, file_id)
+    return cleaned
+
+
 _service: Optional[ScriptService] = None
 
 

@@ -634,6 +634,32 @@ class ScriptRepository:
         )
         return total
 
+    async def find_dm_guide_scripts(
+        self, file_id: str, *, object_key: Optional[str] = None, include_object_refs: bool = False
+    ) -> List[Dict[str, Any]]:
+        """找出把该文件记录当 DM 手册引用的存活剧本（文件删除联动清理用）。
+
+        匹配两级：
+        - 主匹配：``extra.dmGuide.fileId == file_id``（明确指向被删的文件记录）；
+        - 兜底匹配：仅当 ``include_object_refs=True``（OSS 对象即将被物理删除，
+          秒传共享对象此时已无任何存活文件记录）时，才把 ``objectKey`` 引用
+          一并视为作废 —— 避免误伤仍指向其它文件记录的剧本。
+
+        返回行含 ``id / title / extra``，title 供缓存失效时派生 DM 聚合 code。
+        """
+        filters: Dict[str, str] = {"deleted_at": "is.null"}
+        if include_object_refs and object_key:
+            filters["or"] = (
+                f"(extra->dmGuide->>fileId.eq.{file_id},"
+                f"extra->dmGuide->>objectKey.eq.{object_key})"
+            )
+        else:
+            filters["extra->dmGuide->>fileId"] = f"eq.{file_id}"
+        rows, _ = await self.db.select_with_count(
+            TABLE_SCRIPTS, filters=filters, columns="id,title,extra", limit=100
+        )
+        return rows
+
     async def increment_view(self, script_id: str) -> Optional[int]:
         """剧本详情浏览 +1（数据库端原子自增，避免读-改-写竞态）。
 

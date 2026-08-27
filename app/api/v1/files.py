@@ -129,7 +129,14 @@ async def get_avatar(
     "/{file_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="删除文件",
-    description="软删除数据库记录；当没有其它记录引用该对象时，同步删除 OSS 上的实际文件。",
+    description=(
+        "软删除数据库记录；当没有其它记录引用该对象时，同步删除 OSS 上的实际文件。\n\n"
+        "若删的是某剧本的 **DM 主持人手册**，会联动清空该剧本的全部解析产物"
+        "（解析任务 / 文档 / 分块 / 问答 / 故事还原 / 划线评论，物理删除），"
+        "并摘掉剧本的 `dmGuide` 引用 —— 剧本行本身保留，可重新上传导入。"
+        "秒传共享同一对象的其它剧本不受影响（仅 `fileId` 直接命中才清理；"
+        "对象被物理删除时才扩大到 `objectKey` 级兜底匹配）。"
+    ),
 )
 async def delete_file(
     file_id: str = Path(description="文件 ID"),
