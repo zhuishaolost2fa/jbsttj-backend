@@ -69,6 +69,8 @@ create table if not exists public.scripts (
     created_by   uuid,
     created_at   timestamptz not null default now(),
     updated_at   timestamptz not null default now(),
+    -- 软删标记；删除动作（软删 / 恢复 / 物理删 与 DM 产物清理）
+    -- 统一收敛在 sql/script_delete.sql，改删除逻辑不要在本文件里加函数
     deleted_at   timestamptz,
 
     constraint uq_scripts_code unique (code),

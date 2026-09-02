@@ -57,6 +57,8 @@
 ├── sql/schema.sql              # Supabase 建表 + RLS + 索引（上传/文件相关）
 ├── sql/script_options.sql      # 剧本杀维度字典建表 + RLS + script_option_tree 视图
 ├── sql/scripts.sql             # 剧本库建表 + RLS + GIN/trgm 索引 + 校验触发器 + scripts_labeled 视图
+├── sql/script_delete.sql       # 剧本删除唯一权威实现：软删/恢复/物理删 + DM 产物清理 + OSS 引用计数 + 巡检
+├── sql/script_delete_runbook.sql  # 删单本剧本的操作手册（建函数跑前者，删数据照后者）
 ├── sql/dm_rag.sql              # DM 手册 RAG：文档/分块/问答表 + pgvector HNSW 索引 + 任务表
 ├── scripts/setup_oss.py        # 一键配置 OSS 跨域与碎片清理规则
 ├── scripts/setup_script_options.py  # 字典建表（直连 DDL）+ 灌种子数据

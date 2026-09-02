@@ -206,6 +206,10 @@ $$;
 -- 4. purge 扩展：force 重跑时清掉旧 story
 --    注意 story 上的划线是 set null 不是级联删除 —— 用户划线保留，
 --    等 T4 写完新 story 后调 reanchor_dm_highlights 重新挂接。
+--
+--    ⚠️ 本函数已被 sql/script_delete.sql 覆盖（那里是含容错判断的最终版，
+--       并对未建 story 表的库做 to_regclass 判空）。要改清理逻辑请去
+--       script_delete.sql，且本文件必须排在其之前执行。
 -- ------------------------------------------------------------
 create or replace function public.purge_dm_document(p_document_id uuid)
 returns void

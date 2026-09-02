@@ -127,6 +127,8 @@ class FileService:
         ``prefix`` 可覆盖默认的对象 key 前缀（settings.upload_prefix），
         例如头像上传传 ``"avatars"`` 以落到独立的命名空间，便于公开接口按 key 回源、
         也避免污染普通文件列表。
+        秒传（find_by_hash）同样按该前缀做命名空间隔离：临时文件不会复用永久对象，
+        反之亦然——否则临时对象被生命周期规则删除后会拖垮引用同一对象的永久文件。
         ``acl`` 可选，传入如 ``"public-read"`` 可将对象设为匿名可读（头像直链场景）；
         普通文件上传不传，保持 bucket 默认私有。
         """
@@ -145,7 +147,7 @@ class FileService:
         mime = guess_content_type(clean_name, content_type)
         file_hash = hashlib.sha256(data).hexdigest()
 
-        existing = await self.files.find_by_hash(user.id, file_hash)
+        existing = await self.files.find_by_hash(user.id, file_hash, key_prefix=prefix)
         if existing and int(existing.get("file_size") or 0) == len(data):
             meta = await self.oss.head_object(existing["object_key"])
             if meta:

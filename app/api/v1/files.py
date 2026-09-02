@@ -6,7 +6,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, Path, Query, Response, UploadFile, status
 
-from app.core.exceptions import NotFoundError
+from app.core.config import get_settings
+from app.core.exceptions import NotFoundError, ValidationError
 from app.core.security import CurrentUser, get_current_user
 from app.schemas.common import PageResult, Pagination
 from app.schemas.file import DownloadUrlResponse, FileInfo, SimpleUploadResponse
@@ -32,9 +33,23 @@ SIMPLE_UPLOAD_LIMIT = 20 * 1024 * 1024
 async def simple_upload(
     file: UploadFile = File(description="待上传文件"),
     filename: Optional[str] = Form(default=None, description="覆盖原始文件名"),
+    upload_type: str = Form(
+        default="permanent",
+        description=(
+            "对象命名空间：permanent 写入 uploads/ 长期保留；"
+            "temporary 写入 temp/，由 OSS 生命周期规则自动清理。"
+            "微信小程序端导入 DM 手册传 temporary，与 H5 分片链路保持一致。"
+        ),
+    ),
     user: CurrentUser = Depends(get_current_user),
     service: FileService = Depends(get_file_service),
 ) -> SimpleUploadResponse:
+    if upload_type not in {"permanent", "temporary"}:
+        raise ValidationError(
+            "upload_type 只能是 permanent 或 temporary", code="invalid_upload_type"
+        )
+    prefix = get_settings().temp_upload_prefix if upload_type == "temporary" else None
+
     data = await file.read()
     info = await service.simple_upload(
         user,
@@ -42,6 +57,7 @@ async def simple_upload(
         content_type=file.content_type,
         data=data,
         max_size=SIMPLE_UPLOAD_LIMIT,
+        prefix=prefix,
     )
     return SimpleUploadResponse(file=info)
 

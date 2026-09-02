@@ -511,6 +511,10 @@ $$;
 
 -- ------------------------------------------------------------
 -- 9. 清理函数：重新索引前先清空旧版本
+--
+--    ⚠️ 本函数已被 sql/script_delete.sql 覆盖（那里是含 stories/highlights
+--       与容错判断的最终版）。要改清理逻辑请去 script_delete.sql，
+--       并保证本文件的执行顺序排在其之前，否则会把旧版本覆盖回去。
 -- ------------------------------------------------------------
 create or replace function public.purge_dm_document(p_document_id uuid)
 returns void
