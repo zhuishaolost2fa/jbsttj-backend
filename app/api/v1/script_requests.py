@@ -53,7 +53,8 @@ async def create_request(
     user: CurrentUser = Depends(get_current_user),
     service: ScriptRequestService = Depends(get_script_request_service),
 ) -> ScriptRequestItem:
-    return await service.create(user.id, payload)
+    # user_email 仅用于运营通知标识发起人；匿名 / 无邮箱时退化为 user_id 前 8 位
+    return await service.create(user.id, payload, user_email=user.email)
 
 
 @router.get(

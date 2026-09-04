@@ -15,11 +15,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.core.config import get_settings
 from app.core.exceptions import ConflictError, DatabaseError, NotFoundError, ValidationError
+from app.services.notifier import get_notifier
 from app.schemas.common import Pagination
 from app.schemas.script_request import (
     ScriptRequestCreate,
@@ -68,7 +71,18 @@ class ScriptRequestService:
         self.scripts = scripts or ScriptRepository()
 
     # ================= 发起求解析 =================
-    async def create(self, user_id: str, payload: ScriptRequestCreate) -> ScriptRequestItem:
+    async def create(
+        self,
+        user_id: str,
+        payload: ScriptRequestCreate,
+        *,
+        user_email: Optional[str] = None,
+    ) -> ScriptRequestItem:
+        """发起求解析。
+
+        ``user_email`` 仅用于运营通知里标识发起人（缺省退化为 user_id 前 8 位），
+        不参与任何业务逻辑。
+        """
         title = (payload.script_title or "").strip()
         if not title:
             raise ValidationError("剧本名称不能为空", code="title_required")
@@ -92,12 +106,108 @@ class ScriptRequestService:
         # 3) 去重：同用户同剧本只有一条诉求
         existing = await self.repo.find_by_match_key(user_id, match_key)
         if existing is not None:
-            return await self._reuse_or_conflict(existing, match_key)
+            return await self._reuse_with_notify(existing, match_key, user_id, user_email)
 
-        # 4) 新建
-        row = await self._insert_request(user_id, script, match_key, title, payload.reason)
-        logger.info("新增求解析 user=%s script=%s title=%s", user_id, match_key, title)
-        return self._to_item(row, already_exists=False)
+        # 4) 新建（并发撞唯一约束时内部会退化成「复用 / 复活」，
+        #    由 already_exists 区分，避免两条路径重复通知）
+        item = await self._insert_request(
+            user_id, script, match_key, title, payload.reason, user_email=user_email
+        )
+        if not item.already_exists:
+            logger.info("新增求解析 user=%s script=%s title=%s", user_id, match_key, title)
+            self._fire_notify(item, match_key=match_key, user_id=user_id,
+                              user_email=user_email, revived=False)
+        return item
+
+    async def _reuse_with_notify(
+        self,
+        existing: Dict[str, Any],
+        match_key: str,
+        user_id: str,
+        user_email: Optional[str],
+    ) -> ScriptRequestItem:
+        """命中已有诉求时的一致性处理（复用 / 复活 / 拦截）＋ 复活通知。
+
+        「复活」（cancelled → pending）也是一次新的求解析意愿，但同一用户
+        反复取消-重开会刷屏，所以默认不推，由 NOTIFY_ON_REVIVE 显式打开。
+        """
+        was_cancelled = existing.get("status") == STATUS_CANCELLED
+        item = await self._reuse_or_conflict(existing, match_key)
+        if was_cancelled and item.status == STATUS_PENDING:
+            self._fire_notify(item, match_key=match_key, user_id=user_id,
+                              user_email=user_email, revived=True)
+        return item
+
+    # ================= 运营通知（旁路，失败不影响任何业务结果）=================
+    def _fire_notify(
+        self,
+        item: ScriptRequestItem,
+        *,
+        match_key: str,
+        user_id: str,
+        user_email: Optional[str],
+        revived: bool = False,
+    ) -> None:
+        """把「有人求解析」投递到后台任务，不等结果、不阻塞接口。
+
+        用 ``asyncio.create_task`` 而非 FastAPI 的 BackgroundTasks：通知挂在
+        service 层，这样无论从 HTTP 接口还是从内部调用 create，行为都一致。
+        任务内部自行兜住所有异常 —— 求解析已经落库成功，推送失败不该让
+        用户感知到（也不该让接口返回 500）。
+        """
+        settings = get_settings()
+        if not settings.notify_enabled:
+            return
+        if revived and not settings.notify_on_revive:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 非异步上下文（如脚本直调）直接跳过
+            logger.debug("无事件循环，跳过求解析通知")
+            return
+        loop.create_task(
+            self._notify_async(
+                item, match_key=match_key, user_id=user_id,
+                user_email=user_email, revived=revived,
+            )
+        )
+
+    async def _notify_async(
+        self,
+        item: ScriptRequestItem,
+        *,
+        match_key: str,
+        user_id: str,
+        user_email: Optional[str],
+        revived: bool,
+    ) -> None:
+        """通知的实际执行体：补一个「累计多少人求过」，再交给 Notifier。"""
+        try:
+            count = 0
+            try:
+                count = await self._pending_count(match_key)
+            except DatabaseError as exc:  # noqa: BLE001
+                logger.warning("统计累计求解析人数失败，通知里省略该字段: %s", exc)
+            result = await get_notifier().notify_script_request(
+                script_title=item.script_title,
+                script_id=item.script_id,
+                script_code=item.script_code,
+                reason=item.reason,
+                user_id=user_id,
+                user_email=user_email,
+                in_library=bool(item.script_id),
+                pending_count=count,
+                match_key=match_key,
+                revived=revived,
+            )
+            logger.info("求解析通知结果: %s", result)
+        except Exception:  # noqa: BLE001 - 兜底：通知的任何异常都不许冒泡
+            logger.exception("发送求解析通知时发生未预期异常")
+
+    async def _pending_count(self, match_key: str) -> int:
+        """同一剧本当前 pending 的诉求条数（含刚落库的这条）。"""
+        rows = await self.repo.leaderboard_rows()
+        return sum(1 for r in rows if (r.get("match_key") or "") == match_key)
 
     async def _insert_request(
         self,
@@ -106,7 +216,16 @@ class ScriptRequestService:
         match_key: str,
         title: str,
         reason: Optional[str],
-    ) -> Dict[str, Any]:
+        *,
+        user_email: Optional[str] = None,
+    ) -> ScriptRequestItem:
+        """落库一条新诉求，返回统一的出参模型。
+
+        并发下可能撞 ``uq_script_requests_user_script`` 唯一约束，此时退化成
+        「复用 / 复活」分支 —— 返回 ``already_exists=true`` 的 item。
+        （早前这里两条分支的返回类型不一致：新建返回 dict、冲突返回 item，
+        冲突路径上 ``_to_item`` 会拿不到 key 直接抛错，已统一为 item。）
+        """
         data: Dict[str, Any] = {
             "user_id": user_id,
             "match_key": match_key,
@@ -121,7 +240,7 @@ class ScriptRequestService:
             # 展示与榜单聚合都应以库内规范名称为准
             data["script_title"] = script.get("title") or title
         try:
-            return await self.repo.create(data)
+            row = await self.repo.create(data)
         except DatabaseError as exc:
             # 并发撞唯一约束：读回既有行，走统一分支，绝不报 500
             if not _is_unique_violation(exc, _UQ_USER_SCRIPT):
@@ -129,7 +248,8 @@ class ScriptRequestService:
             existing = await self.repo.find_by_match_key(user_id, match_key)
             if existing is None:
                 raise
-            return await self._reuse_or_conflict(existing, match_key)
+            return await self._reuse_with_notify(existing, match_key, user_id, user_email)
+        return self._to_item(row, already_exists=False)
 
     async def _reuse_or_conflict(
         self, existing: Dict[str, Any], match_key: str

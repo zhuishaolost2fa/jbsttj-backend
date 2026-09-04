@@ -505,6 +505,81 @@ Celery worker 是同步进程，直接复用同一套 `DMStore` 能少维护一�
 没填、队列挂了，都不该让「改个剧本简介」失败。所以 `maybe_trigger` 捕获全部异常只留
 日志；需要确定性结果（成功/失败）的调用方走显式 `POST .../dm-guide/ingest`。
 
+## 运营通知：有人求解析 → 微信推送
+
+用户在 H5 点「求解析」后（即 `POST /api/v1/scripts/requests` 真正**新建**一条诉求时），
+后端会把这件事推送到你的微信。通知是**旁路能力**：推送失败只写日志，绝不影响接口返回。
+
+### 三步启用（以 PushPlus 为例，最省事）
+
+1. 打开 <https://www.pushplus.plus/> → 微信扫码登录 → 首页复制你的 **token**；
+2. 在 `.env`（本地）/ Railway Variables（线上）加两行：
+
+   ```env
+   NOTIFY_ENABLED=true
+   NOTIFY_CHANNEL=pushplus
+   PUSHPLUS_TOKEN=你复制的token
+   ```
+
+3. 自检并收一条测试消息：
+
+   ```bash
+   python scripts/test_notify.py          # 真发一条
+   python scripts/test_notify.py --dry-run  # 只拼文案、不发包
+   ```
+
+   脚本会打印当前配置、缺失项，失败时给对应渠道的排查提示。
+
+### 四种渠道
+
+| 渠道 | 取值 | 拿 key 的成本 | 消息落在哪 | 适用 |
+| --- | --- | --- | --- | --- |
+| **PushPlus** | `pushplus` | 扫码登录拿 token，30 秒 | 微信「pushplus 推送助手」服务号 | **个人项目首选** |
+| Server酱 | `serverchan` | 扫码登录拿 SendKey | 微信「方糖」服务号 | 同上，备选 |
+| 企业微信群机器人 | `wecom_bot` | 群里加机器人，复制 Webhook | 企业微信群 | 已有企业微信、想多人收 |
+| 企业微信应用消息 | `wecom_app` | 建自建应用，要 CorpID/Secret/AgentID | 指定成员的「企业微信」 | 需要 @ 具体人；**注意要配可信 IP**，Railway 出口 IP 会变，不推荐 |
+
+### 配置项
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `NOTIFY_ENABLED` | `false` | 总开关。`false` 时所有通知只写日志，本地开发零副作用 |
+| `NOTIFY_CHANNEL` | `none` | `none` / `pushplus` / `serverchan` / `wecom_bot` / `wecom_app` |
+| `NOTIFY_TIMEOUT` | `8.0` | 推送 HTTP 超时（秒）。旁路能力，必须短 |
+| `NOTIFY_DEDUP_WINDOW` | `0` | 同一剧本的推送合并窗口（秒），`0`=不合并。防多人连求同一本刷屏 |
+| `NOTIFY_ON_REVIVE` | `false` | 取消后又重新求（复活）是否也推。默认关，避免反复取消-重开刷屏 |
+| `NOTIFY_CONSOLE_URL` | 空 | 正文末尾附的处理页链接，方便手机上直接点开 |
+| `PUSHPLUS_TOKEN` / `PUSHPLUS_TOPIC` / `PUSHPLUS_TEMPLATE` | — | topic=群组编码（一对多），留空只发给自己 |
+| `SERVERCHAN_SEND_KEY` / `SERVERCHAN_CHANNEL` | — | SendKey 形如 `SCTxxxx` |
+| `WECOM_BOT_WEBHOOK` / `WECOM_BOT_MENTIONED_MOBILES` | — | 手机号逗号分隔，群里 @ 人才强提醒 |
+| `WECOM_CORP_ID` / `WECOM_CORP_SECRET` / `WECOM_AGENT_ID` / `WECOM_TO_USER` | — | to_user 多成员用 `\|` 分隔，`@all` 全员 |
+
+### 触发时机（避免刷屏）
+
+| 场景 | 是否推送 |
+| --- | --- |
+| 首次求某个剧本（真正新建） | ✅ 推送 |
+| 重复点求解析（幂等返回既有记录） | ❌ 不推 |
+| 取消后重新求（复活） | 由 `NOTIFY_ON_REVIVE` 控制，默认 ❌ |
+| 剧本已解析（409 `script_already_parsed`） | ❌ 不推 |
+
+正文示例：
+
+```
+【有人求解析】病娇男孩的精分日记
+剧本：病娇男孩的精分日记
+来源：剧本库内
+编码：bing-jiao-nan-hai
+发起人：player@example.com
+理由：想要复盘线索
+累计：已有 3 人求过这本
+时间：2026-09-03 10:20:05
+环境：production
+```
+
+实现在 `app/services/notifier.py`：渠道通过 `_DISPATCH` 注册，新增渠道只需加一个协程 +
+一个成功判定分支；`Notifier.send()` 内部吞掉全部异常，调用方只拿 `NotifyResult`。
+
 ## 常见问题
 
 **`SignatureDoesNotMatch`**

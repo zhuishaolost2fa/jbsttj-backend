@@ -25,6 +25,18 @@ class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=10)
 
 
+class WechatLoginRequest(BaseModel):
+    """微信小程序登录：wx.login() 拿到的 code。
+
+    nickname / avatar_url 可选 —— 只在首次创建资料时写入，已存在则不覆盖，
+    避免用户改过昵称后每次登录都被重置回微信昵称。
+    """
+
+    code: str = Field(min_length=1, max_length=256)
+    nickname: Optional[str] = Field(default=None, max_length=30)
+    avatar_url: Optional[str] = Field(default=None, max_length=1024)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: Optional[str] = None
@@ -41,6 +53,9 @@ class ProfileResponse(BaseModel):
     role: str
     is_service: bool = False
     email_verified: bool = False
+    # 登录来源：None=邮箱注册；'wechat'=微信登录。
+    # 前端据此隐藏「修改密码 / 修改邮箱」—— 微信用户没有真邮箱，改了也没意义。
+    provider: Optional[str] = None
     nickname: Optional[str] = None
     avatar_url: Optional[str] = None
     avatar_color: int = 0

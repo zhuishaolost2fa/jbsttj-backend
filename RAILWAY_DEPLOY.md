@@ -200,6 +200,21 @@ POST /api/v1/dm/guides/{code}/ingest   # 例如 code=dm-bingjiao-nanhai
 - `OCR_DPI=130`
 - 各种 `DM_*` 参数（可保留默认值）
 
+### E. 运营通知（有人求解析 → 微信推送，可选）
+
+线上有人点「求解析」时把消息推到你微信。**通知是旁路能力，不配也能正常跑**，
+配了不影响任何接口：
+
+```env
+NOTIFY_ENABLED=true
+NOTIFY_CHANNEL=pushplus     # 推荐 pushplus；备选 serverchan / wecom_bot / wecom_app
+PUSHPLUS_TOKEN=你的token     # https://www.pushplus.plus/ 扫码登录 → 首页复制
+NOTIFY_ON_REVIVE=false
+```
+
+`NOTIFY_ENABLED=false`（默认）时只写日志。配好后重新部署，用
+`python scripts/test_notify.py` 在本地验一遍连通性（脚本会读同一份变量）。
+
 > 不要直接上传本地 `.env` 到 Railway。本地 broker/redis 指向 `127.0.0.1`，上云必须指向 Railway Redis。推荐用 Railway Variables 的 **Raw Editor** 批量粘贴，但记得把 broker/backend/dedup 三处 `127.0.0.1` 手动换成 `${{REDIS_URL}}/N`。
 
 ## 当前本地状态备忘

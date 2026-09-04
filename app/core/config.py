@@ -16,6 +16,10 @@ def _split_csv(raw: Optional[str]) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# 支持的运营通知渠道；none 表示只写日志（默认，未配置时零副作用）
+_NOTIFY_CHANNELS = {"none", "pushplus", "serverchan", "wecom_bot", "wecom_app"}
+
+
 class Settings(BaseSettings):
     # 分层加载：.env 为共享基线，.env.local 为本地联调私有覆盖（已被 gitignore）。
     # pydantic-settings 按列表顺序读取，后读的文件优先级更高 —— 即 .env.local 覆盖 .env，
@@ -43,6 +47,16 @@ class Settings(BaseSettings):
     supabase_jwt_secret: str = ""
     supabase_jwks_url: str = ""
     supabase_jwt_audience: str = "authenticated"
+
+    # ---------------- 微信小程序登录 ----------------
+    # 微信公众平台 → 开发管理 → 开发信息 里拿。留空则 /auth/wechat/login 直接
+    # 报 503，不影响 H5 端的邮箱登录 —— 微信登录是可选能力，不进 missing_required()。
+    wechat_appid: str = ""
+    wechat_app_secret: str = ""
+    # 派生「微信用户 → GoTrue 账号」确定性密码的 HMAC 密钥，留空则回落到
+    # SUPABASE_JWT_SECRET。⚠️ 上线后不要改：一旦改动，所有存量微信用户的派生
+    # 密码都会变，导致 password grant 失败（虽有重置兜底，但会全量抖动）。
+    wechat_link_secret: str = ""
 
     # ---------------- 阿里云 OSS ----------------
     oss_access_key_id: str = ""
@@ -103,6 +117,50 @@ class Settings(BaseSettings):
 
     # ---------------- 服务间调用 ----------------
     service_api_key: str = ""
+
+    # ---------------- 运营通知（有人求解析 → 推送到微信）----------------
+    # 总开关：false 时所有通知降级为「只写日志」，绝不阻塞业务接口。
+    notify_enabled: bool = False
+    # 推送渠道：none(只记日志) / pushplus(推荐) / serverchan / wecom_bot / wecom_app
+    notify_channel: str = "none"
+    # 单次推送的 HTTP 超时（秒）。微信推送属于旁路，超时必须短，不能拖慢接口
+    notify_timeout: float = 8.0
+    # 同一剧本的推送合并窗口（秒）：窗口内重复求同一本只推一次，0=不合并。
+    # 合并计数存在进程内存里，重启即失效（仅用于防刷屏，非强一致）
+    notify_dedup_window: int = 0
+    # 取消后「复活」的求解析是否也推送（同一用户反复取消-重开会刷屏，默认关）
+    notify_on_revive: bool = False
+    # 推送正文里附带的落地页，方便手机上直接点开（留空则不展示）
+    notify_console_url: str = ""
+
+    # ---- PushPlus（pushplus.plus）----
+    # 微信扫码登录 → 复制 token；消息以「pushplus 推送助手」服务号下发到微信。
+    # 免费额度足够个人项目（每天 200 条）。
+    pushplus_token: str = ""
+    # 群组编码（一对多推送场景），留空=只发给自己
+    pushplus_topic: str = ""
+    # 正文模板：txt / html / markdown
+    pushplus_template: str = "txt"
+
+    # ---- Server酱（sct.ftqq.com）----
+    # 微信扫码登录 → 复制 SendKey（形如 SCTxxxxxx）；消息以「方糖服务号」下发。
+    serverchan_send_key: str = ""
+    # 可选通道号（如 9=方糖服务号），留空走默认通道
+    serverchan_channel: str = ""
+
+    # ---- 企业微信群机器人（webhook）----
+    # 群设置 → 群机器人 → 添加 → 复制 Webhook 地址。消息进群，微信需装企业微信。
+    wecom_bot_webhook: str = ""
+    # 要 @ 的人的手机号，逗号分隔（企业微信群里 @ 才会强提醒）
+    wecom_bot_mentioned_mobiles: str = ""
+
+    # ---- 企业微信应用消息（自建应用，推送给指定成员）----
+    # 需要在企业微信后台建自建应用，拿到 CorpID / Secret / AgentID；
+    # 接收人填成员 UserID，多个用 | 分隔，@all 表示全员。
+    wecom_corp_id: str = ""
+    wecom_corp_secret: str = ""
+    wecom_agent_id: str = ""
+    wecom_to_user: str = "@all"
 
     # ---------------- Celery / RabbitMQ / Redis ----------------
     # broker 走 RabbitMQ（可靠投递、支持多队列独立扩缩容），
@@ -265,6 +323,16 @@ class Settings(BaseSettings):
         """RAG 流水线是否具备最低运行条件。缺 Key 时接口要明确报错而不是静默失败。"""
         return bool(self.siliconflow_api_key and self.supabase_url and self.supabase_service_role_key)
 
+    @property
+    def wechat_login_enabled(self) -> bool:
+        """微信登录是否具备运行条件：需要小程序凭证 + 能建 GoTrue 账号。"""
+        return bool(self.wechat_appid and self.wechat_app_secret and self.supabase_service_role_key)
+
+    @property
+    def _wechat_link_key(self) -> str:
+        """派生微信账号密码的 HMAC 密钥，缺省回落 JWT Secret。"""
+        return self.wechat_link_secret or self.supabase_jwt_secret
+
     def missing_rag_config(self) -> List[str]:
         """返回 RAG 流水线缺失的配置项，供 /ready 与触发接口给出可操作提示。"""
         required = {
@@ -317,7 +385,43 @@ class Settings(BaseSettings):
             raise ValueError("DM_EXTRACT_PAGES_PER_SHARD 至少为 1")
         if self.embedding_batch_size < 1:
             raise ValueError("EMBEDDING_BATCH_SIZE 至少为 1")
+
+        # ---- 运营通知参数自洽性 ----
+        # 只校验取值合法性；凭证缺失不算致命错误（降级为只写日志），
+        # 避免少配一个 key 就起不来服务。
+        if self.notify_channel.lower() not in _NOTIFY_CHANNELS:
+            raise ValueError(
+                f"NOTIFY_CHANNEL 只能是 {' / '.join(sorted(_NOTIFY_CHANNELS))}"
+            )
+        if self.pushplus_template.lower() not in {"txt", "html", "markdown", "json"}:
+            raise ValueError("PUSHPLUS_TEMPLATE 只能是 txt / html / markdown / json")
+        if self.notify_timeout <= 0:
+            raise ValueError("NOTIFY_TIMEOUT 必须为正数")
+        if self.notify_dedup_window < 0:
+            raise ValueError("NOTIFY_DEDUP_WINDOW 不能为负数")
         return self
+
+    def missing_notify_config(self) -> List[str]:
+        """返回当前渠道缺失的凭证；渠道为 none 时返回 []。
+
+        供启动自检与 `scripts/test_notify.py` 给出可操作提示 —— 通知是旁路能力，
+        缺配置只降级不报错，所以这里不进 missing_required()。
+        """
+        channel = self.notify_channel.lower()
+        required: Dict[str, str] = {}
+        if channel == "pushplus":
+            required["PUSHPLUS_TOKEN"] = self.pushplus_token
+        elif channel == "serverchan":
+            required["SERVERCHAN_SEND_KEY"] = self.serverchan_send_key
+        elif channel == "wecom_bot":
+            required["WECOM_BOT_WEBHOOK"] = self.wecom_bot_webhook
+        elif channel == "wecom_app":
+            required = {
+                "WECOM_CORP_ID": self.wecom_corp_id,
+                "WECOM_CORP_SECRET": self.wecom_corp_secret,
+                "WECOM_AGENT_ID": self.wecom_agent_id,
+            }
+        return [k for k, v in required.items() if not v]
 
     def missing_required(self) -> List[str]:
         """返回缺失的关键配置项，用于启动自检与 /ready 探针。"""

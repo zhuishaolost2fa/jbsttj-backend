@@ -206,10 +206,15 @@ class SupabaseAuth:
         self._settings = settings or get_settings()
 
     def _headers(self) -> Dict[str, str]:
-        if not self._settings.supabase_anon_key:
-            raise ConfigError("未配置 SUPABASE_ANON_KEY，无法使用内置登录接口")
+        # GoTrue 只校验 apikey 是不是本项目的有效 key，anon 与 service_role 都接受。
+        # 优先用 anon（权限最小）；未配置时回落到 service_role，避免 anon key
+        # 缺失/失效（历史上有过占位符导致 register/login/refresh 全线 401）时
+        # 整条登录链路不可用。这是服务端内部调用，key 不会下发到客户端。
+        key = self._settings.supabase_anon_key or self._settings.supabase_service_role_key
+        if not key:
+            raise ConfigError("未配置 SUPABASE_ANON_KEY 或 SUPABASE_SERVICE_ROLE_KEY，无法使用内置登录接口")
         return {
-            "apikey": self._settings.supabase_anon_key,
+            "apikey": key,
             "Content-Type": "application/json",
         }
 
@@ -285,6 +290,34 @@ class SupabaseAuth:
             or "校验当前密码失败"
         )
         raise AuthError(str(message), status_code=502)
+
+    async def admin_create_user(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """用 service_role 创建用户，并**直接标记为邮箱已验证**。
+
+        与前端 /auth/register 的关键差异：这里必须传 email_confirm=True。
+        微信用户用的是占位邮箱 wx_xxx@wechat.local，永远收不到验证邮件，
+        未确认时 GoTrue 会直接拒绝 password grant，用户就再也登不进来。
+        """
+        url = f"{self._settings.supabase_auth_url}/admin/users"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json=attrs, headers=self._admin_headers())
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("message")
+                or detail.get("error_description")
+                or detail.get("msg")
+                or "创建账号失败"
+            )
+            raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
 
     async def admin_update_user(self, user_id: str, attrs: Dict[str, Any]) -> Dict[str, Any]:
         """调用 GoTrue 管理接口更新用户属性（密码 / 邮箱等）。

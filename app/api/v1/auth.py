@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, File, Request, UploadFile
 
 from app.core.exceptions import (
     AuthError,
+    ConfigError,
     ConflictError,
     DatabaseError,
     ValidationError,
@@ -34,8 +35,10 @@ from app.schemas.auth import (
     RefreshRequest,
     RegisterRequest,
     TokenResponse,
+    WechatLoginRequest,
 )
 from app.services.supabase import SupabaseAuth, SupabaseClient, get_supabase, get_supabase_auth
+from app.services.wechat import WeChatService, get_wechat_service
 from app.services.file_service import FileService, get_file_service
 from app.services.oss import OSSService, get_oss_service
 
@@ -95,6 +98,170 @@ async def refresh(
     return _to_token(data)
 
 
+# GoTrue 在邮箱被占用时返回 422 + 这类文案；用来识别「占位邮箱账号已存在」
+# 的恢复分支（例如上次建号成功但绑定表写入失败）。
+_EMAIL_EXISTS_HINTS = ("already registered", "already exists", "email_exists", "user_already_exists")
+
+
+@router.post("/wechat/login", response_model=TokenResponse, summary="微信小程序一键登录")
+async def wechat_login(
+    payload: WechatLoginRequest,
+    db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+    wx: WeChatService = Depends(get_wechat_service),
+) -> TokenResponse:
+    """用 wx.login 的 code 换取与 /auth/login **完全同构**的 TokenResponse。
+
+    链路：code → openid → 查绑定 → 未绑定则建 GoTrue 账号 → password grant。
+    返回的 token 由 GoTrue 签发，可直接用现有 /auth/refresh 续期，业务侧
+    （profiles / RLS / CurrentUser.id）零改动。
+
+    安全性：本接口不校验登录态（与 /auth/login 一致），安全性完全依赖 code
+    的一次性 —— 只有持有小程序 appsecret 的服务端才能兑换成功。
+    """
+    if not wx.enabled:
+        raise ConfigError("服务端未配置微信小程序凭证，微信登录不可用")
+    if not db.available:
+        raise DatabaseError("数据库未配置，无法完成微信登录", code="db_unavailable")
+
+    session = await wx.code2session(payload.code)
+    openid = str(session["openid"])
+    unionid = session.get("unionid")
+    email = wx.placeholder_email(openid)
+    password = wx.derive_password(openid)
+
+    identity = await db.select_one(
+        "user_identities",
+        filters={"provider": "eq.wechat", "provider_uid": f"eq.{openid}"},
+    )
+
+    if identity and identity.get("user_id"):
+        user_id = str(identity["user_id"])
+    else:
+        user_id = await _provision_wechat_user(
+            db=db,
+            auth=auth,
+            wx=wx,
+            openid=openid,
+            unionid=unionid,
+            email=email,
+            password=password,
+            session=session,
+            nickname=payload.nickname,
+            avatar_url=payload.avatar_url,
+        )
+
+    # password grant：拿真正的 GoTrue token
+    try:
+        data = await auth.sign_in(email, password)
+    except AuthError as exc:
+        if exc.status_code != 400:
+            raise
+        # 密码被外部改过（人工重置、账号重建）→ 用 admin 重置回确定性密码再试一次
+        logger.warning("微信用户 password grant 失败，重置密码后重试（openid=%s）", openid[:8] + "***")
+        await auth.admin_update_user(user_id, {"password": password})
+        data = await auth.sign_in(email, password)
+
+    # 回写登录时间，失败不影响登录结果
+    try:
+        await db.update(
+            "user_identities",
+            filters={"provider": "eq.wechat", "provider_uid": f"eq.{openid}"},
+            data={"last_login_at": "now()"},
+        )
+    except DatabaseError:  # noqa: BLE001
+        logger.warning("回写微信登录时间失败（openid=%s）", openid[:8] + "***")
+
+    logger.info("微信登录成功（user_id=%s）", user_id)
+    return _to_token(data)
+
+
+async def _provision_wechat_user(
+    *,
+    db: SupabaseClient,
+    auth: SupabaseAuth,
+    wx: WeChatService,
+    openid: str,
+    unionid: Optional[str],
+    email: str,
+    password: str,
+    session: Dict[str, Any],
+    nickname: Optional[str],
+    avatar_url: Optional[str],
+) -> str:
+    """首次登录：建 GoTrue 账号 + 写绑定表 + 播种 profiles，返回 user_id。"""
+    try:
+        created = await auth.admin_create_user(
+            {
+                "email": email,
+                "password": password,
+                # 占位邮箱永远收不到验证邮件，不预确认会导致 password grant 被拒
+                "email_confirm": True,
+                "user_metadata": {
+                    "provider": "wechat",
+                    "openid": openid,
+                    "unionid": unionid,
+                    "nickname": nickname,
+                    "avatar_url": avatar_url,
+                },
+            }
+        )
+        user_id = str(created.get("id") or "")
+    except AuthError as exc:
+        hint = f"{exc.message} {exc.code} {exc.details or ''}".lower()
+        if not any(h in hint for h in _EMAIL_EXISTS_HINTS):
+            raise
+        # 账号已存在（上次建号成功但绑定表没写进去）→ 用确定性密码登录反查 id。
+        # 避免一次网络抖动就把这个微信用户永久锁死在「建号失败」。
+        logger.warning("占位邮箱账号已存在，改用登录反查 user_id（openid=%s）", openid[:8] + "***")
+        data = await auth.sign_in(email, password)
+        user_id = str((data.get("user") or {}).get("id") or "")
+
+    if not user_id:
+        raise AuthError("创建微信账号失败", status_code=502)
+
+    await db.upsert(
+        "user_identities",
+        {
+            "user_id": user_id,
+            "provider": "wechat",
+            "provider_uid": openid,
+            "union_id": unionid,
+            "session_key": session.get("session_key"),
+            "session_key_updated_at": "now()",
+            # 只存去掉 session_key 后的快照，排障够用且不重复存敏感值
+            "raw": {k: v for k, v in session.items() if k != "session_key"},
+        },
+        on_conflict="provider,provider_uid",
+    )
+    await _seed_profile(db, user_id, nickname, avatar_url)
+    logger.info("微信用户首次登录（user_id=%s, openid=%s）", user_id, openid[:8] + "***")
+    return user_id
+
+
+async def _seed_profile(
+    db: SupabaseClient,
+    user_id: str,
+    nickname: Optional[str],
+    avatar_url: Optional[str],
+) -> None:
+    """首次登录播种 profiles。
+
+    已有资料时只补 provider，**不覆盖**用户自己改过的昵称 / 头像 ——
+    否则每次重新登录都会把改名冲掉。
+    """
+    existing = await db.select_one("profiles", filters={"id": f"eq.{user_id}"})
+    if existing is None:
+        seed: Dict[str, Any] = {"id": user_id, "provider": "wechat"}
+        if nickname:
+            seed["nickname"] = nickname
+        if avatar_url:
+            seed["avatar_url"] = avatar_url
+        await db.upsert("profiles", seed, on_conflict="id")
+    elif not existing.get("provider"):
+        await db.update("profiles", filters={"id": f"eq.{user_id}"}, data={"provider": "wechat"})
+
+
 async def _load_profile(db: SupabaseClient, user_id: str) -> Optional[Dict[str, Any]]:
     """读取用户个人资料；数据库不可用时返回 None 而不报错。"""
     if not db.available:
@@ -118,12 +285,16 @@ def _profile_response(
     email_verified: bool,
 ) -> ProfileResponse:
     """把鉴权身份与 profiles 行拼成统一的 ProfileResponse。"""
+    meta = user.claims.get("user_metadata") or {}
+    # 优先用 profiles.provider（自己写的、可控），token 里的 user_metadata 兜底
+    provider = (profile or {}).get("provider") or meta.get("provider")
     return ProfileResponse(
         id=user.id,
         email=user.email,
         role=user.role,
         is_service=user.is_service,
         email_verified=email_verified,
+        provider=provider,
         nickname=profile.get("nickname") if profile else None,
         avatar_url=profile.get("avatar_url") if profile else None,
         avatar_color=int(profile.get("avatar_color") or 0) if profile else 0,
