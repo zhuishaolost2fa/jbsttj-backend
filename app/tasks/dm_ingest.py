@@ -81,7 +81,7 @@ from app.services.dm_store import (
     qa_titles_cache_scope,
     to_pgvector,
 )
-from app.services.llm import QAPair, get_llm_client
+from app.services.llm import QAPair, StoryItem, SynthesisOverview, get_llm_client
 from app.services.script_service import slugify
 from app.services.pdf_extract import (
     ShardResult,
@@ -963,6 +963,90 @@ def embed_and_store(
     return {"chunks": len(chunk_rows), "qa": len(qa_rows), "stories": len(story_rows)}
 
 
+def _run_synthesis(
+    store: "store_mod.DMStore",
+    *,
+    document_id: str,
+    script_id: str,
+    script_code: str,
+    script_title: str = "",
+) -> None:
+    """finalize 末尾调用：拿全量 StoryItem 合成一篇 5 节复盘文章。
+
+    设计要点：
+      - 与 finalize 解耦：失败仅记日志、不抛异常，让 job 状态正常翻 completed；
+      - 与 story_extraction 互补：前者抽「碎片卡片」，这里把它们「串成完整文章」；
+      - 拿不到 StoryItem 就跳过（极少见，除非纯手册目录）；LLM 解析失败也跳过；
+      - 调 ``store.set_synthesis_status`` 把状态写到 documents 表，前端可据此展示
+        「合成文章生成中」「已生成」徽标（v1 暂未在前端展示，但状态机已就位）。
+    """
+    if not script_title:
+        # 兼容老剧本：script_title 不在 finalize 入参里时，从 scripts 表反查
+        script_title = store.get_script_title(script_id)
+
+    try:
+        rows = store.list_stories_for_synthesis(document_id)
+    except DatabaseError as exc:
+        logger.warning("合成文章准备：拉 StoryItem 失败 doc=%s: %s", document_id, exc)
+        return
+
+    if not rows:
+        logger.info("合成文章：doc=%s 无 StoryItem，跳过", document_id)
+        return
+
+    items: List[StoryItem] = []
+    for r in rows:
+        items.append(
+            StoryItem(
+                story_type=str(r.get("story_type") or "other"),
+                title=str(r.get("title") or ""),
+                content=str(r.get("content") or ""),
+                summary=str(r.get("summary") or ""),
+                meta=r.get("meta") if isinstance(r.get("meta"), dict) else {},
+            )
+        )
+
+    store.set_synthesis_status(document_id, store_mod.SYNTHESIS_GENERATING)
+    overview: SynthesisOverview = get_llm_client().generate_synthesis(
+        items, script_title=script_title
+    )
+
+    if overview.is_empty():
+        store.set_synthesis_status(document_id, store_mod.SYNTHESIS_FAILED)
+        logger.warning(
+            "合成文章：doc=%s LLM 返回空，标记 failed（前端会回退到故事卡片）",
+            document_id,
+        )
+        return
+
+    # 取真实调用的模型名（settings.siliconflow_qa_model 优先），方便排查
+    settings = get_settings()
+    model_name = settings.siliconflow_qa_model or settings.siliconflow_chat_model
+
+    saved = store.upsert_synthesis(
+        document_id=document_id,
+        synopsis=overview.synopsis,
+        trick=overview.trick,
+        timeline=overview.timeline,
+        roles=overview.roles,
+        ending=overview.ending,
+        anchor_stories=overview.anchor_stories,
+        model=model_name,
+        prompt_version="v1",
+    )
+
+    if saved:
+        store.set_synthesis_status(document_id, store_mod.SYNTHESIS_READY)
+        filled = sum(1 for _, body in overview.sections() if body)
+        logger.info(
+            "合成文章：doc=%s 完成（%s/5 节非空，model=%s）",
+            document_id, filled, model_name,
+        )
+    else:
+        store.set_synthesis_status(document_id, store_mod.SYNTHESIS_FAILED)
+        logger.error("合成文章：doc=%s upsert 失败", document_id)
+
+
 # ============================================================
 # 收尾与错误处理
 # ============================================================
@@ -1040,6 +1124,19 @@ def finalize(
                 "划线重锚定 doc=%s: 重挂 %s 条，仍孤立 %s 条",
                 document_id, anchor.get("relined", 0), anchor.get("still_orphaned", 0),
             )
+
+    # 合成文章（dm.synthesize_overview）：拿全量 StoryItem 二次加工成 5 节复盘文章。
+    # 与 finalize 解耦 —— 失败仅记日志、不影响 job 翻 completed；前端会回退到故事卡片。
+    # 这次生成的目的是把「碎片卡片」拼成「完整复盘文章」（用户痛点：散乱），所以是
+    # finalize 后的标准步骤，不是可选项；没故事条目的手册直接跳过。
+    if story_count:
+        _run_synthesis(
+            store,
+            document_id=document_id,
+            script_id=script_id,
+            script_code=script_code,
+            script_title=script_title,
+        )
 
     batches = len(results) if results else 0
     logger.info(

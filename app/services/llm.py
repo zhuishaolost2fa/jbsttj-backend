@@ -32,7 +32,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -130,6 +130,49 @@ class StoryItem:
             meta=meta,
             source_index=int(data.get("source_index", 0)),
         )
+
+
+@dataclass
+class SynthesisOverview:
+    """「整本剧本脉络」的合成文章 —— LLM 在所有 chunks 入库后二次加工产物。
+
+    与 :class:`StoryItem` 的关系：StoryItem 是「按片段抽出的颗粒条目」（按手册行文顺序），
+    适合检索/划线锚定/共读时间线，但读起来像碎片卡片；SynthesisOverview 是把同一批
+    StoryItem 串起来的**完整复盘文章**，5 节结构对应主持人带本结束后的标准复盘顺序：
+    梗概 → 核心诡计 → 时间线 → 角色命运 → 结局。
+
+    ``anchor_stories`` 记每节引用的 StoryItem title 列表，前端点「展开细节」时按 title
+    在 document_id 范围内定位回原 stories 行 —— 无须强制外键，重跑换文档也兼容。
+    """
+
+    synopsis: str = ""
+    trick: str = ""
+    timeline: str = ""
+    roles: str = ""
+    ending: str = ""
+    anchor_stories: Dict[str, List[str]] = None  # type: ignore[assignment]
+
+    # 关联到的 StoryItem 原始列表（来源回溯/调试用，不入库）
+    source_stories: List[StoryItem] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.anchor_stories is None:
+            self.anchor_stories = {}
+        if self.source_stories is None:
+            self.source_stories = []
+
+    def is_empty(self) -> bool:
+        return not any([self.synopsis, self.trick, self.timeline, self.roles, self.ending])
+
+    def sections(self) -> List[Tuple[str, str]]:
+        """按固定顺序返回 [(key, body), ...]，便于渲染和向量检索。"""
+        return [
+            ("synopsis", self.synopsis),
+            ("trick", self.trick),
+            ("timeline", self.timeline),
+            ("roles", self.roles),
+            ("ending", self.ending),
+        ]
 
 
 # ============================================================
@@ -270,6 +313,203 @@ def parse_qa_response(content: str, *, max_index: int) -> List[QAPair]:
             )
         )
     return pairs
+
+
+# ============================================================
+# 故事还原合成文章（dm.synthesize_overview 任务）
+# ------------------------------------------------------------
+# 与 story_extraction 的关系：
+#   - 故事抽取：每个 chunk（~800 字）一次 LLM，输出 0~N 条颗粒条目（按手册行文顺序），
+#     适合检索 / 划线锚定 / 共读时间线，但读起来像碎片卡片。
+#   - 合成文章：所有 chunks 入库后，LLM 拿全量 StoryItem 二次加工成**完整复盘文章**，
+#     5 节结构对应主持人带本结束后的标准复盘顺序。prompt 强调「忠于原文」「5 节各 150-300 字」
+#     「不写手册外细节」，避免 LLM 在二次加工时编造。
+# ============================================================
+_SYNTHESIS_SYSTEM_PROMPT = """你是一名资深的剧本杀内容编辑，擅长把零散的「故事还原条目」整合成一篇**完整的剧本脉络复盘文章**。
+
+你的任务：把已经整理出来的若干条「故事还原条目」按照剧本本身的故事节奏，重新串联、扩写、润色，形成一篇结构完整、读起来一气呵成的复盘文章。
+
+输出结构（5 节，固定顺序，每节 150~300 字，整篇 800~1500 字）：
+1. **synopsis（剧本梗概）**：故事背景、核心矛盾、人物群像的整体轮廓；
+2. **trick（核心诡计）**：本剧本最核心的真相揭示 ——「凶手是怎么做到的」「最关键的诡计/机制是什么」；
+3. **timeline（时间线）**：案发前 → 案发 → 后续，按时间顺序串起关键节点；
+4. **roles（角色命运）**：每个核心角色的关键抉择与最终归宿；
+5. **ending（结局）**：剧本落幕时的整体收束。
+
+约束：
+1. **严格忠于原文**：所有信息必须能追溯到所给条目内容；条目没写清的就写「手册未展开」或跳过；
+2. **不要编造**：禁止引入条目外的人名、时间、地点、物品、动机；
+3. **连贯叙述**：5 节之间要自然衔接 —— 梗概铺垫 → 诡计揭示 → 时间线收束 → 角色归位 → 结局落幕；
+4. **保留关键术语**：人名、地名、道具名、专有名词必须与条目原文一致；
+5. **anchor_stories**：每节列出你引用的 StoryItem 的 title 列表（直接照抄条目 title），便于前端做「展开细节」跳转。
+   - 不要为了凑数把所有 title 都塞进去，只列**本节实际用到**的核心条目；
+   - 如果某一节没有现成条目支撑（例如结局在手册里很简略），anchor_stories 对应节返回空数组 []。
+
+只输出 JSON 对象，不要任何解释文字、不要 markdown 围栏。
+格式：
+{
+  "synopsis": "...",
+  "trick": "...",
+  "timeline": "...",
+  "roles": "...",
+  "ending": "...",
+  "anchor_stories": {
+    "synopsis": ["条目1 title", "条目2 title"],
+    "trick": ["条目3 title"],
+    "timeline": ["条目4 title"],
+    "roles": ["条目5 title"],
+    "ending": []
+  }
+}"""
+
+
+def build_synthesis_user_prompt(
+    story_items: Sequence["StoryItem"],
+    *,
+    script_title: str = "",
+) -> str:
+    """拼装合成文章的 user prompt。
+
+    与 :func:`build_story_user_prompt` 不同：本任务**不需要原始 chunk 文本**，
+    只喂 StoryItem 列表（已 LLM 整理过一遍），让 LLM 专心做「串联 + 扩写 + 润色」。
+    输入量大幅压缩（105 条 StoryItem × ~300 字 ≈ 30K 字），模型上下文压力可控。
+    """
+    lines: List[str] = []
+    if script_title:
+        lines.append(f"剧本名称：《{script_title}》")
+    lines.append(
+        f"以下是从《{script_title or '该剧本'}》主持人手册里 LLM 整理出的"
+        f" {len(story_items)} 条故事还原条目（按手册行文顺序排列）。"
+    )
+    lines.append(
+        "请按照 system 中的 5 节结构，把它们整合成一篇完整、连贯的复盘文章。"
+    )
+    lines.append("")
+
+    # 按 story_type 分组排版：让 LLM 看到的素材有结构，便于它归位到对应章节
+    from collections import defaultdict
+    by_type: Dict[str, List["StoryItem"]] = defaultdict(list)
+    for item in story_items:
+        by_type[item.story_type].append(item)
+
+    type_order = ("timeline", "truth", "role", "clue", "ending", "other")
+    type_labels = {
+        "timeline": "时间线",
+        "truth":    "真相还原",
+        "role":     "角色背景",
+        "clue":     "线索关联",
+        "ending":   "结局收束",
+        "other":    "其他",
+    }
+
+    counter = 0
+    for st in type_order:
+        items = by_type.get(st)
+        if not items:
+            continue
+        lines.append(f"=== [{type_labels[st]}] ===")
+        for it in items:
+            counter += 1
+            loc = ""
+            if it.meta and isinstance(it.meta, dict):
+                # meta 里如果有 page 字段，附带给模型一点方位感
+                p = it.meta.get("page")
+                if p:
+                    loc = f" (P{p})"
+            lines.append(f"[{counter}] {it.title}{loc}")
+            lines.append(it.content)
+            if it.summary:
+                lines.append(f"  摘要：{it.summary}")
+            lines.append("")
+        # 保留未匹配的 type 类别兜底
+    leftovers = [it for st in type_order for it in by_type.get(st, [])]
+    handled = sum(len(by_type.get(st, [])) for st in type_order)
+    if handled < len(story_items):
+        for it in story_items[handled:]:
+            counter += 1
+            lines.append(f"[{counter}] {it.title}")
+            lines.append(it.content)
+            lines.append("")
+
+    lines.append(
+        "务必按 5 节结构输出 JSON，anchor_stories 的 title 必须与上面某条条目的 title"
+        " 完全一致（方便前端反查）。"
+    )
+    return "\n".join(lines)
+
+
+def parse_synthesis_response(
+    content: str,
+    *,
+    source_stories: Sequence["StoryItem"],
+) -> SynthesisOverview:
+    """解析合成文章的 JSON 输出，容错策略与 parse_qa_response 同构。
+
+    返回空对象表示整次生成失败（``is_empty()`` 为 True）—— 调用方应降级为
+    「合成文章不可用，前端只展示 StoryItem 卡片」，不影响整条流水线。
+    """
+    if not content or not content.strip():
+        return SynthesisOverview(source_stories=list(source_stories))
+
+    raw = content.strip()
+    fence = _JSON_FENCE.search(raw)
+    if fence:
+        raw = fence.group(1).strip()
+
+    data: Any = None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                logger.warning("合成文章 JSON 解析失败，原始输出前 200 字: %s", raw[:200])
+                return SynthesisOverview(source_stories=list(source_stories))
+        else:
+            logger.warning("合成文章响应中未找到 JSON 对象: %s", raw[:200])
+            return SynthesisOverview(source_stories=list(source_stories))
+
+    if not isinstance(data, dict):
+        return SynthesisOverview(source_stories=list(source_stories))
+
+    # 容错：有的模型会包一层 {"data": {...}}，剥一层
+    if not any(k in data for k in ("synopsis", "trick", "timeline", "roles", "ending")):
+        for key in ("data", "result", "overview", "synthesis"):
+            inner = data.get(key)
+            if isinstance(inner, dict):
+                data = inner
+                break
+
+    anchors_raw = data.get("anchor_stories") or {}
+    if not isinstance(anchors_raw, dict):
+        anchors_raw = {}
+
+    # 过滤 anchor_stories：只保留 source_stories 里实际存在的 title，避免 LLM
+    # 自己造的「看似合理的 title」写进 anchor 而前端反查不到
+    valid_titles = {it.title.strip() for it in source_stories if it.title.strip()}
+    anchors: Dict[str, List[str]] = {}
+    for section_key in ("synopsis", "trick", "timeline", "roles", "ending"):
+        v = anchors_raw.get(section_key) or []
+        if not isinstance(v, list):
+            anchors[section_key] = []
+            continue
+        cleaned: List[str] = []
+        for t in v:
+            if isinstance(t, str) and t.strip() in valid_titles:
+                cleaned.append(t.strip())
+        anchors[section_key] = cleaned
+
+    return SynthesisOverview(
+        synopsis=str(data.get("synopsis") or "").strip(),
+        trick=str(data.get("trick") or "").strip(),
+        timeline=str(data.get("timeline") or "").strip(),
+        roles=str(data.get("roles") or "").strip(),
+        ending=str(data.get("ending") or "").strip(),
+        anchor_stories=anchors,
+        source_stories=list(source_stories),
+    )
 
 
 # ============================================================
@@ -771,6 +1011,54 @@ class SiliconFlowClient:
         items = parse_story_response(content, max_index=len(chunks) - 1)
         logger.info("故事还原提取: %s 个片段 -> %s 条", len(chunks), len(items))
         return items
+
+    def generate_synthesis(
+        self,
+        story_items: Sequence[StoryItem],
+        *,
+        script_title: str = "",
+        max_retries: int = 2,
+    ) -> SynthesisOverview:
+        """拿全量 StoryItem 合成一篇 5 节复盘文章。
+
+        与 :meth:`generate_stories` 的差异：
+        - 输入：StoryItem 列表（已经 LLM 整理过的结构化条目），不再喂原始 chunks；
+        - 输出：一篇完整文章（SynthesisOverview），不是 0~N 条颗粒条目；
+        - 触发时机：finalize 阶段，全量入库之后，**只调一次**（不是每个 chunk 一次）。
+
+        失败降级：返回 ``is_empty()=True`` 的空对象，由调用方写日志、跳过 upsert，
+        不影响 finalize 的成功状态（前端会回退到现有 stories 卡片展示）。
+        """
+        if not story_items:
+            return SynthesisOverview(source_stories=list(story_items))
+        qa_model = self._settings.siliconflow_qa_model or self._settings.siliconflow_chat_model
+        user_prompt = build_synthesis_user_prompt(story_items, script_title=script_title)
+        messages = [
+            {"role": "system", "content": _SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            content = self.chat(
+                messages,
+                model=qa_model,
+                temperature=0.3,
+                max_tokens=8192,
+                max_retries=max_retries,
+                response_format_json=False,
+            )
+        except LLMError as exc:
+            logger.warning(
+                "合成文章生成失败（跳过：%s 条 StoryItem）: %s", len(story_items), exc
+            )
+            return SynthesisOverview(source_stories=list(story_items))
+
+        overview = parse_synthesis_response(content, source_stories=story_items)
+        logger.info(
+            "合成文章生成: %s 条 StoryItem -> %s 节非空",
+            len(story_items),
+            sum(1 for _, body in overview.sections() if body),
+        )
+        return overview
 
 
 # ============================================================

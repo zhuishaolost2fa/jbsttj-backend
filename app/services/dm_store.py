@@ -35,12 +35,19 @@ TABLE_JOBS = "script_dm_jobs"
 TABLE_QUESTIONS = "script_dm_questions"
 TABLE_STORIES = "script_dm_stories"
 TABLE_HIGHLIGHTS = "script_dm_highlights"
+TABLE_SYNTHESIS = "script_dm_synthesis"
 
 # 故事还原 / 划线评论的状态与可见性枚举（与 sql/dm_story.sql 保持一致）
 STORY_TYPES = ("timeline", "truth", "role", "clue", "ending", "other")
 HL_VISIBILITY = frozenset({"private", "public"})
 HL_STATUS_ACTIVE = "active"
 HL_STATUS_ORPHANED = "orphaned"
+
+# 合成文章生成状态：与 job.status 解耦 —— 失败不挡 finalize
+SYNTHESIS_PENDING = "pending"
+SYNTHESIS_GENERATING = "generating"
+SYNTHESIS_READY = "ready"
+SYNTHESIS_FAILED = "failed"
 
 # 问答标题链（qa-titles 接口）Redis 缓存的 scope 前缀。
 # API 侧读缓存、ingest 流水线写库后失效缓存都从这一处取，保证两端口径一致。
@@ -685,6 +692,115 @@ class DMStore:
             total = int(result.get("total") or 0)
             return items if isinstance(items, list) else [], total
         return [], 0
+
+    # ---------------- 故事还原合成文章 ----------------
+    def list_stories_for_synthesis(
+        self, document_id: str
+    ) -> List[Dict[str, Any]]:
+        """给合成文章任务用的：取一个文档下所有 StoryItem 的精简字段。
+
+        与 :meth:`list_stories`（按剧本聚合）不同 —— 这里按 **document** 取，
+        因为合成文章以 document 为粒度（同一剧本多版本时各版本独立成文）。
+        返回字段：title / story_type / content / summary / meta，
+        这些就是 LLM 二次加工所需的全部信息，避开 chunk_id 等无关字段。
+        """
+        resp = self._request(
+            "GET",
+            f"/{TABLE_STORIES}",
+            params={
+                "document_id": f"eq.{document_id}",
+                "select": "title,story_type,content,summary,meta,story_index",
+                "order": "story_index",
+                "limit": 500,
+            },
+        )
+        return self._rows(resp)
+
+    def upsert_synthesis(
+        self,
+        *,
+        document_id: str,
+        synopsis: str,
+        trick: str,
+        timeline: str,
+        roles: str,
+        ending: str,
+        anchor_stories: Optional[Dict[str, Any]] = None,
+        model: str = "",
+        prompt_version: str = "v1",
+    ) -> Optional[Dict[str, Any]]:
+        """调 RPC upsert_dm_synthesis：合成文章以 document_id 唯一，重跑即覆盖。
+
+        返回写入后的整行（含 created_at / updated_at），失败返回 None。
+        """
+        try:
+            result = self.rpc(
+                "upsert_dm_synthesis",
+                {
+                    "p_document_id": document_id,
+                    "p_synopsis": synopsis,
+                    "p_trick": trick,
+                    "p_timeline": timeline,
+                    "p_roles": roles,
+                    "p_ending": ending,
+                    "p_anchor_stories": anchor_stories or {},
+                    "p_model": model,
+                    "p_prompt_version": prompt_version,
+                },
+            )
+        except DatabaseError as exc:
+            logger.error("合成文章 upsert 失败 doc=%s: %s", document_id, exc)
+            return None
+        if isinstance(result, list) and result:
+            return result[0]
+        return result if isinstance(result, dict) else None
+
+    def get_synthesis(self, script_code: str) -> Optional[Dict[str, Any]]:
+        """按 script_code 拿当前活跃文档的合成文章。
+
+        走 RPC get_dm_synthesis：自动 join documents 过滤 is_active=true，
+        无合成文章时返回 null（前端降级为故事卡片列表）。
+        """
+        result = self.rpc(
+            "get_dm_synthesis",
+            {"p_script_code": script_code},
+        )
+        if isinstance(result, list):
+            return result[0] if result else None
+        return result if isinstance(result, dict) else None
+
+    def set_synthesis_status(self, document_id: str, status: str) -> None:
+        """更新 documents / jobs 的 synthesis_status 字段。"""
+        try:
+            self._request(
+                "PATCH",
+                f"/{TABLE_DOCUMENTS}",
+                params={"id": f"eq.{document_id}"},
+                json={"synthesis_status": status},
+            )
+        except DatabaseError as exc:
+            logger.warning("更新 documents.synthesis_status 失败 doc=%s: %s", document_id, exc)
+
+    def get_script_title(self, script_id: str) -> str:
+        """轻量查 scripts.title：合成文章 prompt 用作上下文。
+
+        documents 表没有 script_title（只有 script_code），且 ScriptService 是
+        async 的，finalize 跑在同步 Celery worker 里、起 event loop 太重。
+        一次单行 HTTP 查询就够，失败降级为空字符串（不影响合成文章生成）。
+        """
+        if not script_id:
+            return ""
+        try:
+            resp = self._request(
+                "GET",
+                "/scripts",
+                params={"id": f"eq.{script_id}", "select": "title", "limit": 1},
+            )
+            rows = self._rows(resp)
+            return str(rows[0].get("title") or "") if rows else ""
+        except DatabaseError as exc:
+            logger.warning("查 scripts.title 失败 script_id=%s: %s", script_id, exc)
+            return ""
 
     def get_story(self, story_id: str) -> Optional[Dict[str, Any]]:
         resp = self._request(

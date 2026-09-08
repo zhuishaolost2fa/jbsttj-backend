@@ -34,6 +34,7 @@ from app.schemas.dm_guide import (
     SearchResult,
     StoryDetail,
     StoryListResult,
+    SynthesisResult,
     UpdateHighlightRequest,
 )
 from app.services.dm_service import DMGuideService, get_dm_guide_service, script_dm_code
@@ -479,6 +480,31 @@ async def list_dm_stories(
     return await service.list_stories(
         script_code=resolved, script_title=name, story_type=story_type, limit=limit, offset=offset
     )
+
+
+@ask_router.get(
+    "/synthesis",
+    response_model=SynthesisResult,
+    response_model_by_alias=True,
+    summary="故事还原 · 合成文章（5 节复盘：梗概/诡计/时间线/角色/结局）",
+    description=(
+        "取剧本的「合成文章」—— 与 `/stories` 互补：\n"
+        "  - `/stories` 返回碎片化 StoryItem 列表（按手册行文顺序的颗粒条目）；\n"
+        "  - `/synthesis` 返回一篇 5 节连贯复盘文章（梗概 → 核心诡计 → 时间线 → 角色命运 → 结局），\n"
+        "    是 dm.synthesize_overview 任务在 finalize 末尾拿全量 StoryItem 二次加工的产物。\n\n"
+        "前端默认展示本文，下方「展开细节」抽屉才展开 StoryItem 卡片列表。\n"
+        "文章尚未生成时（status != ready）`overview` 为 null，前端降级为只展示故事卡片。\n\n"
+        "剧本标识与 `/stories` 同口径：`code` 优先，或传 `title`（剧本中文名）自动派生。\n"
+        "公开可读，无需登录。"
+    ),
+)
+async def get_dm_synthesis(
+    code: Optional[str] = Query(default=None, description="DM 聚合业务编码，优先级高于 title"),
+    title: Optional[str] = Query(default=None, description="剧本杀名称（中文名原文）"),
+    service: DMGuideService = Depends(get_dm_guide_service),
+) -> SynthesisResult:
+    resolved, name = _resolve_script_code(code, title)
+    return await service.get_synthesis(script_code=resolved, script_title=name)
 
 
 @ask_router.get(

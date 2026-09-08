@@ -566,6 +566,49 @@ class StoryListResult(BaseModel):
     items: List[StoryItem] = Field(default_factory=list, description="当前页条目")
 
 
+class SynthesisOverview(BaseModel):
+    """「整本剧本脉络」的合成文章 —— 与 script_dm_stories（碎片卡片）互补。
+
+    由 ``dm.synthesize_overview`` 任务在 finalize 末尾生成：以剧本为单位，
+    把全量 StoryItem 二次加工成 5 节复盘文章（梗概 / 诡计 / 时间线 / 角色命运 / 结局）。
+    前端默认展示本文，下方「展开细节」抽屉才展开现有 StoryItem 卡片。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    synopsis: str = Field(default="", description="剧本梗概：背景、核心矛盾、人物群像")
+    trick: str = Field(default="", description="核心诡计：剧本最关键的真相揭示")
+    timeline: str = Field(default="", description="时间线：案发前 → 案发 → 后续")
+    roles: str = Field(default="", description="角色命运：每个角色的关键抉择与归宿")
+    ending: str = Field(default="", description="结局：剧本落幕时的整体收束")
+    anchor_stories: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="每节引用的 StoryItem title 列表（前端做「展开细节」跳转用）",
+    )
+
+
+class SynthesisResult(BaseModel):
+    """剧本维度的合成文章读取响应。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    script_code: str = Field(description="DM 聚合业务编码")
+    script_title: Optional[str] = Field(default=None, description="剧本名（按名称查询时回显）")
+    document_id: Optional[str] = Field(default=None, description="所属文档 ID")
+    overview: Optional[SynthesisOverview] = Field(
+        default=None,
+        description="合成文章主体（尚未生成时为 null，前端降级为故事卡片列表）",
+    )
+    synthesis_status: str = Field(
+        default="pending",
+        description="生成状态：pending / generating / ready / failed",
+    )
+    model: Optional[str] = Field(default=None, description="生成所用的 LLM 模型")
+    prompt_version: Optional[str] = Field(default=None, description="prompt 版本号")
+    created_at: Optional[datetime] = Field(default=None, description="首次生成时间")
+    updated_at: Optional[datetime] = Field(default=None, description="最近更新时间")
+
+
 class HighlightRecord(BaseModel):
     """一条用户划线评论（Web Annotation 式文本锚点）。
 

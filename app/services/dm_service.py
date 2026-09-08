@@ -58,6 +58,8 @@ from app.schemas.dm_guide import (
     StoryDetail,
     StoryItem,
     StoryListResult,
+    SynthesisOverview,
+    SynthesisResult,
     UpdateHighlightRequest,
 )
 from app.services import dm_store as store_mod
@@ -1010,6 +1012,59 @@ class DMGuideService:
             script_title=script_title or None,
             total=total,
             items=[_to_story_item(r) for r in rows],
+        )
+
+    async def get_synthesis(
+        self,
+        *,
+        script_code: str,
+        script_title: str = "",
+    ) -> SynthesisResult:
+        """取剧本的「合成文章」（5 节复盘文章）。
+
+        与 :meth:`list_stories` 互补：
+          - list_stories 返回碎片化的 StoryItem 列表（颗粒度细、适合检索/划线）；
+          - get_synthesis 返回一篇 5 节文章（颗粒度粗、适合复盘/通读）。
+
+        同一剧本的「合成文章」与「故事条目列表」并存：前端默认展示本文，
+        下方抽屉里展开 StoryItem 卡片。合成文章尚未生成时（status != ready），
+        ``overview`` 为 null —— 前端降级为「只展示故事卡片列表」。
+
+        权限口径与 qa-titles / list_stories 一致：手册衍生内容，公开可读，无需登录。
+        """
+        code = (script_code or "").strip().lower()
+        if not code:
+            raise ValidationError("剧本标识缺失", code="script_code_required")
+        store = store_mod.get_dm_store()
+        row = await run_in_threadpool(store.get_synthesis, code)
+        if not row:
+            return SynthesisResult(
+                script_code=code,
+                script_title=script_title or None,
+                overview=None,
+                synthesis_status="pending",
+            )
+        anchors = row.get("anchor_stories") or {}
+        if not isinstance(anchors, dict):
+            anchors = {}
+        overview = SynthesisOverview(
+            synopsis=str(row.get("synopsis") or ""),
+            trick=str(row.get("trick") or ""),
+            timeline=str(row.get("timeline") or ""),
+            roles=str(row.get("roles") or ""),
+            ending=str(row.get("ending") or ""),
+            anchor_stories=anchors,
+        )
+        return SynthesisResult(
+            script_code=code,
+            script_title=script_title or None,
+            document_id=str(row.get("document_id") or "") or None,
+            overview=overview,
+            synthesis_status=str(row.get("synthesis_status") or "ready"),
+            model=str(row.get("model") or "") or None,
+            prompt_version=str(row.get("prompt_version") or "") or None,
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
         )
 
     async def get_story(
