@@ -847,7 +847,11 @@ def embed_and_store(
     inserted = store.insert_chunks(chunk_rows)
     # 按 content_hash 建映射而不是靠返回顺序：PostgREST 在 upsert 冲突时
     # 返回的行序不保证与请求一致，靠下标对齐会把 QA 挂到错误的 chunk 上
-    hash_to_id = {row.get("content_hash"): row.get("id") for row in inserted}
+    # ★ 这里必须 str()：VECTOR_BACKEND=local 时 insert_chunks 走本地 pgvector，
+    #   psycopg 把 id 反序列化成 uuid.UUID 对象；而 stories 表仍在 Supabase、
+    #   走 HTTP JSON 序列化，UUID 对象无法 json.dumps 会炸
+    #   「TypeError: Object of type UUID is not JSON serializable」。
+    hash_to_id = {row.get("content_hash"): str(row.get("id")) for row in inserted}
 
     # ---------- QA 向量 ----------
     qa_rows: List[Dict[str, Any]] = []
@@ -1050,12 +1054,19 @@ def finalize(
     }
 
 
-@_task(bind=True, name="dm.on_pipeline_error")
-def on_pipeline_error(self, request: Any, exc: Any = None, traceback: Any = None, *, job_id: str = "") -> None:
+@_task(name="dm.on_pipeline_error")
+def on_pipeline_error(request: Any, exc: Any = None, traceback: Any = None, *, job_id: str = "") -> None:
     """link_error 回调：把失败信息落到任务记录上。
 
     Celery 的错误回调签名是 (request, exc, traceback)，与普通任务不同。
     这里不重新抛出异常，否则错误处理器自身失败会淹没真正的错误原因。
+
+    **为什么不能加 ``bind=True``**：Celery 5.x 对 bind=True 的任务会把
+    ``__header__`` 包成 ``functools.partial(func, object())``（self 占位），
+    导致 ``_call_task_errbacks`` 里的 ``not isinstance(__header__, partial)``
+    判假，误走 old-signature 路径（只传 task_id），异常对象 ``exc`` 恒为
+    None，落库的 error_message 就变成无意义的「Error: None」、把真正的
+    失败原因吞掉。去掉 bind=True 后 __header__ 是普通函数，能正常拿到异常。
     """
     message = f"{type(exc).__name__ if exc else 'Error'}: {exc}"
     logger.error("DM 流水线失败 job=%s: %s", job_id, message)
