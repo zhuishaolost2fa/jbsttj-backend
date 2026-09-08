@@ -999,7 +999,7 @@ class DMGuideService:
         clean_ids = [str(i).strip() for i in (ids or []) if str(i).strip()]
         if clean_ids:
             store = store_mod.get_dm_store()
-            rows = await run_in_threadpool(store.get_stories_by_ids, clean_ids)
+            rows = await run_in_threadpool(store.list_story_cards_by_ids, clean_ids)
             # 只允许返回属于该剧本的条目，防止跨剧本 id 越权读取
             rows = [r for r in rows if str(r.get("script_code") or "").lower() == code]
             return StoryListResult(

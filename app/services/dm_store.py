@@ -717,10 +717,13 @@ class DMStore:
         )
         return self._rows(resp)
 
-    def get_stories_by_ids(
+    def list_story_cards_by_ids(
         self, story_ids: Sequence[str]
     ) -> List[Dict[str, Any]]:
-        """按 id 批量取故事条目（合成文章「查看本节关联碎片」用）。
+        """按 id 批量取故事条目（合成文章「查看本节关联碎片」用），返回列表。
+
+        注意别和 :meth:`get_stories_by_ids`（返回 ``{story_id: row}``，共读时间线用）
+        撞名 —— 两者语义不同：那个是「给划线补条目标题」的字典，这个是「取完整卡片」。
 
         为什么单独开一个方法而不是复用 :meth:`list_stories`：后者走 RPC
         ``list_dm_stories``（按剧本聚合 + 算公开划线数），要支持 id 过滤就得改
