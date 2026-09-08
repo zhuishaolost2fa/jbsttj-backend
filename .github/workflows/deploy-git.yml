@@ -29,7 +29,7 @@ on:
       - "requirements.txt"
       - "Dockerfile"
       - "docker-compose.prod.yml"
-      - "nginx.conf"
+      - "deploy/nginx.conf"
   workflow_dispatch:
     inputs:
       no_build:

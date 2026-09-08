@@ -21,3 +21,7 @@ env/
 
 # 本地记忆与会话数据，不进仓库
 .workbuddy/
+
+# 部署脚本运行时产物（服务器本地状态，不进仓库）
+.last_good_sha
+.last_good_image

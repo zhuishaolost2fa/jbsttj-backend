@@ -6,6 +6,7 @@
 #   ./scripts/deploy.sh --force      代码没变也强制重建
 #
 # 前置：/opt/jbs 必须是 git 仓库（git clone 出来的），且 .env 已在 .gitignore 里。
+# 运行时状态文件 .last_good_sha 也在 .gitignore 里，不会污染 git status。
 
 set -euo pipefail
 
