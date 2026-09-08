@@ -1,0 +1,70 @@
+name: Deploy (SSH + 服务器本地构建)
+
+# 取代「手动 scp 文件」的部署方式：
+#   push main → GitHub Actions SSH 到服务器 → git pull → 服务器本地构建 → 重启 → 健康检查 → 失败自动回滚
+#
+# 为什么在服务器本地构建，而不是在 Actions 里构建完推镜像：
+#   1. 免镜像仓库 —— 不用申请阿里云 ACR / 配 4 个 secrets，只要一个 SSH 私钥；
+#   2. 免传 1GB 镜像 —— Python 镜像加上依赖动辄 1GB，推拉都比本地构建慢；
+#   3. 顺带解决非代码文件 —— compose / nginx.conf / sql / scripts 一起被 git pull 带上去，
+#      镜像方案只同步「代码」，这些文件还是得手动传。
+#
+# 需要的 Secrets（仓库 Settings → Secrets and variables → Actions）：
+#   SSH_HOST   服务器公网 IP
+#   SSH_USER   登录用户（腾讯云 Ubuntu 镜像是 ubuntu）
+#   SSH_KEY    SSH 私钥全文（含 -----BEGIN/END 行），公钥要已在服务器 ~/.ssh/authorized_keys
+#   SSH_PORT   可选，默认 22
+#   APP_DIR    可选，服务器项目目录，默认 /opt/jbs
+#
+# 前提：服务器上的 /opt/jbs 必须是 git clone 出来的仓库，且 .env / frontend 不在 git 里（已 gitignore）。
+
+on:
+  push:
+    branches: [main]
+    # 只改文档/记忆时不触发部署
+    paths:
+      - "app/**"
+      - "sql/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "Dockerfile"
+      - "docker-compose.prod.yml"
+      - "nginx.conf"
+  workflow_dispatch:
+    inputs:
+      no_build:
+        description: "跳过构建，只拉代码并重启（改了 .env / nginx.conf 时用）"
+        type: boolean
+        default: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # 串行部署：两次 push 紧挨着时，后一次排队，避免两个 build 抢 CPU 或互相回滚
+    concurrency:
+      group: deploy-cn
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          APP_DIR: ${{ secrets.APP_DIR || '/opt/jbs' }}
+          FLAG: ${{ github.event.inputs.no_build == true && '--no-build' || '' }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 20m
+          envs: APP_DIR,FLAG
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+            # 首次部署时 deploy.sh 可能还没被 git 带上来，兜底从 GitHub 取
+            if [ ! -x scripts/deploy.sh ]; then
+              curl -fsSL -o scripts/deploy.sh \
+                https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/deploy.sh
+              chmod +x scripts/deploy.sh
+            fi
+            ./scripts/deploy.sh $FLAG

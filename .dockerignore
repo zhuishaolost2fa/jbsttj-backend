@@ -1,5 +1,9 @@
 # 本地密钥 / 虚拟环境 / 缓存 —— 绝不进镜像
+# 注意：必须显式列 .env.local / .env.* 通配。只写 .env 的话，
+# Dockerfile 的 `COPY . .` 会把本地联调用的 .env.local（含真实密钥）一起打进镜像，
+# 镜像一旦推到仓库（ACR / ghcr）就等于密钥泄露。
 .env
+.env.*
 .venv
 __pycache__
 *.pyc

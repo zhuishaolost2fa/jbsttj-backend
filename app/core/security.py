@@ -56,28 +56,46 @@ class JWKSCache:
         self._fetched_at: float = 0.0
         self._lock = asyncio.Lock()
 
-    async def _refresh(self) -> None:
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(self._url)
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("拉取 JWKS 失败: %s", exc)
-            raise AuthError("无法获取签名公钥，token 校验不可用", code="jwks_unavailable") from exc
+    # 拉取 JWKS 的正常耗时约 1.5 秒，10 秒已经很宽松；但实测仍会遇到偶发抖动
+    # 直接撞满超时 —— 表现为「第一次请求 401，刷新一下就好了」的偶发故障。
+    # 因此给一次重试：单次失败的概率不容忽视，连续两次都失败才算真故障。
+    _TIMEOUT = 10.0
+    _RETRIES = 2
 
-        keys, algs = {}, {}
-        for item in data.get("keys", []):
-            kid = item.get("kid")
-            if not kid:
-                continue
+    async def _refresh(self) -> None:
+        last: Optional[Exception] = None
+        for attempt in range(self._RETRIES):
             try:
-                keys[kid] = jwt.PyJWK.from_dict(item).key
-                algs[kid] = item.get("alg", "ES256")
+                async with httpx.AsyncClient(timeout=self._TIMEOUT) as client:
+                    resp = await client.get(self._url)
+                    resp.raise_for_status()
+                    data = resp.json()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("跳过无法解析的 JWK %s: %s", kid, exc)
-        self._keys, self._algs = keys, algs
-        self._fetched_at = time.monotonic()
+                last = exc
+                if attempt < self._RETRIES - 1:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+
+            keys, algs = {}, {}
+            for item in data.get("keys", []):
+                kid = item.get("kid")
+                if not kid:
+                    continue
+                try:
+                    keys[kid] = jwt.PyJWK.from_dict(item).key
+                    algs[kid] = item.get("alg", "ES256")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("跳过无法解析的 JWK %s: %s", kid, exc)
+            self._keys, self._algs = keys, algs
+            self._fetched_at = time.monotonic()
+            return
+
+        # 注意：失败时**不更新** _fetched_at，下次请求仍会重新拉取，不会把
+        # 一次网络抖动固化成长期故障。
+        logger.error("拉取 JWKS 失败（已重试 %d 次）: %s", self._RETRIES, last)
+        raise AuthError(
+            "无法获取签名公钥，token 校验不可用", code="jwks_unavailable"
+        ) from last
 
     async def get(self, kid: str) -> tuple[Any, str]:
         async with self._lock:
@@ -128,10 +146,17 @@ class JWTVerifier:
                     "verify_aud": bool(audience),
                     "require": ["exp", "sub"],
                 },
-                leeway=30,
+                leeway=self._settings.jwt_leeway_seconds,
             )
         except jwt.ExpiredSignatureError as exc:
             raise AuthError("登录已过期，请重新登录", code="token_expired") from exc
+        except jwt.ImmatureSignatureError as exc:
+            # iat 落在「未来」= 本机时钟落后于签发方，超过 leeway 就到这里。
+            # 常见诱因：本机时间未同步（实测比 Supabase 慢 66 秒）、虚拟机挂起后恢复。
+            raise AuthError(
+                "登录凭证暂时不可用，可能是本机时间与服务器不同步，请校准系统时间后重试",
+                code="token_not_yet_valid",
+            ) from exc
         except jwt.InvalidAudienceError as exc:
             raise AuthError("token 受众不匹配", code="invalid_audience") from exc
         except jwt.PyJWTError as exc:

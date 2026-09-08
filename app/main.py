@@ -16,7 +16,8 @@ from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import RequestContextMiddleware, setup_logging
-from app.services.supabase import supabase
+from app.services.supabase import supabase, supabase_auth
+from app.services.vector_store import reset_vector_store
 
 settings = get_settings()
 logger = logging.getLogger("app")
@@ -73,6 +74,11 @@ async def lifespan(app: FastAPI):
     await supabase.startup()
     yield
     await supabase.shutdown()
+    # GoTrue 连接池是懒创建的，只有真正调用过鉴权接口才存在
+    await supabase_auth.aclose()
+    # 本地向量库同样是懒创建的；不关的话 psycopg_pool 的后台线程会拖住进程退出，
+    # 容器 stop 时会看到 "couldn't stop thread 'pool-1-worker-N' within 5.0 seconds"
+    reset_vector_store()
     logger.info("服务已关闭")
 
 

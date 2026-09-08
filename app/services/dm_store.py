@@ -24,6 +24,7 @@ import httpx
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ConfigError, DatabaseError
+from app.services.vector_store import get_vector_store, to_pgvector  # noqa: F401
 
 logger = logging.getLogger("app.dm_store")
 
@@ -92,13 +93,9 @@ JOB_STATES = frozenset(
 )
 
 
-def to_pgvector(vector: Sequence[float]) -> str:
-    """把 Python 浮点列表转成 pgvector 的字面量 ``[0.1,0.2,...]``。
-
-    PostgREST 走 JSON，vector 类型收到 JSON 数组时会当成 text 解析失败，
-    必须自己拼成字符串再交给 PG 隐式转换。
-    """
-    return "[" + ",".join(f"{float(v):.7g}" for v in vector) + "]"
+# to_pgvector 已从 app.services.vector_store 导入并在此 re-export：
+# 向量字面量的拼法只有一份真相，本地库与 PostgREST 两条路径共用，
+# 历史调用方 ``from app.services.dm_store import to_pgvector`` 仍然可用。
 
 
 class DMStore:
@@ -133,6 +130,17 @@ class DMStore:
         if self._client is not None:
             self._client.close()
             self._client = None
+
+    def _vec(self) -> Optional[Any]:
+        """本地向量库实例；``VECTOR_BACKEND != local`` 时返回 None 走 Supabase。
+
+        chunks / qa 两张向量表下沉到同机 pgvector 后，检索从跨洋 200ms 降到
+        几毫秒。其余表（documents / jobs / stories / highlights / questions）
+        仍在 Supabase，两边由本类统一路由，上层无感。
+        """
+        if str(self._settings.vector_backend or "supabase").lower() != "local":
+            return None
+        return get_vector_store(self._settings)
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         try:
@@ -182,6 +190,7 @@ class DMStore:
         rows = self._rows(resp)
         if not rows:
             raise DatabaseError("文档记录写入后未返回数据")
+        self._sync_document_local(rows[0])
         return rows[0]
 
     def get_document(self, document_id: str) -> Optional[Dict[str, Any]]:
@@ -276,13 +285,29 @@ class DMStore:
         return rows[0] if rows else None
 
     def update_document(self, document_id: str, patch: Dict[str, Any]) -> None:
-        self._request(
+        # return=representation 而非 minimal：拿回完整行才能同步到本地影子表，
+        # 省掉一次回读（影子表要 is_active / deleted_at / object_key / created_at）
+        resp = self._request(
             "PATCH",
             f"/{TABLE_DOCUMENTS}",
             params={"id": f"eq.{document_id}"},
-            headers={"Prefer": "return=minimal"},
+            headers={"Prefer": "return=representation"},
             json=patch,
         )
+        rows = self._rows(resp)
+        if rows:
+            self._sync_document_local(rows[0])
+        else:
+            self._sync_document_local(
+                {
+                    "id": document_id,
+                    "script_id": patch.get("script_id"),
+                    "script_code": patch.get("script_code") or "",
+                    "object_key": patch.get("object_key") or "",
+                    "is_active": patch.get("is_active", True),
+                    "deleted_at": patch.get("deleted_at"),
+                }
+            )
 
     def deactivate_other_versions(
         self, script_id: str, keep_document_id: str, *, script_code: Optional[str] = None
@@ -303,6 +328,12 @@ class DMStore:
             headers={"Prefer": "return=minimal"},
             json={"is_active": False},
         )
+        vec = self._vec()
+        if vec is not None:
+            try:
+                vec.deactivate_other_versions(script_id, keep_document_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("影子表下线旧版本失败 script=%s: %s", script_id, exc)
 
     def deactivate_documents_not_matching(
         self, script_id: str, object_key: str, *, script_code: Optional[str] = None
@@ -329,6 +360,14 @@ class DMStore:
             headers={"Prefer": "return=minimal"},
             json={"is_active": False},
         )
+        vec = self._vec()
+        if vec is not None:
+            try:
+                vec.deactivate_documents_not_matching(
+                    script_id, object_key, script_code=script_code
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("影子表下线非当前文件失败 script=%s: %s", script_id, exc)
 
     def next_version(self, script_id: str) -> int:
         resp = self._request(
@@ -345,8 +384,18 @@ class DMStore:
         return int(rows[0].get("version", 0)) + 1 if rows else 1
 
     def purge_document(self, document_id: str) -> None:
-        """清空某文档已入库的 chunk 与 QA（重跑前调用）。"""
+        """清空某文档已入库的 chunk 与 QA（重跑前调用）。
+
+        Supabase 侧那一份仍会清（存量数据还没删，保持两边一致），
+        本地向量库那一份由 purge_local_document 负责。
+        """
         self.rpc("purge_dm_document", {"p_document_id": document_id})
+        vec = self._vec()
+        if vec is not None:
+            try:
+                vec.purge_document(document_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("本地向量库清档失败 doc=%s: %s", document_id, exc)
 
     def purge_script_side_effects(self, script_id: str) -> None:
         """物理删除某剧本的全部导入副作用（剧本删除时调用）。
@@ -381,6 +430,13 @@ class DMStore:
             TABLE_JOBS,
         ):
             self._request("DELETE", f"/{table}", params={"script_id": f"eq.{script_id}"})
+
+        vec = self._vec()
+        if vec is not None:
+            try:
+                vec.purge_script(script_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("本地向量库清理剧本失败 script=%s: %s", script_id, exc)
 
     # ---------------- 任务 ----------------
     def create_job(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -493,11 +549,14 @@ class DMStore:
     def insert_chunks(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """批量写入 chunk（含向量），按 (document_id, content_hash) 去重。
 
-        用 ``ignore-duplicates`` 而非 merge：重跑时同一段文本的向量不会变，
+        用 upsert 而非 ignore：重跑时同一段文本的向量不会变，
         没必要浪费一次写放大；返回体里拿到的仍是既有行的 id，外键照样能挂。
         """
         if not rows:
             return []
+        vec = self._vec()
+        if vec is not None:
+            return vec.insert_chunks(rows)
         resp = self._request(
             "POST",
             f"/{TABLE_CHUNKS}",
@@ -510,6 +569,10 @@ class DMStore:
     def insert_qa(self, rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not rows:
             return []
+        vec = self._vec()
+        if vec is not None:
+            # 本地库同样受不了同批次重复 key，去重逻辑在 vector_store 里做了一份
+            return vec.insert_qa(rows)
         # 同批次内若同一 question_hash 出现多次（模型在同一批里重复产出相同问句，
         # 多见于「每片段多生成」之后），PostgREST 的单条 ON CONFLICT DO UPDATE
         # 会报「cannot affect row a second time」直接 500，拖垮整条流水线。
@@ -534,6 +597,9 @@ class DMStore:
         return self._rows(resp)
 
     def count_chunks(self, document_id: str) -> int:
+        vec = self._vec()
+        if vec is not None:
+            return vec.count_chunks(document_id)
         resp = self._request(
             "GET",
             f"/{TABLE_CHUNKS}",
@@ -543,6 +609,9 @@ class DMStore:
         return _parse_content_range(resp.headers.get("Content-Range"))
 
     def count_qa(self, document_id: str) -> int:
+        vec = self._vec()
+        if vec is not None:
+            return vec.count_qa(document_id)
         resp = self._request(
             "GET",
             f"/{TABLE_QA}",
@@ -763,8 +832,27 @@ class DMStore:
         行序即手册的原始行文顺序（文档创建时间 → 块序号 → QA 创建时间），
         由 SQL 函数 list_dm_qa_titles 保证，应用层直接按 section_path 组装标题树。
         """
+        vec = self._vec()
+        if vec is not None:
+            return vec.list_qa_titles(script_code)
         result = self.rpc("list_dm_qa_titles", {"p_script_code": script_code})
         return result if isinstance(result, list) else []
+
+    def _sync_document_local(self, doc: Optional[Dict[str, Any]]) -> None:
+        """把文档行同步到本地影子表。
+
+        影子表只用于检索时过滤 is_active / deleted_at，主表仍在 Supabase，
+        所以同步失败**不阻断主流程** —— 记录错误即可，影子表可从主表重建。
+        """
+        if not doc or not doc.get("id"):
+            return
+        vec = self._vec()
+        if vec is None:
+            return
+        try:
+            vec.sync_document(doc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("文档影子表同步失败 doc=%s: %s", doc.get("id"), exc)
 
     # ---------------- 检索 ----------------
     def match_chunks(
@@ -777,6 +865,16 @@ class DMStore:
         match_count: int = 8,
         similarity_threshold: float = 0.25,
     ) -> List[Dict[str, Any]]:
+        vec = self._vec()
+        if vec is not None:
+            return vec.match_chunks(
+                embedding,
+                script_id=script_id,
+                script_code=script_code,
+                document_id=document_id,
+                match_count=match_count,
+                similarity_threshold=similarity_threshold,
+            )
         result = self.rpc(
             "match_dm_chunks",
             {
@@ -801,6 +899,17 @@ class DMStore:
         match_count: int = 8,
         similarity_threshold: float = 0.25,
     ) -> List[Dict[str, Any]]:
+        vec = self._vec()
+        if vec is not None:
+            return vec.match_qa(
+                embedding,
+                script_id=script_id,
+                script_code=script_code,
+                document_id=document_id,
+                category=category,
+                match_count=match_count,
+                similarity_threshold=similarity_threshold,
+            )
         result = self.rpc(
             "match_dm_qa",
             {

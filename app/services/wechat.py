@@ -5,17 +5,24 @@
 
 本模块刻意只保留登录必需的能力：
   - code2session：wx.login 的 code 换 openid / unionid / session_key
-  - placeholder_email / derive_password：把 openid 映射成 GoTrue 账号所需材料
+  - placeholder_email / random_password：建号时凑齐 GoTrue 要求的材料
 
 没有实现 getuserphonenumber：它要求企业主体 + 认证 + 单独付费，个人主体用不了，
 且本项目不做手机号绑定，引进来只是死代码。
+
+关于**为什么不再派生确定性密码**：早期实现用 HMAC(openid) 派生的固定密码走
+password grant。但 GoTrue 一个账号只有一个密码 —— 微信用户一旦绑定真实邮箱
+并设置自己的密码，两种登录方式就会互相顶掉。现在登录改用 magiclink 免密签发
+（见 SupabaseAuth.issue_session_for_user），密码只在建号时随机生成一次，此后
+不再使用，也就不存在冲突。
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import logging
+import secrets
+import string
 from typing import Any, Dict, Optional
 
 import httpx
@@ -49,18 +56,16 @@ class WeChatService:
             raise ConfigError("未配置 WECHAT_APPID / WECHAT_APP_SECRET，微信登录不可用")
 
     # ---------------- openid → GoTrue 账号材料 ----------------
-    def derive_password(self, openid: str) -> str:
-        """从 openid 派生可复现的登录密码（不落库，现算现用）。
+    @staticmethod
+    def random_password() -> str:
+        """建号时用的随机密码，**生成后不保存**。
 
-        微信用户没有密码，但 GoTrue 的 password grant 必须要密码。这里用
-        HMAC 从 openid 派生一个确定性密码：每次登录都能现算出来，改天换台
-        机器也不影响。30 位、含大小写与符号，满足 Supabase 密码强度要求。
+        GoTrue 建号要求带密码，但登录改走 magiclink 免密签发后用不到它。
+        刻意不保存、也不从 openid 派生：一旦可复现，就等于给账号留了一个
+        绕过微信身份校验的后门。
         """
-        key = self._settings._wechat_link_key
-        if not key:
-            raise ConfigError("未配置 WECHAT_LINK_SECRET 或 SUPABASE_JWT_SECRET，无法派生微信账号密码")
-        digest = hmac.new(key.encode("utf-8"), openid.encode("utf-8"), hashlib.sha256).hexdigest()
-        return "Jbs!wx" + digest[:24]
+        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+        return "Jbs!" + "".join(secrets.choice(alphabet) for _ in range(28))
 
     @staticmethod
     def placeholder_email(openid: str) -> str:

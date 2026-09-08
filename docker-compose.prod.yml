@@ -1,0 +1,299 @@
+# =============================================================================
+# 生产部署（国内 4G 轻量服务器）—— API + Celery Worker + Redis + RabbitMQ + pgvector
+#
+# 用法：
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+#   docker compose -f docker-compose.prod.yml --env-file .env logs -f worker
+#   docker compose -f docker-compose.prod.yml --env-file .env down
+#
+# 与本地开发用的 docker-compose.yml 的区别：
+#   - 那份只起 RabbitMQ + Redis，应用跑在宿主机；这份四个组件全在容器里。
+#   - 这份带内存上限、日志轮转、健康检查、端口收紧。
+#
+# 前提：
+#   1) 同目录有 .env（生产配置，见 docs/deploy-cn.md 的模板）
+#   2) 已开 2G swap（见文档）—— 4G 内存不开 swap，PDF 峰值会直接 OOM kill
+# =============================================================================
+
+# API 与 Worker 共用同一份构建定义（YAML 锚点），避免两处改漏。
+# 注意：**两个服务都必须有 build**。只给 api 配 build 而 worker 只写 image 的话，
+# compose 会先尝试从 registry 拉 jbsttj-backend:latest，而镜像站对本地 tag
+# 返回的是 403 而不是 404，构建会直接失败。
+x-backend-build: &backend-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    # 国内服务器构建时换成清华源，国外 CI 构建用默认
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    # Debian 官方源在国内会超时卡住构建，默认走阿里云镜像站。
+    # 实测腾讯云镜像站的 debian-security 同步滞后会超过 Valid-Until（2026-09-08 时
+    # 还是 08-31 的 InRelease），apt 直接 exit 100；阿里云当天已同步。
+    # 海外 CI 构建时在 .env 里设 APT_MIRROR= 留空即可。
+    APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
+
+services:
+  # ---------------------------------------------------------------- RabbitMQ
+  # 选型说明：本项目的 DM 流水线用了两处 chord（T1 分片汇聚、T3→T4 汇聚），
+  # chord 的回调计数器必须由 result backend 做原子自增，所以 backend 走 Redis；
+  # 而 broker 保留 RabbitMQ —— 换成 Redis broker 也能跑，但 chord 会退化成
+  # chord_unlock 轮询，worker 全挂时回调可能永远不触发，job 卡在 extracting。
+  # 省这 300MB 不值得。
+  rabbitmq:
+    # 必须是 -management 变体，否则没有 15672 管理后台（alpine 基础镜像默认不带插件）
+    image: ${RABBITMQ_IMAGE:-rabbitmq:3.13-management-alpine}
+    container_name: jbs-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-jbs}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-jbs123456}
+      # 内存高水位不在这里配。RABBITMQ_VM_MEMORY_HIGH_WATERMARK 在 3.13 已废弃，
+      # 一旦设置 RabbitMQ 会打印 "deprecated environment variables detected" 并拒绝启动
+      # （容器无限 Restarting，健康检查永远 unhealthy，api/worker 因 depends_on 起不来）。
+      # 官方默认值就是 0.4，与我们的预算一致，所以不配置即可。
+      # 真要改就挂 /etc/rabbitmq/rabbitmq.conf 写 vm_memory_high_watermark.relative = 0.4
+    ports:
+      # 只绑 127.0.0.1：broker 和管理后台绝不能暴露公网。
+      # 想看管理后台：ssh -L 15672:127.0.0.1:15672 root@你的IP
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    mem_limit: 640m
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - jbs-net
+
+  # ------------------------------------------------------------------- Redis
+  # 三个逻辑库：db0 = celery result backend / db1 = SimHash 去重指纹 / db2 = 业务缓存
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: jbs-redis
+    restart: unless-stopped
+    command: >-
+      redis-server
+      --maxmemory 200mb
+      --maxmemory-policy noeviction
+      --appendonly no
+      --save 900 1
+    # 为什么是 noeviction 而不是 allkeys-lru：
+    # chord 的汇聚计数器就存在 db0，内存一满被 LRU 淘汰掉，回调永远等不齐，
+    # 流水线会静默卡死（job 停在 extracting，没有任何报错）。
+    # noeviction 让写入直接报错，症状至少是显式的。result 本身有
+    # result_expires=86400 兜底，不会真的堆积。
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    mem_limit: 256m
+    logging: *default-logging
+    volumes:
+      - redis_data:/data
+    networks:
+      - jbs-net
+
+  # -------------------------------------------------------------- pgvector
+  # DM 手册的向量表（chunks / qa）下沉到同机 Postgres，检索从跨洋 ~200ms 降到 3~5ms。
+  #
+  # 为什么不继续放 Supabase：实测一次 match_dm_chunks 199ms，其中网络往返 179ms、
+  # DB 侧向量计算只有 20ms —— 瓶颈 100% 在网络，调索引参数毫无收益。
+  # 迁过来的只有向量表，scripts / documents / jobs / stories / highlights / questions
+  # 及 GoTrue 鉴权仍在 Supabase，见 docs/vector-optimization.md。
+  #
+  # 数据目录首次初始化时会自动执行挂载的 sql/local_vector.sql（建表 + 索引 + 检索函数），
+  # 已初始化过再重启不会重复执行（要改表结构得手动进容器执行或删卷重建）。
+  pgvector:
+    image: ${PGVECTOR_IMAGE:-pgvector/pgvector:pg16}
+    container_name: jbs-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGVECTOR_DB:-jbsvector}
+      POSTGRES_PASSWORD: ${PGVECTOR_PASSWORD:?请在 .env 中设置 PGVECTOR_PASSWORD}
+    command: >-
+      postgres
+      -c shared_buffers=128MB
+      -c work_mem=8MB
+      -c maintenance_work_mem=256MB
+      -c effective_cache_size=512MB
+      -c max_connections=50
+    ports:
+      # 只绑 127.0.0.1：向量库绝不暴露公网，容器间用服务名 pgvector 互访
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${PGVECTOR_DB:-jbsvector}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: 384m
+    logging: *default-logging
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+      # 10- 前缀保证在同一批 init 脚本里先执行（先建表再建函数）
+      - ./sql/local_vector.sql:/docker-entrypoint-initdb.d/10-local-vector.sql:ro
+    networks:
+      - jbs-net
+
+  # --------------------------------------------------------------------- API
+  api:
+    build: *backend-build
+    image: ${BACKEND_IMAGE:-jbsttj-backend:latest}
+    container_name: jbs-api
+    restart: unless-stopped
+    # 覆盖 Dockerfile 的 CMD（supervisord）：compose 里 web 与 worker 拆成独立容器，
+    # 各自崩了互不影响，也能单独 docker compose restart worker。
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+    # docker compose stop / up -d 重建容器时，先发 SIGTERM，等这么久才 SIGKILL。
+    # uvicorn 收到 SIGTERM 会停止接受新连接并等正在处理的请求跑完，30s 足够。
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      # 容器间用服务名互访，不要写 127.0.0.1
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-jbs}:${RABBITMQ_PASS:-jbs123456}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      CELERY_REDIS_URL: redis://redis:6379/1
+      CELERY_EAGER: "false"
+      # 向量库后端：local 走同机 pgvector，supabase 走 PostgREST（.env 里也要同步设置，
+      # 这里显式覆盖是为了保证容器里一定指向服务名 pgvector 而不是宿主机地址）
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-supabase}
+      VECTOR_DB_DSN: postgresql://postgres:${PGVECTOR_PASSWORD}@pgvector:5432/${PGVECTOR_DB:-jbsvector}
+    ports:
+      # 8000 而非 80：境内服务器 80/443 在未备案情况下会被拦截。
+      # 只绑 127.0.0.1 —— 外部一律走 nginx 服务的 80 端口，不直接暴露 API 端口。
+      # 服务器上要单独探活：curl http://127.0.0.1:8000/ready（照常可用）
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    mem_limit: 512m
+    logging: *default-logging
+    networks:
+      - jbs-net
+
+  # ------------------------------------------------------------------ Worker
+  # 与 API 共用同一个镜像，只换启动命令 —— 不用维护两份 Dockerfile。
+  worker:
+    # 必须与 api 用同一个构建定义，否则 compose 会尝试 pull 这个本地 tag
+    build: *backend-build
+    image: ${BACKEND_IMAGE:-jbsttj-backend:latest}
+    container_name: jbs-worker
+    restart: unless-stopped
+    command: >-
+      celery -A app.tasks worker
+      -Q dm.extract,dm.chunk,dm.qa,dm.embed,default
+      --pool=threads
+      --concurrency=6
+      --hostname=celery@%h
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+      --loglevel=info
+    # 优雅退出窗口，必须比最长的单个任务（dm.extract 分片）耗时长。
+    # Celery 收到 SIGTERM 会进入 warm shutdown：拒绝新任务、等手上的跑完再退出。
+    # 因为配了 task_acks_late + task_reject_on_worker_lost，即使超时被 SIGKILL，
+    # 任务也会重投不丢 —— 但已跑了 5 分钟的提取就白跑了，所以这里给足 5 分钟。
+    # 副作用：up -d 重建时最多会等这么久，部署耗时按最坏情况估。
+    stop_grace_period: 300s
+    # --pool=threads 而非 prefork 是刻意的：4 个 prefork worker = 13 个进程、
+    # 常驻 1.3GB 起，4G 机器必然 OOM。threads 池单进程约 400MB，
+    # 且 extract 用的 PyMuPDF 是 C 扩展会释放 GIL，并行度并不差。
+    # 代价：--max-memory-per-child / worker_max_tasks_per_child 在 threads 下不生效，
+    # 长跑内存增长靠容器 mem_limit + swap 兜底。
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-jbs}:${RABBITMQ_PASS:-jbs123456}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      CELERY_REDIS_URL: redis://redis:6379/1
+      CELERY_EAGER: "false"
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-supabase}
+      VECTOR_DB_DSN: postgresql://postgres:${PGVECTOR_PASSWORD}@pgvector:5432/${PGVECTOR_DB:-jbsvector}
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.tasks inspect ping -d celery@$$(hostname) --timeout 5 | grep -q OK"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+    mem_limit: 1536m
+    logging: *default-logging
+    networks:
+      - jbs-net
+
+  # ------------------------------------------------------------------ Nginx
+  # 前端 H5 静态托管 + /api 同源反代。作用有三：
+  #   1) 页面和接口同源（都是 80），彻底消除 CORS 预检与 HTTPS/HTTP 混合内容拦截
+  #   2) 前端不必知道后端地址，浏览器只跟 Nginx 打交道
+  #   3) 静态资源走本地磁盘，绕开 Vercel 海外 CDN
+  # 把 Taro H5 的 build 产物（dist/h5/*）放到 ./frontend/ 即可。
+  # 目录为空也能正常启动，只是访问 80 会 404，不影响后端。
+  nginx:
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: jbs-nginx
+    restart: unless-stopped
+    ports:
+      # 用 80 而非 8080：防火墙规则按端口逐条生效，轻量机模板默认已放行 80。
+      # 「未备案拦截」是按 HTTP Host 头识别**域名**的，纯 IP 访问不受影响
+      # （2026-09-08 在腾讯云轻量上实测 IP:80 公网可达，HTTP 200 / 51ms）。
+      # ⚠️ 将来绑了未备案的域名到 80 就会被拦；届时要么备案，要么改回 8080。
+      # 备案后上 Caddy 做 HTTPS 时，把这里改成 127.0.0.1 绑定、让 Caddy 占 80/443。
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ready || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    mem_limit: 128m
+    logging: *default-logging
+    networks:
+      - jbs-net
+
+volumes:
+  rabbitmq_data:
+  redis_data:
+  pgvector_data:
+
+networks:
+  jbs-net:
+    driver: bridge

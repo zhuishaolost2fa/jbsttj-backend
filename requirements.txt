@@ -22,6 +22,10 @@ alibabacloud-sts20150401>=1.0.0
 # ---- HTTP 客户端 (Supabase PostgREST / GoTrue / JWKS) ----
 httpx>=0.27.0
 
+# ---- 本地向量库（VECTOR_BACKEND=local 时连同机 pgvector，检索 200ms -> 3ms）----
+psycopg[binary]>=3.2
+psycopg_pool>=3.2
+
 # ---- DM 主持人手册 RAG 流水线 ----
 # 异步任务框架：四阶段流水线跑在 Celery worker 上（broker=RabbitMQ / backend=Redis）
 celery>=5.5.0

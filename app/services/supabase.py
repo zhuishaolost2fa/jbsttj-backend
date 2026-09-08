@@ -204,6 +204,37 @@ class SupabaseAuth:
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._settings = settings or get_settings()
+        # GoTrue 专用长连接池，懒创建。见 auth_client 属性的说明。
+        self._auth_http: Optional[httpx.AsyncClient] = None
+
+    @property
+    def auth_client(self) -> httpx.AsyncClient:
+        """GoTrue 请求复用的 client（懒创建，带 keep-alive 连接池）。
+
+        为什么不能写 `async with httpx.AsyncClient()`：
+        那会在**每次调用**时新建 TCP + TLS 连接。从国内服务器访问海外 Supabase，
+        单次 TLS 握手实测约 0.7s；而这里的方法（登录 / refresh / 微信免密签发 /
+        OTP / admin 用户管理）在一次业务请求里往往要打多次 GoTrue，
+        新建连接的开销会远超业务本身。复用连接池后只在首次握手。
+
+        两个前提（都已满足，改动因此不改变语义）：
+          1) 所有调用方传的都是绝对 URL，httpx 会忽略 base_url；
+          2) client 级 headers 只放 Content-Type，apikey / Authorization 由每次
+             请求的 headers 覆盖（httpx 请求级 headers 优先级高于 client 级）。
+        """
+        if self._auth_http is None:
+            self._auth_http = httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=10.0),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                headers={"Content-Type": "application/json"},
+            )
+        return self._auth_http
+
+    async def aclose(self) -> None:
+        """释放连接池。进程级单例正常退出可不调，测试里反复建实例时应调。"""
+        if self._auth_http:
+            await self._auth_http.aclose()
+            self._auth_http = None
 
     def _headers(self) -> Dict[str, str]:
         # GoTrue 只校验 apikey 是不是本项目的有效 key，anon 与 service_role 都接受。
@@ -221,8 +252,12 @@ class SupabaseAuth:
     async def _post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self._settings.supabase_auth_url}{path}"
         try:
-            async with httpx.AsyncClient(timeout=AUTH_REQUEST_TIMEOUT) as client:
-                resp = await client.post(url, json=payload, headers=self._headers())
+            resp = await self.auth_client.post(
+                url,
+                json=payload,
+                headers=self._headers(),
+                timeout=AUTH_REQUEST_TIMEOUT,  # 单独的 5s 超时，保持原语义
+            )
         except httpx.HTTPError as exc:
             # 连接超时 / 被防火墙丢弃等：典型为后端出网无法抵达 supabase.co
             # （如国内网络环境）。快速失败并返回明确错误，避免卡 15s 后冒泡成 500。
@@ -269,10 +304,9 @@ class SupabaseAuth:
         if not email:
             return False
         url = f"{self._settings.supabase_auth_url}/token?grant_type=password"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                url, json={"email": email, "password": password}, headers=self._headers()
-            )
+        resp = await self.auth_client.post(
+            url, json={"email": email, "password": password}, headers=self._headers()
+        )
         if resp.status_code == 200:
             return True
         if resp.status_code == 400:
@@ -299,8 +333,7 @@ class SupabaseAuth:
         未确认时 GoTrue 会直接拒绝 password grant，用户就再也登不进来。
         """
         url = f"{self._settings.supabase_auth_url}/admin/users"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, json=attrs, headers=self._admin_headers())
+        resp = await self.auth_client.post(url, json=attrs, headers=self._admin_headers())
         if resp.status_code >= 400:
             detail: Any
             try:
@@ -327,8 +360,7 @@ class SupabaseAuth:
         if not user_id:
             raise ValidationError("缺少用户标识，无法更新账号")
         url = f"{self._settings.supabase_auth_url}/admin/users/{user_id}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.put(url, json=attrs, headers=self._admin_headers())
+        resp = await self.auth_client.put(url, json=attrs, headers=self._admin_headers())
         if resp.status_code >= 400:
             detail: Any
             try:
@@ -356,8 +388,7 @@ class SupabaseAuth:
         if not user_id:
             raise ValidationError("缺少用户标识，无法读取账号")
         url = f"{self._settings.supabase_auth_url}/admin/users/{user_id}"
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, headers=self._admin_headers())
+        resp = await self.auth_client.get(url, headers=self._admin_headers())
         if resp.status_code >= 400:
             detail: Any
             try:
@@ -371,6 +402,182 @@ class SupabaseAuth:
                 or "读取账号失败"
             )
             raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
+
+    # ---------------- 免密码签发会话 ----------------
+    async def generate_link(self, email: str, link_type: str = "magiclink") -> Dict[str, Any]:
+        """用 service_role 生成一次性登录链接（**不会真的发邮件**）。
+
+        只接受 email，不接受 user_id（实测传 user_id 会 400
+        "An email address is required"），所以调用方要先拿到用户当前邮箱。
+        """
+        if not email:
+            raise ValidationError("缺少邮箱，无法生成登录凭证")
+        url = f"{self._settings.supabase_auth_url}/admin/generate_link"
+        resp = await self.auth_client.post(
+            url, json={"type": link_type, "email": email}, headers=self._admin_headers()
+        )
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("message")
+                or detail.get("error_description")
+                or detail.get("msg")
+                or "生成登录凭证失败"
+            )
+            raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
+
+    async def verify_link(self, token_hash: str, link_type: str) -> Dict[str, Any]:
+        """用 generate_link 得到的 token_hash 直接兑换会话（服务端完成，用户无需点链接）。
+
+        注意：新版 GoTrue 只接受 **POST + JSON body**。用 GET 带 query 参数会返回
+        400 "Verify requires a token or a token hash"。
+        """
+        payload = {"token_hash": token_hash, "type": link_type}
+        url = f"{self._settings.supabase_auth_url}/verify"
+        resp = await self.auth_client.post(url, json=payload, headers=self._headers())
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("error_description")
+                or detail.get("msg")
+                or detail.get("message")
+                or "凭证校验失败"
+            )
+            raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
+        try:
+            return resp.json()
+        except Exception:  # noqa: BLE001
+            return {}
+
+    async def issue_session_for_user(self, user_id: str) -> Dict[str, Any]:
+        """**在不知道密码的前提下**给指定用户签出一整套会话。
+
+        这是微信登录与邮箱账号打通的关键：GoTrue 一个账号只有一个密码，
+        若用「确定性密码」做 password grant，微信登录就会把用户自设的邮箱密码
+        顶掉（反之亦然）。改用 magiclink 后两种登录方式各自独立、互不影响。
+
+        等价于「以该用户身份登录」，因此**只能**在已经完成强身份验证之后调用
+        —— 微信侧即 code2session 成功（openid 由微信签名保证）。
+
+        返回结构与 sign_in / refresh 一致（access_token / refresh_token / ...）。
+        """
+        if not user_id:
+            raise ValidationError("缺少用户标识，无法签发会话")
+        user = await self.admin_get_user(user_id)
+        email = str(user.get("email") or "")
+        if not email:
+            raise AuthError("账号缺少邮箱，无法签发会话", status_code=502)
+        link = await self.generate_link(email, "magiclink")
+        token_hash = link.get("hashed_token")
+        if not token_hash:
+            # 老版本 GoTrue 不返回 hashed_token，需要从 action_link 里解析
+            from urllib.parse import urlparse, parse_qs
+
+            qs = parse_qs(urlparse(str(link.get("action_link") or "")).query)
+            token_hash = (qs.get("token_hash") or qs.get("token") or [""])[0]
+        if not token_hash:
+            raise AuthError("生成登录凭证失败", status_code=502)
+        return await self.verify_link(token_hash, "magiclink")
+
+    async def find_user_id_by_email(
+        self, email: str, per_page: int = 200
+    ) -> str:
+        """按邮箱反查 user_id；找不到返回空串（**不抛异常**）。
+
+        GoTrue 管理接口的 listUsers 不支持按 email 精确过滤，只能分页遍历。
+        调用方都在低频路径上（建号报「邮箱已存在」的补救、绑定邮箱的占用校验），
+        可接受。真要做成高频查询，应在业务表里维护 email → user_id 的映射。
+
+        终止条件只看「本页是否满」：**不能依赖响应里的 total 字段** ——
+        实测该字段为 None，若写成 `page * per_page >= total`，满页时会立刻
+        break，用户数超过一页后后面的账号全部漏判。
+        """
+        if not email:
+            return ""
+        url = f"{self._settings.supabase_auth_url}/admin/users"
+        target = email.strip().lower()
+        page = 1
+        # 复用 auth_client：翻页时多个请求共享同一条 keep-alive 连接
+        while page <= 100:  # 上限兜底，避免异常情况下无限翻页
+            resp = await self.auth_client.get(
+                url,
+                headers=self._admin_headers(),
+                params={"page": str(page), "per_page": str(per_page)},
+            )
+            if resp.status_code >= 400:
+                break
+            try:
+                payload = resp.json()
+            except Exception:  # noqa: BLE001
+                break
+            users = payload.get("users") or []
+            for item in users:
+                if str(item.get("email") or "").strip().lower() == target:
+                    return str(item.get("id") or "")
+            # 本页不满即已到最后一页；不依赖 total（实测为 None）
+            if len(users) < per_page:
+                break
+            page += 1
+        return ""
+
+    # ---------------- 邮箱验证码（OTP）----------------
+    async def send_email_otp(self, email: str) -> None:
+        """发送 6 位邮箱验证码。create_user=False：邮箱未注册时不建号。
+
+        Supabase 内置 SMTP 限流很紧（实测约 60 秒 1 封，返回 429
+        over_email_send_rate_limit）。生产建议在 Supabase 后台配自定义 SMTP。
+        """
+        payload = {"email": email, "create_user": False}
+        url = f"{self._settings.supabase_auth_url}/otp"
+        resp = await self.auth_client.post(url, json=payload, headers=self._headers())
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("error_description")
+                or detail.get("msg")
+                or detail.get("message")
+                or "发送验证码失败"
+            )
+            raise AuthError(str(message), status_code=resp.status_code)
+
+    async def verify_email_otp(self, email: str, token: str) -> Dict[str, Any]:
+        """校验 6 位邮箱验证码，成功返回会话。"""
+        payload = {"email": email, "token": token, "type": "email"}
+        url = f"{self._settings.supabase_auth_url}/verify"
+        resp = await self.auth_client.post(url, json=payload, headers=self._headers())
+        if resp.status_code >= 400:
+            detail: Any
+            try:
+                detail = resp.json()
+            except Exception:  # noqa: BLE001
+                detail = resp.text
+            message = (
+                detail.get("error_description")
+                or detail.get("msg")
+                or detail.get("message")
+                or "验证码错误或已过期"
+            )
+            raise AuthError(str(message), status_code=resp.status_code)
         try:
             return resp.json()
         except Exception:  # noqa: BLE001

@@ -1,0 +1,131 @@
+name: Deploy to CN Lighthouse
+
+# 自建服务器后，这就是取代 Railway「push 即部署」的那根管子：
+#   构建（GitHub 海外机房）→ 推阿里云 ACR → SSH 到国内服务器 → 拉镜像 → 滚动重启 → 健康检查 → 失败自动回滚
+#
+# 需要的 Secrets（仓库 Settings → Secrets and variables → Actions）：
+#   ACR_REGISTRY / ACR_NAMESPACE / ACR_USERNAME / ACR_PASSWORD   —— 同 build-cn.yml
+#   SSH_HOST      服务器公网 IP
+#   SSH_USER      登录用户名（腾讯云 Ubuntu 镜像一般是 ubuntu，Docker CE 模板可能是 root）
+#   SSH_KEY       SSH 私钥全文（含 -----BEGIN/END 行），对应公钥要放进 ~/.ssh/authorized_keys
+#   SSH_PORT      可选，默认 22
+#   APP_DIR       可选，服务器上的项目目录，默认 /opt/jbs
+#
+# 变量优先级：workflow_dispatch 输入的 tag  >  github.sha
+# 强烈建议用 sha 部署（默认行为），这样服务器上的 .last_good_image 能精确回滚。
+
+on:
+  workflow_dispatch:
+    inputs:
+      drain_worker:
+        description: "先排空 Celery 队列再部署（改了任务签名/参数时必须开）"
+        type: boolean
+        default: false
+
+env:
+  SHA: ${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------- 1. 构建
+  build:
+    uses: ./.github/workflows/build-cn.yml
+    secrets: inherit
+
+  # ---------------------------------------------------------------- 2. 部署
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          REG: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}
+          SHA: ${{ github.sha }}
+          APP_DIR: ${{ secrets.APP_DIR || '/opt/jbs' }}
+          DRAIN: ${{ github.event.inputs.drain_worker }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          # 最坏情况：worker 优雅退出 300s + 健康检查 90s
+          command_timeout: 15m
+          envs: REG,SHA,APP_DIR,DRAIN
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+
+            export BACKEND_IMAGE="$REG/jbsttj-backend:$SHA"
+            PREV=$(cat .last_good_image 2>/dev/null || echo "")
+            echo "部署目标: $BACKEND_IMAGE"
+            echo "回滚基线: ${PREV:-（首次部署，无基线）}"
+
+            # --- 0. 首次部署自检：.env 必须在，否则容器起来会立刻退出 ---
+            if [ ! -f .env ]; then
+              echo "::error:: $APP_DIR/.env 不存在，先把生产 .env 放上去再部署"
+              exit 1
+            fi
+
+            # --- 1. 选做：排空 Celery 队列 ---
+            # 为什么需要：API 和 worker 是两个容器，up -d 会有几秒的「新 API + 旧 worker」窗口。
+            # 如果你这次提交改了 @shared_task 的名字或参数，新 API 派发的任务旧 worker 不认识，
+            # 会抛 NotRegistered 且不会重投 —— 任务直接丢。开了这个开关就先停 worker 排空，
+            # 期间新任务堆在 RabbitMQ 里，新 worker 起来后照常消费。
+            if [ "$DRAIN" = "true" ]; then
+              echo "== 排空模式：停 worker，等队列清空 =="
+              docker compose -f docker-compose.prod.yml stop worker
+              for i in $(seq 1 60); do
+                N=$(docker compose -f docker-compose.prod.yml exec -T rabbitmq \
+                      rabbitmqctl list_queues -p / name messages 2>/dev/null \
+                      | awk '{s+=$2} END {print s+0}')
+                R=$(docker compose -f docker-compose.prod.yml exec -T rabbitmq \
+                      rabbitmqctl list_queues -p / name consumers 2>/dev/null \
+                      | awk '{s+=$2} END {print s+0}')
+                # 只看「还有消费者但没消息」= 已空；没消费者说明 worker 已停，等消息数不再变化即可
+                [ "${N:-0}" = "0" ] && { echo "队列已空（$i/60）"; break; }
+                sleep 5
+              done
+            fi
+
+            # --- 2. 拉新镜像 ---
+            # 只拉 api / worker：redis、rabbitmq 是第三方镜像，版本不变不用每次拉。
+            docker compose -f docker-compose.prod.yml pull api worker
+
+            # --- 3. 重建容器 ---
+            # -t 300 = 允许 worker 最多 5 分钟优雅退出（与 compose 的 stop_grace_period 对齐）。
+            # --remove-orphans 清掉改名/删掉的历史容器。
+            docker compose -f docker-compose.prod.yml up -d -t 300 --remove-orphans
+
+            # --- 4. 健康检查 ---
+            # 只探 API：worker 是消费者，没有 HTTP 端口，靠 docker compose ps 看状态。
+            OK=0
+            for i in $(seq 1 45); do
+              if curl -fsS --max-time 5 http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+                echo "健康检查通过（${i}/45）"
+                OK=1
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$OK" != "1" ]; then
+              echo "::error:: 健康检查失败，开始回滚"
+              docker compose -f docker-compose.prod.yml logs --tail=80 api
+              if [ -n "$PREV" ]; then
+                export BACKEND_IMAGE="$PREV"
+                docker compose -f docker-compose.prod.yml up -d -t 300 --remove-orphans
+                echo "已回滚到 $PREV"
+              else
+                echo "无回滚基线，请手动检查"
+              fi
+              exit 1
+            fi
+
+            # --- 5. 记录「已知好用」的镜像，供下次失败回滚 ---
+            echo "$REG/jbsttj-backend:$SHA" > .last_good_image
+
+            # --- 6. 收尾：看一眼状态 + 清掉旧镜像层 ---
+            docker compose -f docker-compose.prod.yml ps
+            docker image prune -f > /dev/null 2>&1 || true
+            echo "部署完成: $BACKEND_IMAGE"

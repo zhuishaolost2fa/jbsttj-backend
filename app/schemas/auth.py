@@ -37,6 +37,39 @@ class WechatLoginRequest(BaseModel):
     avatar_url: Optional[str] = Field(default=None, max_length=1024)
 
 
+class SetPasswordRequest(BaseModel):
+    """微信用户设置登录密码（不需要当前密码）。
+
+    微信用户建号时的密码是随机的、生成后即丢弃，所以走不了 change-password
+    的「校验当前密码」流程。设置之后即可用邮箱 + 密码登录。
+    """
+
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+class WechatBindRequest(BaseModel):
+    """把微信身份绑定到**当前已登录**的账号上。
+
+    与 /auth/wechat/login 的区别：本接口要求登录态，不会创建新账号，
+    只把 openid 挂到当前 user_id 上。用于「邮箱老用户想用微信一键登录」。
+    """
+
+    code: str = Field(min_length=1, max_length=256)
+
+
+class EmailBindStartRequest(BaseModel):
+    """发起绑定邮箱：向目标邮箱发 6 位验证码。"""
+
+    email: EmailStr
+
+
+class EmailBindConfirmRequest(BaseModel):
+    """确认绑定邮箱：校验验证码后把账号邮箱改成目标邮箱。"""
+
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=12)
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: Optional[str] = None
@@ -54,8 +87,10 @@ class ProfileResponse(BaseModel):
     is_service: bool = False
     email_verified: bool = False
     # 登录来源：None=邮箱注册；'wechat'=微信登录。
-    # 前端据此隐藏「修改密码 / 修改邮箱」—— 微信用户没有真邮箱，改了也没意义。
+    # 微信用户据此把「修改邮箱」换成「绑定邮箱」入口 —— 占位邮箱改了也没意义。
     provider: Optional[str] = None
+    # 当前账号是否已绑定微信身份。已绑定时前端不再显示「绑定微信」按钮。
+    wechat_bound: bool = False
     nickname: Optional[str] = None
     avatar_url: Optional[str] = None
     avatar_color: int = 0

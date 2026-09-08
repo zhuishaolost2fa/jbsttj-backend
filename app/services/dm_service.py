@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -641,8 +642,11 @@ class DMGuideService:
             qa_k = top_k
             chunk_k = min(top_k, self._settings.dm_search_qa_supplement_k)
 
+        # 每次检索都是一次到 Supabase 的跨洋往返（境外 RTT 数十到数百毫秒）。
+        # chunk 与 qa 两路互不依赖，串行等于付两倍网络成本，这里并发发出。
+        pending: Dict[str, Any] = {}
         if mode in ("chunk", "hybrid"):
-            chunks = await run_in_threadpool(
+            pending["chunk"] = run_in_threadpool(
                 store.match_chunks,
                 vector,
                 script_id=script_id,
@@ -652,7 +656,7 @@ class DMGuideService:
                 similarity_threshold=threshold,
             )
         if mode in ("qa", "hybrid"):
-            qa = await run_in_threadpool(
+            pending["qa"] = run_in_threadpool(
                 store.match_qa,
                 vector,
                 script_id=script_id,
@@ -662,6 +666,21 @@ class DMGuideService:
                 match_count=qa_k,
                 similarity_threshold=threshold,
             )
+
+        if pending:
+            done = await asyncio.gather(*pending.values(), return_exceptions=True)
+            failures: List[BaseException] = []
+            for key, value in zip(pending, done):
+                if isinstance(value, BaseException):
+                    failures.append(value)
+                    logger.warning("DM 检索失败 route=%s: %s", key, value)
+                elif key == "chunk":
+                    chunks = value or []
+                else:
+                    qa = value or []
+            # 单路失败降级为「少一路召回」，全部失败才向上抛，交给 LLM 兜底
+            if len(failures) == len(pending):
+                raise failures[0]
 
         chunk_hits = [_to_chunk_hit(r) for r in chunks]
         qa_hits = [_to_qa_hit(r) for r in qa]

@@ -47,16 +47,17 @@ class Settings(BaseSettings):
     supabase_jwt_secret: str = ""
     supabase_jwks_url: str = ""
     supabase_jwt_audience: str = "authenticated"
+    # 校验 token 时允许的时钟偏差（秒），同时作用于 exp / nbf / iat。
+    # 实测本机比 Supabase 慢 66 秒时，GoTrue 签发的 token 的 iat 落在「未来」，
+    # PyJWT 直接抛 ImmatureSignatureError，所有带 token 的请求全部 401。
+    # 30 秒的常规取值扛不住这种偏移，故默认放宽到 120 秒。
+    jwt_leeway_seconds: int = 120
 
     # ---------------- 微信小程序登录 ----------------
     # 微信公众平台 → 开发管理 → 开发信息 里拿。留空则 /auth/wechat/login 直接
     # 报 503，不影响 H5 端的邮箱登录 —— 微信登录是可选能力，不进 missing_required()。
     wechat_appid: str = ""
     wechat_app_secret: str = ""
-    # 派生「微信用户 → GoTrue 账号」确定性密码的 HMAC 密钥，留空则回落到
-    # SUPABASE_JWT_SECRET。⚠️ 上线后不要改：一旦改动，所有存量微信用户的派生
-    # 密码都会变，导致 password grant 失败（虽有重置兜底，但会全量抖动）。
-    wechat_link_secret: str = ""
 
     # ---------------- 阿里云 OSS ----------------
     oss_access_key_id: str = ""
@@ -263,6 +264,15 @@ class Settings(BaseSettings):
     dm_cache_dir: str = ""
     dm_max_pdf_bytes: int = 200 * 1024 * 1024
 
+    # ---------------- 向量库后端 ----------------
+    # supabase：向量表留在 Supabase，走 PostgREST（跨洋往返 ~200ms/次，适合本地开发）
+    # local：向量表下沉到同机 pgvector，走 psycopg 直连（~3ms/次，生产推荐）
+    vector_backend: str = "supabase"
+    # local 模式下的连接串，如 postgresql://postgres:pwd@pgvector:5432/jbsvec
+    vector_db_dsn: str = ""
+    # 连接池大小：api 与 worker 各自的进程内池，按并发量给
+    vector_db_pool_max: int = 8
+
     # OSS 单个分片的硬性下限（最后一片除外）
     min_part_size: int = Field(default=100 * 1024, exclude=True)
 
@@ -327,11 +337,6 @@ class Settings(BaseSettings):
     def wechat_login_enabled(self) -> bool:
         """微信登录是否具备运行条件：需要小程序凭证 + 能建 GoTrue 账号。"""
         return bool(self.wechat_appid and self.wechat_app_secret and self.supabase_service_role_key)
-
-    @property
-    def _wechat_link_key(self) -> str:
-        """派生微信账号密码的 HMAC 密钥，缺省回落 JWT Secret。"""
-        return self.wechat_link_secret or self.supabase_jwt_secret
 
     def missing_rag_config(self) -> List[str]:
         """返回 RAG 流水线缺失的配置项，供 /ready 与触发接口给出可操作提示。"""

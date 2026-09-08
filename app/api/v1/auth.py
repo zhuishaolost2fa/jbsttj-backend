@@ -28,13 +28,17 @@ from app.core.security import CurrentUser, get_current_user
 from app.schemas.auth import (
     ChangeEmailRequest,
     ChangePasswordRequest,
+    EmailBindConfirmRequest,
+    EmailBindStartRequest,
     LoginRequest,
     MessageResponse,
     ProfileResponse,
     ProfileUpdate,
     RefreshRequest,
     RegisterRequest,
+    SetPasswordRequest,
     TokenResponse,
+    WechatBindRequest,
     WechatLoginRequest,
 )
 from app.services.supabase import SupabaseAuth, SupabaseClient, get_supabase, get_supabase_auth
@@ -112,12 +116,18 @@ async def wechat_login(
 ) -> TokenResponse:
     """用 wx.login 的 code 换取与 /auth/login **完全同构**的 TokenResponse。
 
-    链路：code → openid → 查绑定 → 未绑定则建 GoTrue 账号 → password grant。
+    链路：code → openid → 查绑定 → 未绑定则建 GoTrue 账号 → 免密签发会话。
     返回的 token 由 GoTrue 签发，可直接用现有 /auth/refresh 续期，业务侧
     （profiles / RLS / CurrentUser.id）零改动。
 
+    **为什么不用 password grant**：GoTrue 一个账号只有一个密码。早期实现用
+    HMAC(openid) 派生的固定密码登录，一旦该用户绑定真实邮箱并自设密码，
+    两种登录方式就会互相顶掉。改用 magiclink 免密签发后，微信与邮箱是两条
+    互不干扰的凭证，同一个 user_id 下可以同时存在。
+
     安全性：本接口不校验登录态（与 /auth/login 一致），安全性完全依赖 code
-    的一次性 —— 只有持有小程序 appsecret 的服务端才能兑换成功。
+    的一次性 —— 只有持有小程序 appsecret 的服务端才能兑换成功。免密签发
+    只在 code2session 成功之后执行，openid 由微信侧签名保证。
     """
     if not wx.enabled:
         raise ConfigError("服务端未配置微信小程序凭证，微信登录不可用")
@@ -127,40 +137,42 @@ async def wechat_login(
     session = await wx.code2session(payload.code)
     openid = str(session["openid"])
     unionid = session.get("unionid")
-    email = wx.placeholder_email(openid)
-    password = wx.derive_password(openid)
 
     identity = await db.select_one(
         "user_identities",
         filters={"provider": "eq.wechat", "provider_uid": f"eq.{openid}"},
     )
 
-    if identity and identity.get("user_id"):
-        user_id = str(identity["user_id"])
-    else:
+    user_id = str(identity["user_id"]) if (identity and identity.get("user_id")) else ""
+    data: Optional[Dict[str, Any]] = None
+
+    if user_id:
+        try:
+            data = await auth.issue_session_for_user(user_id)
+        except AuthError as exc:
+            if exc.status_code != 404:
+                raise
+            # 绑定记录指向的账号在 auth.users 里已不存在（后台手删 / 数据迁移 /
+            # 清理脚本误删）。不清掉这条残留记录，该微信用户会**永久**登录失败 ——
+            # 每次都命中它，拿一个不存在的 user_id 去签发。
+            logger.warning(
+                "绑定记录指向的账号已不存在，清理后重建（openid=%s）", openid[:8] + "***"
+            )
+            await _forget_identity(db, user_id, openid)
+            user_id = ""
+
+    if not user_id:
         user_id = await _provision_wechat_user(
             db=db,
             auth=auth,
             wx=wx,
             openid=openid,
             unionid=unionid,
-            email=email,
-            password=password,
             session=session,
             nickname=payload.nickname,
             avatar_url=payload.avatar_url,
         )
-
-    # password grant：拿真正的 GoTrue token
-    try:
-        data = await auth.sign_in(email, password)
-    except AuthError as exc:
-        if exc.status_code != 400:
-            raise
-        # 密码被外部改过（人工重置、账号重建）→ 用 admin 重置回确定性密码再试一次
-        logger.warning("微信用户 password grant 失败，重置密码后重试（openid=%s）", openid[:8] + "***")
-        await auth.admin_update_user(user_id, {"password": password})
-        data = await auth.sign_in(email, password)
+        data = await auth.issue_session_for_user(user_id)
 
     # 回写登录时间，失败不影响登录结果
     try:
@@ -176,6 +188,22 @@ async def wechat_login(
     return _to_token(data)
 
 
+async def _forget_identity(db: SupabaseClient, user_id: str, openid: str) -> None:
+    """清掉一条失效的微信绑定记录，让该 openid 可以重新建号。
+
+    同时删掉可能残留的 profiles 行 —— 账号已不存在，留着就是脏数据。
+    清理失败只记日志：宁可留脏数据，也不能让登录彻底不可用。
+    """
+    try:
+        await db.delete(
+            "user_identities",
+            filters={"provider": "eq.wechat", "provider_uid": f"eq.{openid}"},
+        )
+        await db.delete("profiles", filters={"id": f"eq.{user_id}"})
+    except DatabaseError:  # noqa: BLE001
+        logger.warning("清理失效绑定记录失败（openid=%s）", openid[:8] + "***")
+
+
 async def _provision_wechat_user(
     *,
     db: SupabaseClient,
@@ -183,19 +211,20 @@ async def _provision_wechat_user(
     wx: WeChatService,
     openid: str,
     unionid: Optional[str],
-    email: str,
-    password: str,
     session: Dict[str, Any],
     nickname: Optional[str],
     avatar_url: Optional[str],
 ) -> str:
     """首次登录：建 GoTrue 账号 + 写绑定表 + 播种 profiles，返回 user_id。"""
+    email = wx.placeholder_email(openid)
+    created: Dict[str, Any] = {}
     try:
         created = await auth.admin_create_user(
             {
                 "email": email,
-                "password": password,
-                # 占位邮箱永远收不到验证邮件，不预确认会导致 password grant 被拒
+                # 随机密码，生成后即丢弃：登录走 magiclink，用不到它
+                "password": wx.random_password(),
+                # 占位邮箱永远收不到验证邮件，不预确认会导致邮箱登录被拒
                 "email_confirm": True,
                 "user_metadata": {
                     "provider": "wechat",
@@ -211,11 +240,10 @@ async def _provision_wechat_user(
         hint = f"{exc.message} {exc.code} {exc.details or ''}".lower()
         if not any(h in hint for h in _EMAIL_EXISTS_HINTS):
             raise
-        # 账号已存在（上次建号成功但绑定表没写进去）→ 用确定性密码登录反查 id。
-        # 避免一次网络抖动就把这个微信用户永久锁死在「建号失败」。
-        logger.warning("占位邮箱账号已存在，改用登录反查 user_id（openid=%s）", openid[:8] + "***")
-        data = await auth.sign_in(email, password)
-        user_id = str((data.get("user") or {}).get("id") or "")
+        # 账号已存在（上次建号成功但绑定表没写进去）→ 用 admin 接口按邮箱反查。
+        # 不依赖密码，避免一次网络抖动就把这个微信用户永久锁死在「建号失败」。
+        logger.warning("占位邮箱账号已存在，改用管理接口反查 user_id（openid=%s）", openid[:8] + "***")
+        user_id = await auth.find_user_id_by_email(email)
 
     if not user_id:
         raise AuthError("创建微信账号失败", status_code=502)
@@ -227,6 +255,7 @@ async def _provision_wechat_user(
             "provider": "wechat",
             "provider_uid": openid,
             "union_id": unionid,
+            "email_snapshot": email,
             "session_key": session.get("session_key"),
             "session_key_updated_at": "now()",
             # 只存去掉 session_key 后的快照，排障够用且不重复存敏感值
@@ -295,6 +324,7 @@ def _profile_response(
         is_service=user.is_service,
         email_verified=email_verified,
         provider=provider,
+        wechat_bound=bool((profile or {}).get("wechat_bound")),
         nickname=profile.get("nickname") if profile else None,
         avatar_url=profile.get("avatar_url") if profile else None,
         avatar_color=int(profile.get("avatar_color") or 0) if profile else 0,
@@ -511,3 +541,181 @@ async def change_email(
     await auth.admin_update_user(user.id, {"email": new_email})
     logger.info("用户发起改邮箱（id=%s -> %s）", user.id, new_email)
     return MessageResponse(message="验证邮件已发送至新邮箱，确认后才会生效")
+
+
+# ------------------------------------------------------------
+# 账号打通：微信 ⇄ 邮箱
+#
+# 免密签发（magiclink）让一个 user_id 下可以同时挂微信与邮箱两种凭证，
+# 两者互不干扰，所以下面两个方向都能安全绑定。
+# ------------------------------------------------------------
+
+_ALREADY_BOUND = "该微信已绑定到其他账号"
+
+
+@router.post("/me/password/set", response_model=MessageResponse, summary="设置登录密码")
+async def set_password(
+    payload: SetPasswordRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+) -> MessageResponse:
+    """给微信账号设置一个登录密码，之后可用「邮箱 + 密码」登录。
+
+    与 /auth/change-password 的区别：不校验当前密码。微信用户建号时的密码
+    是随机生成后即丢弃的，本人无从得知，要求输入当前密码等于把这条路堵死。
+
+    不需要担心会把微信登录顶掉 —— 微信登录走 magiclink 免密签发，不依赖密码，
+    两种登录方式并存于同一个账号。
+    """
+    meta = user.claims.get("user_metadata") or {}
+    if meta.get("provider") != "wechat":
+        raise ValidationError("该账号已有登录密码，请使用「修改密码」")
+
+    await auth.admin_update_user(user.id, {"password": payload.new_password})
+    logger.info("微信用户设置登录密码（user_id=%s）", user.id)
+    return MessageResponse(message="登录密码已设置，下次可用邮箱登录")
+
+
+@router.post("/wechat/bind", response_model=MessageResponse, summary="把微信绑定到当前账号")
+async def wechat_bind(
+    payload: WechatBindRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+    wx: WeChatService = Depends(get_wechat_service),
+) -> MessageResponse:
+    """已登录的邮箱账号绑定微信，之后可用微信一键登录进**同一个账号**。
+
+    这是老用户迁移的关键路径：不绑的话，老用户点微信登录会新建一个空账号，
+    历史数据（DM 导入、划线、剧本）全部看不到。
+
+    与 /auth/wechat/login 的区别：本接口要求登录态，且绝不创建新账号。
+    """
+    if not wx.enabled:
+        raise ConfigError("服务端未配置微信小程序凭证，微信绑定不可用")
+    if not db.available:
+        raise DatabaseError("数据库未配置，无法完成微信绑定", code="db_unavailable")
+
+    session = await wx.code2session(payload.code)
+    openid = str(session["openid"])
+    unionid = session.get("unionid")
+
+    existing = await db.select_one(
+        "user_identities",
+        filters={"provider": "eq.wechat", "provider_uid": f"eq.{openid}"},
+    )
+    if existing:
+        owner = str(existing.get("user_id") or "")
+        if owner and owner == user.id:
+            return MessageResponse(message="该微信已绑定到当前账号")
+        raise ConflictError(_ALREADY_BOUND, code="wechat_already_bound")
+
+    # 记录当前邮箱：签发 magiclink 时需要，且 email 后续可能被用户改掉
+    try:
+        got = await auth.admin_get_user(user.id)
+        current_email = str(got.get("email") or "")
+    except AuthError:
+        current_email = user.email or ""
+
+    await db.upsert(
+        "user_identities",
+        {
+            "user_id": user.id,
+            "provider": "wechat",
+            "provider_uid": openid,
+            "union_id": unionid,
+            "email_snapshot": current_email,
+            "session_key": session.get("session_key"),
+            "session_key_updated_at": "now()",
+            "raw": {k: v for k, v in session.items() if k != "session_key"},
+        },
+        on_conflict="provider,provider_uid",
+    )
+    # 必须用 upsert 而不是 update：邮箱注册不写 profiles（只有微信首次登录、
+    # 编辑资料、传头像才会建行），从未动过资料的老用户根本没有这一行。
+    # 用 update 的话 PATCH 匹配 0 行且不报错，绑定看似成功、/auth/me 却永远
+    # 返回 wechat_bound=false，前端会一直显示「绑定微信」，再点一次又撞
+    # wechat_already_bound。merge-duplicates 语义下只改 wechat_bound，
+    # 不会覆盖用户已填的昵称 / 头像。
+    try:
+        await db.upsert(
+            "profiles",
+            {"id": user.id, "wechat_bound": True},
+            on_conflict="id",
+        )
+    except DatabaseError:  # noqa: BLE001
+        logger.warning("回写 wechat_bound 失败（id=%s）", user.id)
+
+    logger.info("账号绑定微信（user_id=%s, openid=%s）", user.id, openid[:8] + "***")
+    return MessageResponse(message="微信绑定成功，下次可用微信一键登录")
+
+
+@router.post(
+    "/me/email/bind/start", response_model=MessageResponse, summary="发起绑定邮箱（发验证码）"
+)
+async def bind_email_start(
+    payload: EmailBindStartRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+) -> MessageResponse:
+    """向目标邮箱发送 6 位验证码，用于把微信账号升级为可找回的邮箱账号。
+
+    微信用户当前的登录邮箱是占位邮箱（wx_xxx@wechat.local），自己都不知道，
+    一旦换设备就再也找不回账号。绑定真实邮箱后可以走邮箱验证码登录。
+
+    限流：Supabase 内置 SMTP 约 60 秒 1 封，超限会返回 429，前端应提示稍后重试。
+    """
+    email = payload.email.strip().lower()
+    if user.email and email == user.email.lower():
+        raise ValidationError("该邮箱已是当前登录邮箱")
+
+    # 该邮箱若已被别的账号占用，直接拒绝 —— 否则会把人家的账号邮箱顶掉
+    owner = await auth.find_user_id_by_email(email)
+    if owner and owner != user.id:
+        raise ConflictError("该邮箱已被其他账号使用", code="email_taken")
+
+    await auth.send_email_otp(email)
+    logger.info("发起绑定邮箱（user_id=%s -> %s）", user.id, email)
+    return MessageResponse(message="验证码已发送，请查收邮件")
+
+
+@router.post(
+    "/me/email/bind/confirm", response_model=TokenResponse, summary="确认绑定邮箱"
+)
+async def bind_email_confirm(
+    payload: EmailBindConfirmRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: SupabaseClient = Depends(get_supabase),
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+) -> TokenResponse:
+    """校验验证码后把登录邮箱改为目标邮箱，并返回**新签发的 token**。
+
+    返回新 token 是因为 GoTrue 改 email 后，旧 access_token 里的 email claim
+    仍是占位邮箱 —— 不换发的话前端要等下次刷新才看得到正确邮箱。
+    """
+    email = payload.email.strip().lower()
+    try:
+        await auth.verify_email_otp(email, payload.code.strip())
+    except AuthError as exc:
+        # 验证码错误 / 过期：统一成可操作的提示，不回传 GoTrue 原文
+        logger.warning("绑定邮箱验证码校验失败（user_id=%s）", user.id)
+        raise ValidationError("验证码错误或已过期，请重新获取") from exc
+
+    await auth.admin_update_user(user.id, {"email": email, "email_confirm": True})
+
+    if db.available:
+        try:
+            await db.update(
+                "user_identities",
+                filters={"user_id": f"eq.{user.id}", "provider": "eq.wechat"},
+                data={"email_snapshot": email},
+            )
+        except DatabaseError:  # noqa: BLE001
+            logger.warning("回写绑定表邮箱快照失败（user_id=%s）", user.id)
+
+    logger.info("绑定邮箱成功（user_id=%s -> %s）", user.id, email)
+    # 用新邮箱重新签发，确保 token 里的 email claim 已是真实邮箱
+    data = await auth.issue_session_for_user(user.id)
+    return _to_token(data)
