@@ -114,7 +114,7 @@ def _run(svc, script_id, user_id=""):
         "app.services.script_service.store_mod.get_dm_store",
         return_value=FakeDMStore(),
     ), mock.patch(
-        "app.services.script_service.cache.bump_scope_version_sync",
+        "app.services.script_service.cache.bump_scope_versions_sync",
     ) as _bump:
         asyncio.run(svc.delete_script(script_id, user_id=user_id))
         return _bump
@@ -136,8 +136,9 @@ def test_delete_cleans_side_effects_and_object():
     # 4) 剧本软删除时 extra 摘掉了 dmGuide
     assert repo.soft_delete_calls[0][0] == "script-1"
     assert repo.soft_delete_calls[0][1] == {}
-    # 5) QA 标题链缓存按剧本的 DM 聚合 code 失效
-    assert bump.call_args_list and "wu-dou-yi-ying" in bump.call_args_list[0][0][0]
+    # 5) DM 内容缓存（QA 标题链等）按剧本的 DM 聚合 code 批量失效
+    scopes = bump.call_args_list[0][0][0]
+    assert any("wu-dou-yi-ying" in s for s in scopes)
 
 
 def test_delete_keeps_object_when_shared():

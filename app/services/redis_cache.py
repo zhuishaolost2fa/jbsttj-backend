@@ -88,6 +88,39 @@ async def cache_set(key: str, value: str, ttl_seconds: int) -> None:
         _mark_failed()
 
 
+# ------------------------------------------------------------
+# Pydantic 模型级缓存（详情页接口的主力用法）
+# ------------------------------------------------------------
+# 详情页的接口返回值几乎都是 pydantic 模型，逐个手写 dumps/loads 容易漏掉
+# 「缓存内容损坏要当 miss」这一层保护。这里统一收口：
+#   cached = await cache.cache_get_model(key, StoryListResult)
+#   if cached is not None: return cached
+# 序列化用字段名（model_dump_json 默认 by_alias=False），与校验端
+# model_validate_json 口径一致 —— 模型的 populate_by_name=True 保证两者互通。
+
+
+async def cache_get_model(key: str, model_cls: Any) -> Optional[Any]:
+    """读缓存并反序列化成模型；miss / 内容损坏一律返回 None（调用方回源）。"""
+    raw = await cache_get(key)
+    if raw is None:
+        return None
+    try:
+        return model_cls.model_validate_json(raw)
+    except Exception as exc:  # noqa: BLE001 - 版本升级等导致结构不兼容，当 miss 处理
+        logger.warning("缓存反序列化失败（%s），重新查询: %s", getattr(model_cls, "__name__", "?"), exc)
+        return None
+
+
+async def cache_set_model(key: str, value: Any, ttl_seconds: int) -> None:
+    """把 pydantic 模型序列化后写入缓存；失败静默。"""
+    try:
+        payload = value.model_dump_json()
+    except Exception as exc:  # noqa: BLE001 - 序列化失败不该影响接口返回
+        logger.warning("缓存序列化失败，跳过写入: %s", exc)
+        return
+    await cache_set(key, payload, ttl_seconds)
+
+
 async def get_version() -> int:
     """当前缓存版本号；读不到 / 缓存不可用时按 0 处理（key 归零重建，无副作用）。"""
     client = _get_client()
@@ -139,6 +172,25 @@ async def get_scope_version(scope: str) -> int:
         return 0
 
 
+async def bump_scope_version(scope: str) -> None:
+    """异步版 scope 版本号 +1：给 API 写接口（async 上下文）在写库后失效用。"""
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        await client.incr(scope_version_key(scope))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis 缓存版本号自增失败（scope=%s）: %s", scope, exc)
+        _mark_failed()
+
+
+async def bump_scope_versions(scopes: Any) -> None:
+    """异步批量失效多个 scope（一次写可能影响多张缓存，如划线同时影响故事列表）。"""
+    for scope in scopes or ():
+        if scope:
+            await bump_scope_version(scope)
+
+
 # Celery worker 是同步上下文（任务全是同步函数），没法用 async 客户端，
 # bump 需要一份独立的同步客户端。
 _sync_client: Any = None
@@ -169,6 +221,17 @@ def _get_sync_client() -> Any:
 
 def bump_scope_version_sync(scope: str) -> None:
     """同步版 scope 版本号 +1：给 Celery 任务在写库后失效对应域缓存用。失败静默。"""
+    _bump_one_sync(scope)
+
+
+def bump_scope_versions_sync(scopes: Any) -> None:
+    """同步批量失效：流水线跑完一次性失效该剧本的全部缓存域。"""
+    for scope in scopes or ():
+        if scope:
+            _bump_one_sync(scope)
+
+
+def _bump_one_sync(scope: str) -> None:
     client = _get_sync_client()
     if client is None:
         return

@@ -70,6 +70,7 @@ from app.services import redis_cache as cache
 from app.services.chunking import Chunk, ChunkConfig, chunk_blocks, chunks_from_payload
 from app.services.dedup import Deduplicator, build_backend, to_signed_64
 from app.services.dm_store import (
+    CACHE_SCOPE_SYNTHESIS,
     JOB_CHUNKING,
     JOB_COMPLETED,
     JOB_DOWNLOADING,
@@ -77,8 +78,9 @@ from app.services.dm_store import (
     JOB_EXTRACTING,
     JOB_GENERATING_QA,
     JOB_SKIPPED,
+    content_cache_scopes,
+    dm_cache_scope,
     get_dm_store,
-    qa_titles_cache_scope,
     to_pgvector,
 )
 from app.services.llm import QAPair, StoryItem, SynthesisOverview, get_llm_client
@@ -368,7 +370,7 @@ def prepare_document(
             store.update_document(document_id, {"is_active": True})
             store.deactivate_other_versions(script_id, document_id)
             # 旧版本被下线、当前版本转正，该剧本可见的 QA 集合变了，缓存要失效
-            _invalidate_qa_titles_cache(script_code)
+            _invalidate_content_caches(script_code)
             store.update_job(
                 job_id,
                 {
@@ -400,7 +402,7 @@ def prepare_document(
         logger.info("force=True，清空文档 %s 的历史 chunk 与 QA", document_id)
         store.purge_document(document_id)
         # 库里旧 QA 已删，缓存里的标题树立刻作废（重跑期间读到的是逐批增长的半成品）
-        _invalidate_qa_titles_cache(script_code)
+        _invalidate_content_caches(script_code)
 
     # 注意：分片已在上面按格式各自规划好（PDF 按页、Word 按文本单元），
     # 这里不能再统一重规划——否则 Word 的分片区间会被当成「伪页码」区间，
@@ -721,20 +723,38 @@ def _split_batches(items: List[Dict[str, Any]], size: int) -> List[List[Dict[str
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def _invalidate_qa_titles_cache(script_code: str) -> None:
-    """QA 数据发生变化后，让该剧本的问答标题链缓存立即失效。
+def _invalidate_content_caches(script_code: str) -> None:
+    """解析产出发生变化后，让该剧本的**全部内容缓存**立即失效。
 
-    qa-titles 接口按 script_code 缓存全量 QA 标题树，key 里拼了这个 scope 的
-    版本号 —— 这里 INCR 一次，旧 key 自然 miss，无需扫描删除。
+    一次解析会同时改变：QA 标题树、故事卡片、合成文章、索引状态、检索结果
+    （向量库换血后旧命中不再有效）—— 这些缓存域的 key 都带 scope 版本号，
+    这里批量 INCR，旧 key 自然 miss，无需扫描删除。
     失效失败只记日志：缓存靠 TTL 自然过期，最多短暂读到旧数据。
     """
     code = (script_code or "").strip().lower()
     if not code:
         return
     try:
-        cache.bump_scope_version_sync(qa_titles_cache_scope(code))
+        cache.bump_scope_versions_sync(content_cache_scopes(code))
     except Exception as exc:  # noqa: BLE001 - 失效失败不中断流水线
-        logger.warning("失效问答标题链缓存失败 script_code=%s: %s", code, exc)
+        logger.warning("失效剧本内容缓存失败 script_code=%s: %s", code, exc)
+
+
+def _invalidate_synthesis_cache(script_code: str) -> None:
+    """合成文章写库后单独失效。
+
+    合成文章是在流水线收尾**之后**才生成的（晚于 _invalidate_content_caches），
+    不补这一次，前端要等 TTL 过期才看得到新文章。
+    """
+    code = (script_code or "").strip().lower()
+    if not code:
+        return
+    try:
+        cache.bump_scope_versions_sync(
+            [dm_cache_scope(CACHE_SCOPE_SYNTHESIS, code)]
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("失效合成文章缓存失败 script_code=%s: %s", code, exc)
 
 
 # ============================================================
@@ -1059,6 +1079,10 @@ def _run_synthesis(
         prompt_version="v1",
     )
 
+    # 合成文章是在流水线统一失效（_invalidate_content_caches）**之后**才落库的，
+    # 补一次失效，否则前端要等 TTL 过期才看得到新文章
+    _invalidate_synthesis_cache(script_code)
+
     if saved:
         store.set_synthesis_status(document_id, store_mod.SYNTHESIS_READY)
         filled = sum(1 for _, body in overview.sections() if body)
@@ -1136,7 +1160,7 @@ def finalize(
         store.deactivate_other_versions(script_id, document_id, script_code=script_code or None)
 
     # 全部 QA 落库、旧版本下线完毕，该剧本可见的 QA 集合定格 —— 缓存就此失效重建
-    _invalidate_qa_titles_cache(script_code)
+    _invalidate_content_caches(script_code)
 
     # force 重跑 / 换新版本手册时，旧 story 被 purge 删掉、用户划线落入 orphaned；
     # 新 story 就绪后在这里重锚定（quote 精确匹配 → prefix/suffix 上下文模糊匹配）。
@@ -1154,13 +1178,16 @@ def finalize(
     # 这次生成的目的是把「碎片卡片」拼成「完整复盘文章」（用户痛点：散乱），所以是
     # finalize 后的标准步骤，不是可选项；没故事条目的手册直接跳过。
     if story_count:
-        _run_synthesis(
-            store,
-            document_id=document_id,
-            script_id=script_id,
-            script_code=script_code,
-            script_title=script_title,
-        )
+        try:
+            _run_synthesis(
+                store,
+                document_id=document_id,
+                script_id=script_id,
+                script_code=script_code,
+                script_title=script_title,
+            )
+        except Exception as exc:  # noqa: BLE001 - 合成失败绝不能把已完成的 job 拖成失败
+            logger.warning("合成文章生成失败（不影响解析结果）doc=%s: %s", document_id, exc)
 
     batches = len(results) if results else 0
     logger.info(

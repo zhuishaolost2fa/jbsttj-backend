@@ -49,14 +49,61 @@ SYNTHESIS_GENERATING = "generating"
 SYNTHESIS_READY = "ready"
 SYNTHESIS_FAILED = "failed"
 
-# 问答标题链（qa-titles 接口）Redis 缓存的 scope 前缀。
-# API 侧读缓存、ingest 流水线写库后失效缓存都从这一处取，保证两端口径一致。
-QA_TITLES_CACHE_SCOPE = "dm-qa-titles"
+# ------------------------------------------------------------
+# Redis 缓存 scope：API 侧读缓存与写侧失效共用同一套命名
+# ------------------------------------------------------------
+# 每个可缓存的只读接口对应一个 scope（按剧本维度切分）。缓存 key 里拼上该 scope
+# 的版本号，写操作 bump 版本号即整体失效，无需扫描删除。命名集中在这里，
+# 避免出现「读侧拼的 key 与写侧 bump 的 scope 对不上」这类静默失效的 bug。
+QA_TITLES_CACHE_SCOPE = "dm-qa-titles"  # 问答标题链（qa-titles）
+CACHE_SCOPE_STORIES = "dm-stories"  # 故事还原列表 / 精准取回
+CACHE_SCOPE_SYNTHESIS = "dm-synthesis"  # 故事还原合成文章
+CACHE_SCOPE_STORY_DETAIL = "dm-story"  # 单个故事条目详情（含公开划线）
+CACHE_SCOPE_HIGHLIGHTS = "dm-highlights"  # 共读时间线（公开划线列表）
+CACHE_SCOPE_QUESTIONS = "dm-questions"  # 用户提问列表
+CACHE_SCOPE_GUIDE_QUESTIONS = "dm-guide-questions"  # 引导问题 Top N
+CACHE_SCOPE_STATUS = "dm-status"  # 手册索引状态 / 导入总进度
+CACHE_SCOPE_JOB = "dm-job"  # 单个解析任务进度
+CACHE_SCOPE_SEARCH = "dm-search"  # 语义检索 / 问答结果
+
+
+def dm_cache_scope(kind: str, key: str) -> str:
+    """拼接缓存 scope：``<kind>:<key>``，key 统一小写去空格。"""
+    return f"{kind}:{(key or '').strip().lower()}"
 
 
 def qa_titles_cache_scope(script_code: str) -> str:
     """某个剧本的问答标题链缓存 scope（script_code 统一小写后拼接）。"""
-    return f"{QA_TITLES_CACHE_SCOPE}:{(script_code or '').strip().lower()}"
+    return dm_cache_scope(QA_TITLES_CACHE_SCOPE, script_code)
+
+
+def story_detail_cache_scope(story_id: str) -> str:
+    """单个故事条目详情的缓存 scope（按条目 id，不按剧本）。"""
+    return dm_cache_scope(CACHE_SCOPE_STORY_DETAIL, story_id)
+
+
+def job_cache_scope(job_id: str) -> str:
+    """单个解析任务进度的缓存 scope（按 job id）。"""
+    return dm_cache_scope(CACHE_SCOPE_JOB, job_id)
+
+
+def content_cache_scopes(script_code: str) -> List[str]:
+    """解析流水线的产出内容涉及的全部缓存 scope。
+
+    ingest 跑完（或重跑）后这些域的数据都变了，一次性全部 bump：
+    QA 树、故事卡片、合成文章、索引状态、检索结果。
+    注意检索结果也在内 —— 重跑后向量库整体换血，旧命中必须失效。
+    """
+    code = (script_code or "").strip().lower()
+    if not code:
+        return []
+    return [
+        qa_titles_cache_scope(code),
+        dm_cache_scope(CACHE_SCOPE_STORIES, code),
+        dm_cache_scope(CACHE_SCOPE_SYNTHESIS, code),
+        dm_cache_scope(CACHE_SCOPE_STATUS, code),
+        dm_cache_scope(CACHE_SCOPE_SEARCH, code),
+    ]
 
 # 用户提问状态机：pending 待解答 → answered 已解答 / dismissed 无效问题
 QUESTION_PENDING = "pending"

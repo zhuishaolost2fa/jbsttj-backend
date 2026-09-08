@@ -203,7 +203,20 @@ class ScriptService:
         return result
 
     async def get_script(self, id_or_code: str) -> ScriptItem:
-        """按 UUID 或业务 code 取详情，前端拿哪个都能查。"""
+        """按 UUID 或业务 code 取详情，前端拿哪个都能查。
+
+        详情页是访问量最大的读接口（列表点进来的落地页），而剧本内容只在编辑后
+        变化（所有写接口都会 bump 全局版本号，详情缓存同样挂在它上面），
+        所以走 Redis 缓存。浏览量 +1 不失效缓存 —— 计数晚几十秒更新没有感知。
+        """
+        version = await cache.get_version()
+        cache_key = (
+            f"jbs:cache:scripts:detail:v1:{version}:{(id_or_code or '').strip().lower()}"
+        )
+        cached = await cache.cache_get_model(cache_key, ScriptItem)
+        if cached is not None:
+            return cached
+
         row = None
         if _looks_like_uuid(id_or_code):
             row = await self.repo.get(id_or_code)
@@ -211,7 +224,11 @@ class ScriptService:
             row = await self.repo.get_by_code(id_or_code.lower())
         if row is None:
             raise NotFoundError(f"剧本不存在: {id_or_code}", code="script_not_found")
-        return self._to_item(row, await self._label_map())
+        item = self._to_item(row, await self._label_map())
+        await cache.cache_set_model(
+            cache_key, item, ttl_seconds=settings.script_list_cache_ttl
+        )
+        return item
 
     async def record_view(self, id_or_code: str) -> None:
         """剧本详情被浏览时浏览量 +1。
@@ -511,15 +528,15 @@ class ScriptService:
         else:
             await self.repo.soft_delete(script_id)
 
-        # 4) 失效该剧本的 QA 标题链缓存：同名分片剧本共用同一个 DM 聚合 code，
-        #    删掉一本后残留缓存会把已删分片的 QA 也展示出来，必须 bump scope。
+        # 4) 失效该剧本的全部 DM 内容缓存：同名分片剧本共用同一个 DM 聚合 code，
+        #    删掉一本后残留缓存会把已删分片的 QA / 故事卡片也展示出来，必须 bump。
         try:
             dm_code = (slugify(str(row.get("title") or "")) or str(script_id)).strip().lower()
             await run_in_threadpool(
-                cache.bump_scope_version_sync, store_mod.qa_titles_cache_scope(dm_code)
+                cache.bump_scope_versions_sync, store_mod.content_cache_scopes(dm_code)
             )
         except Exception as exc:  # noqa: BLE001 - Redis 不可用时靠 TTL 兜底
-            logger.warning("失效 QA 标题链缓存失败 script=%s: %s", script_id, exc)
+            logger.warning("失效 DM 内容缓存失败 script=%s: %s", script_id, exc)
 
         logger.info("删除剧本 %s（含导入副作用清理）", script_id)
         await self._invalidate_list_cache()
@@ -867,10 +884,10 @@ async def purge_dm_guide_for_file(
         try:
             dm_code = (slugify(str(row.get("title") or "")) or script_id).strip().lower()
             await run_in_threadpool(
-                cache.bump_scope_version_sync, store_mod.qa_titles_cache_scope(dm_code)
+                cache.bump_scope_versions_sync, store_mod.content_cache_scopes(dm_code)
             )
         except Exception as exc:  # noqa: BLE001 - Redis 不可用时靠 TTL 兜底
-            logger.warning("失效 QA 标题链缓存失败 script=%s: %s", script_id, exc)
+            logger.warning("失效 DM 内容缓存失败 script=%s: %s", script_id, exc)
 
         cleaned.append(script_id)
         logger.info("文件删除联动清理 DM 解析产物 script=%s file=%s", script_id, file_id)

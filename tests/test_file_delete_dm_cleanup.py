@@ -112,7 +112,7 @@ def _run(svc, file_id, user_id="user-1", scripts_repo=None, purge=True):
         "app.services.script_service.ScriptRepository",
         return_value=scripts_repo or FakeScriptsRepo(),
     ), mock.patch(
-        "app.services.script_service.cache.bump_scope_version_sync"
+        "app.services.script_service.cache.bump_scope_versions_sync"
     ) as bump:
         asyncio.run(svc.delete_file(_user(user_id), file_id, purge=purge))
         return store, bump
@@ -136,8 +136,9 @@ def test_delete_file_purges_dm_guide_side_effects():
     # 2) 剧本行保留，但 extra 摘掉了 dmGuide
     assert scripts.updates and scripts.updates[0][0] == "script-1"
     assert scripts.updates[0][1]["extra"] == {}
-    # 3) QA 标题链缓存按 DM 聚合 code 失效（雾都疑影 -> wu-dou-yi-ying）
-    assert bump.call_args_list and "wu-dou-yi-ying" in bump.call_args_list[0][0][0]
+    # 3) DM 内容缓存按 DM 聚合 code 批量失效（雾都疑影 -> wu-dou-yi-ying）
+    scopes = bump.call_args_list[0][0][0]
+    assert any("wu-dou-yi-ying" in s for s in scopes)
     # 4) 无其它引用 → OSS 对象物理删除
     assert oss.deleted == [GUIDE_KEY]
     # 5) 文件记录本身软删

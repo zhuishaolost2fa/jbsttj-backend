@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
@@ -83,6 +84,11 @@ def script_dm_code(script: Any) -> str:
     return (slugify(title) or script_id).strip().lower()
 
 
+def _digest(text: str) -> str:
+    """把长文本（检索问题）压成定长摘要，用于拼缓存 key。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:24]
+
+
 # 问答（RAG 生成答案）的提示词。答案必须严格基于手册检索到的内容，
 # 不编造 —— 主持人靠这个带本，瞎编一条规则就是事故。
 _ANSWER_SYSTEM_PROMPT = """你是一名剧本杀主持人（DM）助手，专门依据《主持人手册》回答主持人带本过程中的问题。
@@ -104,6 +110,22 @@ _PARSE_STATUSES = {
     "embedding",
 }
 _TERMINAL_DONE = {"completed", "skipped"}
+# 任务终态：这些状态下进度不会再变，可以安全缓存
+_TERMINAL_JOB_STATUSES = _TERMINAL_DONE | {"failed", "cancelled"}
+# import-status 的终态：解析已结束或明确无法进行，不会自行推进
+_TERMINAL_OVERALL_STATUSES = {"ready", "failed", "no_guide", "parsed"}
+
+
+def _is_terminal_status(status: "DMGuideStatus") -> bool:
+    """手册状态是否进入终态 —— 只有终态才允许写缓存。
+
+    没有任务时状态来自文档聚合（静态数据）；有任务时看任务是否已完成 /
+    失败 / 取消 / 复用。解析进行中返回 False，进度接口保持近实时。
+    """
+    job = status.job
+    if job is None:
+        return True
+    return str(job.status) in _TERMINAL_JOB_STATUSES
 
 
 class DMGuideService:
@@ -115,6 +137,55 @@ class DMGuideService:
     @property
     def settings(self) -> Settings:
         return self._settings
+
+    # --------------------------------------------------------
+    # 缓存（cache-aside）
+    # --------------------------------------------------------
+    # 剧本详情页一次打开会并发打七八个只读接口（状态、问答树、故事卡片、
+    # 合成文章、引导问题、划线…），而这些接口的源数据只在两种时刻才变：
+    # ingest 流水线跑完，或用户写了一条划线 / 真人答案。
+    # 所以全部按「scope 版本号 + 参数」缓存，写侧 bump 版本号即整体失效；
+    # Redis 不可用时版本号读成 0、读写全部降级为直查数据库，接口行为不变。
+
+    async def _cache_key(self, scope: str, *parts: Any) -> str:
+        """拼缓存 key：``<scope>:<版本号>:<参数...>``。"""
+        version = await cache.get_scope_version(scope)
+        suffix = ":".join(str(p) for p in parts if p not in (None, ""))
+        return f"{scope}:{version}:{suffix}" if suffix else f"{scope}:{version}"
+
+    async def _invalidate_highlight_caches(self, *, story_id: str, script_code: str) -> None:
+        """划线写操作（增 / 改 / 删）后失效相关缓存。
+
+        一条划线同时出现在三处缓存里，缺一不可：
+        - 故事条目详情（挂着公开划线列表与该条目的划线计数）；
+        - 共读时间线 / 条目级划线列表（可能按 code 查，也可能按 story_id 查）；
+        - 故事卡片列表（每行带 publicHighlights 计数）。
+        """
+        code = (script_code or "").strip().lower()
+        await cache.bump_scope_versions(
+            [
+                store_mod.story_detail_cache_scope(story_id),
+                store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_HIGHLIGHTS, code),
+                store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_HIGHLIGHTS, story_id),
+                store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_STORIES, code),
+            ]
+        )
+
+    async def _invalidate_question_caches(self, script_code: str) -> None:
+        """用户提问发生变化后失效：提问列表 + 引导问题 Top N。"""
+        code = (script_code or "").strip().lower()
+        await cache.bump_scope_versions(
+            [
+                store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_QUESTIONS, code),
+                store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_GUIDE_QUESTIONS, code),
+            ]
+        )
+
+    async def _invalidate_status_cache(self, script_code: str) -> None:
+        """触发解析后失效手册状态 / 导入进度缓存（两者共用 status scope）。"""
+        await cache.bump_scope_versions(
+            [store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_STATUS, script_code)]
+        )
 
     # --------------------------------------------------------
     # 守门
@@ -292,6 +363,9 @@ class DMGuideService:
             ) from exc
 
         logger.info("DM 解析任务已派发 job=%s script=%s key=%s", job_id, script_id, ref.object_key)
+        # 状态与导入进度缓存里还留着「上次解析的终态」，不失效的话前端会继续
+        # 看到旧的已完成状态，直到 TTL 过期才切换到「解析中」
+        await self._invalidate_status_cache(script_code)
         return IngestResponse(
             job_id=job_id,
             status=store_mod.JOB_PENDING,
@@ -371,21 +445,45 @@ class DMGuideService:
         )
 
     async def get_job(self, job_id: str) -> JobProgress:
+        # 解析中的进度必须近实时（前端 3-5 秒一轮询），只缓存终态快照
+        scope = store_mod.job_cache_scope(job_id)
+        cache_key = await self._cache_key(scope)
+        cached = await cache.cache_get_model(cache_key, JobProgress)
+        if cached is not None:
+            return cached
+
         store = store_mod.get_dm_store()
         row = await run_in_threadpool(store.get_job, job_id)
         if not row:
             raise NotFoundError(f"任务不存在: {job_id}", code="dm_job_not_found")
-        return self._to_progress(row)
+        progress = self._to_progress(row)
+        if progress.status in _TERMINAL_DONE or progress.status in ("failed", "cancelled"):
+            await cache.cache_set_model(
+                cache_key, progress, ttl_seconds=self._settings.dm_status_cache_ttl
+            )
+        return progress
 
     async def get_status(self, script: Any) -> DMGuideStatus:
-        """剧本详情页用的聚合状态。"""
+        """剧本详情页用的聚合状态。
+
+        只在**终态**才写缓存：解析过程中 status 每几秒就变，缓存只会让用户
+        看到卡住的进度。终态（无任务 / 任务已完成-失败-取消-复用）的数据不再变化，
+        缓存它挡住详情页刷新时的重复聚合查询；下次触发解析时 trigger_ingest
+        会 bump 该剧本的 status scope，缓存立即失效。
+        """
         script_id = str(getattr(script, "id", "") or "")
         script_code = script_dm_code(script)
+        status_scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_STATUS, script_code)
+        status_key = await self._cache_key(status_scope, script_id)
+        cached = await cache.cache_get_model(status_key, DMGuideStatus)
+        if cached is not None:
+            return cached
+
         ref = DMGuideRef.from_extra(getattr(script, "extra", None))
         imported_by, importer_profile = await self._importer_profile(script)
 
         if not self._settings.dm_rag_enabled:
-            return DMGuideStatus(
+            result = DMGuideStatus(
                 script_id=script_id,
                 has_guide=bool(ref),
                 indexed=False,
@@ -394,6 +492,10 @@ class DMGuideService:
                 imported_by_avatar_url=importer_profile.get("avatar_url"),
                 imported_by_avatar_color=importer_profile.get("avatar_color"),
             )
+            await cache.cache_set_model(
+                status_key, result, ttl_seconds=self._settings.dm_status_cache_ttl
+            )
+            return result
 
         store = store_mod.get_dm_store()
         docs = await run_in_threadpool(store.list_active_documents_by_code, script_code)
@@ -431,7 +533,7 @@ class DMGuideService:
         version = int(latest_doc.get("version") or 0) if latest_doc else 0
         indexed = bool(total_chunks > 0)
 
-        return DMGuideStatus(
+        result = DMGuideStatus(
             script_id=script_id,
             has_guide=bool(ref),
             indexed=indexed,
@@ -448,6 +550,11 @@ class DMGuideService:
             imported_by_avatar_url=importer_profile.get("avatar_url"),
             imported_by_avatar_color=importer_profile.get("avatar_color"),
         )
+        if _is_terminal_status(result):
+            await cache.cache_set_model(
+                status_key, result, ttl_seconds=self._settings.dm_status_cache_ttl
+            )
+        return result
 
     async def _importer_profile(self, script: Any) -> Tuple[Optional[str], Dict[str, Any]]:
         """解析剧本导入者的展示资料（问答页「感谢 xx 导入手册」用）。
@@ -475,9 +582,21 @@ class DMGuideService:
         前端上传完手册、保存剧本后即开始轮询这个接口即可，不必再分别盯
         `GET /uploads/{task_id}` 和解析进度接口。传 `upload_task_id` 可把
         传输中的实时字节进度也并入 `upload` 字段（传输通常只有几秒，不传也可）。
+
+        缓存口径：只有**未传 uploadTaskId 且整体进入终态**才读写缓存 ——
+        传输中的字节进度是实时的，绝不能缓存。
         """
         script_id = str(getattr(script, "id", "") or "")
         title = str(getattr(script, "title", "") or "") or None
+
+        import_scope = store_mod.dm_cache_scope(
+            store_mod.CACHE_SCOPE_STATUS, script_dm_code(script)
+        )
+        import_key = await self._cache_key(import_scope, f"import:{script_id}")
+        if not upload_task_id:
+            cached = await cache.cache_get_model(import_key, ImportStatus)
+            if cached is not None:
+                return cached
 
         status = await self.get_status(script)
 
@@ -577,7 +696,7 @@ class DMGuideService:
         ]
 
         dm_guide = status.model_dump(by_alias=True)
-        return ImportStatus(
+        result = ImportStatus(
             script_id=script_id,
             title=title,
             overall_status=overall,
@@ -585,6 +704,11 @@ class DMGuideService:
             upload=upload_detail,
             dm_guide=dm_guide,
         )
+        if not upload_task_id and overall in _TERMINAL_OVERALL_STATUSES:
+            await cache.cache_set_model(
+                import_key, result, ttl_seconds=self._settings.dm_status_cache_ttl
+            )
+        return result
 
     # --------------------------------------------------------
     # 检索
@@ -606,6 +730,9 @@ class DMGuideService:
         `mode=hybrid` 时问答对与原文块各查一轮。两次 RPC 都要用同一条查询向量，
         所以向量化只做一次 —— embedding 是这里唯一的外部网络调用，
         重复一次就把 P99 翻倍。
+
+        结果只随手册内容变化（重跑解析会 bump scope 失效），与提问者无关，
+        所以整段走 Redis 缓存：命中时连 embedding 都不用调，直接返回。
         """
         self._require_rag_config()
         query = (query or "").strip()
@@ -624,6 +751,24 @@ class DMGuideService:
             if min_similarity is not None
             else self._settings.dm_search_min_similarity
         )
+
+        # 缓存 key：问题全文 hash + 全部影响结果的参数（不同 topK / 阈值结果不同）
+        scope = store_mod.dm_cache_scope(
+            store_mod.CACHE_SCOPE_SEARCH, script_code or script_id or ""
+        )
+        cache_key = await self._cache_key(
+            scope,
+            _digest(query),
+            mode,
+            top_k,
+            round(threshold, 4),
+            category or "-",
+            script_id or "-",
+            document_id or "-",
+        )
+        cached = await cache.cache_get_model(cache_key, SearchResult)
+        if cached is not None:
+            return cached
 
         started = time.perf_counter()
         from app.services.llm import get_llm_client
@@ -689,7 +834,7 @@ class DMGuideService:
         hits = _merge_hits_qa_first(qa_hits, chunk_hits, self._settings.dm_search_qa_boost)
 
         took = int((time.perf_counter() - started) * 1000)
-        return SearchResult(
+        result = SearchResult(
             query=query,
             mode=mode,
             document_id=document_id,
@@ -698,6 +843,10 @@ class DMGuideService:
             hits=hits,
             took_ms=took,
         )
+        await cache.cache_set_model(
+            cache_key, result, ttl_seconds=self._settings.dm_search_cache_ttl
+        )
+        return result
 
     # --------------------------------------------------------
     # 问答（RAG 生成答案）
@@ -743,6 +892,25 @@ class DMGuideService:
                 code="dm_not_indexed",
                 details={"hasGuide": status.has_guide, "indexed": False},
             )
+
+        # 同一问题在带本现场会被反复问（前端引导问题、页面来回切换），
+        # 而答案只随手册内容变化 —— 走缓存，命中即省掉整条检索 + LLM 链路。
+        # 注意：命中时**不重复沉淀待解答问题**（同一问题缓存期内只记一次，
+        # 沉淀的意义是「有人问过」，重复计数没有价值）。
+        scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_SEARCH, script_dm_code(script))
+        ask_key = await self._cache_key(
+            scope,
+            "ask",
+            _digest(question),
+            mode,
+            top_k,
+            "-" if min_similarity is None else round(min_similarity, 4),
+            category or "-",
+            "llm" if use_llm else "direct",
+        )
+        cached = await cache.cache_get_model(ask_key, AskResponse)
+        if cached is not None:
+            return cached
 
         started = time.perf_counter()
         result = await self.search(
@@ -826,7 +994,7 @@ class DMGuideService:
                 user_id=user_id,
             )
 
-        return AskResponse(
+        response = AskResponse(
             question=question,
             answer=answer,
             sources=sources,
@@ -836,6 +1004,10 @@ class DMGuideService:
             best_similarity=round(best_similarity, 4),
             need_human_answer=need_human,
         )
+        await cache.cache_set_model(
+            ask_key, response, ttl_seconds=self._settings.dm_search_cache_ttl
+        )
+        return response
 
     async def _record_low_similarity_question(
         self,
@@ -863,6 +1035,9 @@ class DMGuideService:
                 best_similarity=best_similarity,
                 created_by=user_id or None,
             )
+            # 新问题进池 / 老问题计数 +1：提问列表与引导问题的缓存立即失效，
+            # 让主持人下一秒就能看到它（否则要等 UGC 缓存过期）
+            await self._invalidate_question_caches(script_dm_code(script))
         except Exception as exc:  # noqa: BLE001 - 落库失败不影响问答主链路
             logger.warning("低相似度问题落库失败（已忽略）script=%s: %s",
                            getattr(script, "id", "?"), exc)
@@ -890,6 +1065,13 @@ class DMGuideService:
             )
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
+
+        scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_QUESTIONS, code)
+        cache_key = await self._cache_key(scope, status_filter or "-", limit, offset)
+        cached = await cache.cache_get_model(cache_key, QuestionListResult)
+        if cached is not None:
+            return cached
+
         store = store_mod.get_dm_store()
         rows, total = await run_in_threadpool(
             store.list_questions,
@@ -900,7 +1082,11 @@ class DMGuideService:
         )
         items = [_to_question_record(r) for r in rows]
         await self._attach_profiles(items)
-        return QuestionListResult(total=total, items=items)
+        result = QuestionListResult(total=total, items=items)
+        await cache.cache_set_model(
+            cache_key, result, ttl_seconds=self._settings.dm_ugc_cache_ttl
+        )
+        return result
 
     async def answer_question(
         self, question_id: str, *, answer: str, answered_by: str
@@ -925,6 +1111,8 @@ class DMGuideService:
             raise NotFoundError(f"提问记录不存在: {question_id}", code="dm_question_not_found")
         record = _to_question_record(row)
         await self._attach_profiles([record])
+        # 引导问题取的就是「已解答」的提问，解答后必须让这两份缓存立即失效
+        await self._invalidate_question_caches(record.script_code)
         return record
 
     async def guide_questions(
@@ -936,15 +1124,28 @@ class DMGuideService:
             raise ValidationError("剧本标识缺失", code="script_code_required")
         top = limit or self._settings.dm_guide_questions_limit
         top = max(1, min(top, 10))
+
+        scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_GUIDE_QUESTIONS, code)
+        cache_key = await self._cache_key(scope, top)
+        cached = await cache.cache_get_model(cache_key, GuideQuestions)
+        if cached is not None:
+            # script_title 随调用方而变（按名式接口才有），不进 key，命中后覆写
+            cached.script_title = script_title or None
+            return cached
+
         store = store_mod.get_dm_store()
         rows = await run_in_threadpool(store.list_guide_questions, code, limit=top)
         items = [_to_question_record(r) for r in rows]
         await self._attach_profiles(items)
-        return GuideQuestions(
+        result = GuideQuestions(
             script_code=code,
             script_title=script_title or None,
             items=items,
         )
+        await cache.cache_set_model(
+            cache_key, result, ttl_seconds=self._settings.dm_ugc_cache_ttl
+        )
+        return result
 
     async def _attach_profiles(self, records: List[QuestionRecord]) -> None:
         """读取时批量关联 profiles，把最新昵称/头像合并进记录。
@@ -996,18 +1197,32 @@ class DMGuideService:
         code = (script_code or "").strip().lower()
         if not code:
             raise ValidationError("剧本标识缺失", code="script_code_required")
+        # 故事条目只在流水线落库后变化，列表与「按 id 精准取回」都走缓存：
+        # 详情页一次打开会同时请求全量列表 + 若干节的锚点组合，缓存收益明显。
+        scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_STORIES, code)
+
         clean_ids = [str(i).strip() for i in (ids or []) if str(i).strip()]
         if clean_ids:
+            cache_key = await self._cache_key(scope, "ids", _digest(",".join(sorted(clean_ids))))
+            cached = await cache.cache_get_model(cache_key, StoryListResult)
+            if cached is not None:
+                cached.script_title = script_title or None
+                return cached
             store = store_mod.get_dm_store()
             rows = await run_in_threadpool(store.list_story_cards_by_ids, clean_ids)
             # 只允许返回属于该剧本的条目，防止跨剧本 id 越权读取
             rows = [r for r in rows if str(r.get("script_code") or "").lower() == code]
-            return StoryListResult(
+            result = StoryListResult(
                 script_code=code,
                 script_title=script_title or None,
                 total=len(rows),
                 items=[_to_story_item(r) for r in rows],
             )
+            await cache.cache_set_model(
+                cache_key, result, ttl_seconds=self._settings.dm_content_cache_ttl
+            )
+            return result
+
         if story_type and story_type not in store_mod.STORY_TYPES:
             raise ValidationError(
                 f"不支持的故事类型: {story_type}",
@@ -1016,6 +1231,11 @@ class DMGuideService:
             )
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
+        cache_key = await self._cache_key(scope, story_type or "-", limit, offset)
+        cached = await cache.cache_get_model(cache_key, StoryListResult)
+        if cached is not None:
+            cached.script_title = script_title or None
+            return cached
         store = store_mod.get_dm_store()
         rows, total = await run_in_threadpool(
             store.list_stories,
@@ -1024,12 +1244,16 @@ class DMGuideService:
             limit=limit,
             offset=offset,
         )
-        return StoryListResult(
+        result = StoryListResult(
             script_code=code,
             script_title=script_title or None,
             total=total,
             items=[_to_story_item(r) for r in rows],
         )
+        await cache.cache_set_model(
+            cache_key, result, ttl_seconds=self._settings.dm_content_cache_ttl
+        )
+        return result
 
     async def get_synthesis(
         self,
@@ -1052,15 +1276,25 @@ class DMGuideService:
         code = (script_code or "").strip().lower()
         if not code:
             raise ValidationError("剧本标识缺失", code="script_code_required")
+
+        scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_SYNTHESIS, code)
+        cache_key = await self._cache_key(scope)
+        cached = await cache.cache_get_model(cache_key, SynthesisResult)
+        if cached is not None:
+            cached.script_title = script_title or None
+            return cached
+
         store = store_mod.get_dm_store()
         row = await run_in_threadpool(store.get_synthesis, code)
         if not row:
+            # 未生成：状态还会变（生成中），不缓存 —— 否则用户要等 TTL 才看得到文章
             return SynthesisResult(
                 script_code=code,
                 script_title=script_title or None,
                 overview=None,
                 synthesis_status="pending",
             )
+        synthesis_status = str(row.get("synthesis_status") or "ready")
         anchors = row.get("anchor_stories") or {}
         if not isinstance(anchors, dict):
             anchors = {}
@@ -1072,17 +1306,23 @@ class DMGuideService:
             ending=str(row.get("ending") or ""),
             anchor_stories=anchors,
         )
-        return SynthesisResult(
+        result = SynthesisResult(
             script_code=code,
             script_title=script_title or None,
             document_id=str(row.get("document_id") or "") or None,
             overview=overview,
-            synthesis_status=str(row.get("synthesis_status") or "ready"),
+            synthesis_status=synthesis_status,
             model=str(row.get("model") or "") or None,
             prompt_version=str(row.get("prompt_version") or "") or None,
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
         )
+        # 只缓存终态（ready / failed）：生成中的状态下一次请求就可能变
+        if synthesis_status in (store_mod.SYNTHESIS_READY, store_mod.SYNTHESIS_FAILED):
+            await cache.cache_set_model(
+                cache_key, result, ttl_seconds=self._settings.dm_content_cache_ttl
+            )
+        return result
 
     async def get_story(
         self, story_id: str, *, highlight_limit: int = 50, highlight_offset: int = 0
@@ -1091,7 +1331,16 @@ class DMGuideService:
 
         `highlight_count` 是含私有在内的全部活跃划线数（作者自己看得到），
         `public_highlights` 是公开数 —— 两个数字分开算，前端按视角取用。
+
+        条目本体是解析产物，但挂着公开划线（UGC）—— 按 UGC 口径缓存，
+        有人提交 / 修改 / 删除划线时会 bump 这个条目的 scope 立即失效。
         """
+        scope = store_mod.story_detail_cache_scope(story_id)
+        cache_key = await self._cache_key(scope, highlight_limit, highlight_offset)
+        cached = await cache.cache_get_model(cache_key, StoryDetail)
+        if cached is not None:
+            return cached
+
         store = store_mod.get_dm_store()
         row = await run_in_threadpool(store.get_story, story_id)
         if not row:
@@ -1108,7 +1357,11 @@ class DMGuideService:
         highlights = [_to_highlight_record(r) for r in hl_rows]
         item.public_highlights = hl_total
         await self._enrich_highlights(highlights)
-        return StoryDetail(**item.model_dump(), highlights=highlights)
+        detail = StoryDetail(**item.model_dump(), highlights=highlights)
+        await cache.cache_set_model(
+            cache_key, detail, ttl_seconds=self._settings.dm_ugc_cache_ttl
+        )
+        return detail
 
     # --------------------------------------------------------
     # 划线评论（Web Annotation 式文本锚点）
@@ -1129,6 +1382,9 @@ class DMGuideService:
         - 共读时间线：script_code + visibility=public（公开划线跨条目按时间倒序）；
         - 我的划线：user_id（任意可见性）；
         - 条目详情：story_id + visibility=public（见 :meth:`get_story`）。
+
+        只有「共读时间线」这类**公开、与登录者无关**的视角才缓存；
+        「我的划线」是个人私有数据，不缓存。
         """
         if not (script_code or story_id or user_id):
             raise ValidationError(
@@ -1143,10 +1399,24 @@ class DMGuideService:
             )
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
+        code = (script_code or "").strip().lower()
+        # 公开视角（不按 user_id 过滤）才缓存：结果是所有人看到同一份
+        cacheable = not user_id
+        scope = store_mod.dm_cache_scope(store_mod.CACHE_SCOPE_HIGHLIGHTS, code or story_id or "")
+        cache_key = (
+            await self._cache_key(scope, story_id or "-", visibility or "-", limit, offset)
+            if cacheable
+            else ""
+        )
+        if cache_key:
+            cached = await cache.cache_get_model(cache_key, HighlightListResult)
+            if cached is not None:
+                return cached
+
         store = store_mod.get_dm_store()
         rows, total = await run_in_threadpool(
             store.list_highlights,
-            script_code=(script_code or "").strip().lower() or None,
+            script_code=code or None,
             story_id=story_id,
             user_id=user_id,
             visibility=visibility,
@@ -1155,7 +1425,12 @@ class DMGuideService:
         )
         items = [_to_highlight_record(r) for r in rows]
         await self._enrich_highlights(items)
-        return HighlightListResult(total=total, items=items)
+        result = HighlightListResult(total=total, items=items)
+        if cache_key:
+            await cache.cache_set_model(
+                cache_key, result, ttl_seconds=self._settings.dm_ugc_cache_ttl
+            )
+        return result
 
     async def create_highlight(
         self, *, user_id: str, payload: CreateHighlightRequest
@@ -1193,6 +1468,9 @@ class DMGuideService:
             ) from exc
         record = _to_highlight_record(row)
         await self._enrich_highlights([record])
+        await self._invalidate_highlight_caches(
+            story_id=payload.story_id, script_code=str(story.get("script_code") or "")
+        )
         return record
 
     async def update_highlight(
@@ -1222,6 +1500,10 @@ class DMGuideService:
             raise NotFoundError(f"划线不存在: {highlight_id}", code="dm_highlight_not_found")
         record = _to_highlight_record(row)
         await self._enrich_highlights([record])
+        await self._invalidate_highlight_caches(
+            story_id=str(existing.get("story_id") or ""),
+            script_code=str(existing.get("script_code") or ""),
+        )
         return record
 
     async def delete_highlight(self, *, highlight_id: str, user_id: str) -> None:
@@ -1235,6 +1517,10 @@ class DMGuideService:
                 "只能删除自己的划线评论", code="highlight_not_owner"
             )
         await run_in_threadpool(store.soft_delete_highlight, highlight_id)
+        await self._invalidate_highlight_caches(
+            story_id=str(existing.get("story_id") or ""),
+            script_code=str(existing.get("script_code") or ""),
+        )
 
     async def _enrich_highlights(self, records: List[HighlightRecord]) -> None:
         """给划线记录补挂接条目标题/类型 + 作者资料（一次批量查询）。
@@ -1294,16 +1580,11 @@ class DMGuideService:
             raise ValidationError("剧本标识缺失，无法定位标题链", code="script_code_required")
 
         scope = store_mod.qa_titles_cache_scope(code)
-        version = await cache.get_scope_version(scope)
-        cache_key = f"{store_mod.QA_TITLES_CACHE_SCOPE}:{code}:{version}"
-        cached = await cache.cache_get(cache_key)
+        cache_key = await self._cache_key(scope)
+        cached = await cache.cache_get_model(cache_key, QATitleChain)
         if cached is not None:
-            try:
-                chain = QATitleChain.model_validate_json(cached)
-                chain.script_title = script_title or None
-                return chain
-            except Exception:  # noqa: BLE001 - 缓存内容损坏当作 miss 重新查询
-                logger.warning("问答标题链缓存反序列化失败，重新查询: %s", cache_key)
+            cached.script_title = script_title or None
+            return cached
 
         store = store_mod.get_dm_store()
         rows = await run_in_threadpool(store.list_qa_titles, code)
@@ -1315,10 +1596,8 @@ class DMGuideService:
             total_qa=total_qa,
             titles=titles,
         )
-        await cache.cache_set(
-            cache_key,
-            chain.model_dump_json(),
-            ttl_seconds=self._settings.dm_qa_cache_ttl,
+        await cache.cache_set_model(
+            cache_key, chain, ttl_seconds=self._settings.dm_qa_cache_ttl
         )
         return chain
 

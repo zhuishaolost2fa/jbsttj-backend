@@ -190,6 +190,21 @@ class Settings(BaseSettings):
     # TTL 只是兜底（防止失效失败后长期读到旧数据）。Redis 不可用时自动降级直查数据库。
     dm_qa_cache_ttl: int = 600
 
+    # ---------------- 详情页其它只读接口的缓存 ----------------
+    # 解析产出类（故事卡片 / 合成文章 / 检索结果）：只在 ingest 流水线落库后变化，
+    # 流水线会主动失效，TTL 纯兜底 —— 可以给得比较长。
+    dm_content_cache_ttl: int = 600
+    # 检索与问答（含 embedding 调用）：同一问题短时间内重复问很常见（前端引导问题、
+    # 页面来回切换），缓存直接省掉一次 embedding + 两路向量查询。
+    # 结果只随解析重跑变化，重跑时由流水线失效。
+    dm_search_cache_ttl: int = 300
+    # 用户生成内容类（划线评论 / 用户提问）：随时可能新增，写入侧会主动失效，
+    # 但失效失败时不能长时间读到旧数据，所以 TTL 压短。
+    dm_ugc_cache_ttl: int = 60
+    # 状态与进度类（手册索引状态 / 导入总进度 / 任务进度）：只有**终态**才缓存
+    # （解析中必须近实时），终态数据不再变化，短 TTL 足够挡住详情页的并发刷新。
+    dm_status_cache_ttl: int = 15
+
     # ---------------- 硅基流动（SiliconFlow）----------------
     # OpenAI 兼容协议，chat 与 embedding 共用同一个 base_url 与 API Key
     siliconflow_api_key: str = ""
