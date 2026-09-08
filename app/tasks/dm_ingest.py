@@ -995,11 +995,19 @@ def _run_synthesis(
         return
 
     items: List[StoryItem] = []
+    # title -> id 映射：LLM 只认得 title，落库前要解析成 id，
+    # 前端才能用 GET /stories?ids=... 精准取到「这一节关联的几张卡片」，
+    # 而不是在上百张碎片里做标题字符串匹配（分页未加载时会定位失败）。
+    title_to_id: Dict[str, str] = {}
     for r in rows:
+        title = str(r.get("title") or "")
+        sid = r.get("id")
+        if title and sid and title not in title_to_id:
+            title_to_id[title] = str(sid)
         items.append(
             StoryItem(
                 story_type=str(r.get("story_type") or "other"),
-                title=str(r.get("title") or ""),
+                title=title,
                 content=str(r.get("content") or ""),
                 summary=str(r.get("summary") or ""),
                 meta=r.get("meta") if isinstance(r.get("meta"), dict) else {},
@@ -1023,6 +1031,22 @@ def _run_synthesis(
     settings = get_settings()
     model_name = settings.siliconflow_qa_model or settings.siliconflow_chat_model
 
+    # anchor: [{title}] -> [{id, title}]，只保留能映射上 id 的
+    anchors_with_id: Dict[str, List[Dict[str, str]]] = {}
+    dropped = 0
+    for key, titles in (overview.anchor_stories or {}).items():
+        picked: List[Dict[str, str]] = []
+        for t in titles:
+            sid = title_to_id.get(t)
+            if sid:
+                picked.append({"id": sid, "title": t})
+            else:
+                dropped += 1
+        if picked:
+            anchors_with_id[key] = picked
+    if dropped:
+        logger.info("合成文章：doc=%s 有 %s 个锚点 title 映射不到 id（已丢弃）", document_id, dropped)
+
     saved = store.upsert_synthesis(
         document_id=document_id,
         synopsis=overview.synopsis,
@@ -1030,7 +1054,7 @@ def _run_synthesis(
         timeline=overview.timeline,
         roles=overview.roles,
         ending=overview.ending,
-        anchor_stories=overview.anchor_stories,
+        anchor_stories=anchors_with_id,
         model=model_name,
         prompt_version="v1",
     )

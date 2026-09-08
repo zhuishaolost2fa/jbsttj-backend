@@ -701,20 +701,78 @@ class DMStore:
 
         与 :meth:`list_stories`（按剧本聚合）不同 —— 这里按 **document** 取，
         因为合成文章以 document 为粒度（同一剧本多版本时各版本独立成文）。
-        返回字段：title / story_type / content / summary / meta，
-        这些就是 LLM 二次加工所需的全部信息，避开 chunk_id 等无关字段。
+        返回字段：id / title / story_type / content / summary / meta / story_index。
+        id 是给 anchor_stories 用的：LLM 只能输出 title，落库前要把 title 解析成
+        id，前端才能精准拉取关联卡片（见 ``_run_synthesis``）。
         """
         resp = self._request(
             "GET",
             f"/{TABLE_STORIES}",
             params={
                 "document_id": f"eq.{document_id}",
-                "select": "title,story_type,content,summary,meta,story_index",
+                "select": "id,title,story_type,content,summary,meta,story_index",
                 "order": "story_index",
                 "limit": 500,
             },
         )
         return self._rows(resp)
+
+    def get_stories_by_ids(
+        self, story_ids: Sequence[str]
+    ) -> List[Dict[str, Any]]:
+        """按 id 批量取故事条目（合成文章「查看本节关联碎片」用）。
+
+        为什么单独开一个方法而不是复用 :meth:`list_stories`：后者走 RPC
+        ``list_dm_stories``（按剧本聚合 + 算公开划线数），要支持 id 过滤就得改
+        RPC 签名 —— 而 PostgREST 的 ``create or replace function`` 改参数会残留
+        旧签名导致 PGRST203（本项目已踩过一次）。这里直接用 PostgREST 的
+        ``id=in.(...)`` 原生过滤，不动任何函数。
+
+        ``highlight_count`` 单独查一次并按 story_id 聚合回填，避免 N 次请求。
+        """
+        clean = [str(sid).strip() for sid in story_ids if str(sid).strip()]
+        if not clean:
+            return []
+        # PostgREST 的 in 过滤：id=in.(uuid1,uuid2,...)，含逗号/括号需转义，uuid 不会
+        resp = self._request(
+            "GET",
+            f"/{TABLE_STORIES}",
+            params={
+                "id": f"in.({','.join(clean)})",
+                "select": (
+                    "id,document_id,script_code,story_index,story_type,title,"
+                    "summary,meta,section_path,page_start,page_end,char_count"
+                ),
+                "limit": max(len(clean), 1),
+            },
+        )
+        rows = self._rows(resp)
+        if not rows:
+            return []
+
+        counts: Dict[str, int] = {}
+        try:
+            hl = self._request(
+                "GET",
+                f"/{TABLE_HIGHLIGHTS}",
+                params={
+                    "story_id": f"in.({','.join(clean)})",
+                    "select": "story_id",
+                    "visibility": "eq.public",
+                    "status": f"eq.{HL_STATUS_ACTIVE}",
+                    "limit": 1000,
+                },
+            )
+            for h in self._rows(hl):
+                sid = str(h.get("story_id") or "")
+                if sid:
+                    counts[sid] = counts.get(sid, 0) + 1
+        except DatabaseError as exc:  # 划线数拿不到不影响卡片展示
+            logger.warning("批量取故事：聚合公开划线数失败: %s", exc)
+
+        for r in rows:
+            r["highlight_count"] = counts.get(str(r.get("id") or ""), 0)
+        return rows
 
     def upsert_synthesis(
         self,

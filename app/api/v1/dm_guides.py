@@ -460,7 +460,9 @@ async def list_guide_questions(
         "role / clue / ending / other）。每行带 `publicHighlights`（公开划线数），"
         "点击条目可进详情看共读时间线。\n\n"
         "剧本标识与 qa-titles 同口径：`code` 优先，或传 `title`（剧本中文名）自动派生。"
-        "公开可读，无需登录。"
+        "公开可读，无需登录。\n\n"
+        "传 `ids` 时进入**精准取回**模式（合成文章「查看本节关联碎片」用）：按 id 只取这几条，"
+        "忽略分页与类型过滤，且只返回属于该剧本的条目。"
     ),
 )
 async def list_dm_stories(
@@ -472,13 +474,23 @@ async def list_dm_stories(
         pattern="^(timeline|truth|role|clue|ending|other)$",
         description="按故事类型过滤，不传返回全部",
     ),
+    ids: Optional[str] = Query(
+        default=None,
+        description="按 id 精准取回，逗号分隔（如 ids=uuid1,uuid2），命中时忽略分页与类型过滤",
+    ),
     limit: int = Query(default=50, ge=1, le=100, description="每页条数"),
     offset: int = Query(default=0, ge=0, description="分页偏移"),
     service: DMGuideService = Depends(get_dm_guide_service),
 ) -> StoryListResult:
     resolved, name = _resolve_script_code(code, title)
+    id_list = [p.strip() for p in (ids or "").split(",") if p.strip()] or None
     return await service.list_stories(
-        script_code=resolved, script_title=name, story_type=story_type, limit=limit, offset=offset
+        script_code=resolved,
+        script_title=name,
+        story_type=story_type,
+        ids=id_list,
+        limit=limit,
+        offset=offset,
     )
 
 

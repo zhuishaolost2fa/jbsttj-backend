@@ -980,6 +980,7 @@ class DMGuideService:
         script_code: str,
         script_title: str = "",
         story_type: Optional[str] = None,
+        ids: Optional[List[str]] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> StoryListResult:
@@ -987,10 +988,26 @@ class DMGuideService:
 
         列表本身只读手册衍生内容、不含任何用户数据，与 qa-titles 同权限口径，
         无需登录。每行的公开划线数由 SQL 函数一次算好，列表页不产生 N+1。
+
+        ``ids`` 命中时走**精准取回**分支（合成文章「查看本节关联碎片」用）：
+        按 id 直接取这几条，忽略分页与类型过滤。合成文章每节只关联 3~7 张，
+        用它可以在上百张碎片里精确聚焦，避免整列表翻找。
         """
         code = (script_code or "").strip().lower()
         if not code:
             raise ValidationError("剧本标识缺失", code="script_code_required")
+        clean_ids = [str(i).strip() for i in (ids or []) if str(i).strip()]
+        if clean_ids:
+            store = store_mod.get_dm_store()
+            rows = await run_in_threadpool(store.get_stories_by_ids, clean_ids)
+            # 只允许返回属于该剧本的条目，防止跨剧本 id 越权读取
+            rows = [r for r in rows if str(r.get("script_code") or "").lower() == code]
+            return StoryListResult(
+                script_code=code,
+                script_title=script_title or None,
+                total=len(rows),
+                items=[_to_story_item(r) for r in rows],
+            )
         if story_type and story_type not in store_mod.STORY_TYPES:
             raise ValidationError(
                 f"不支持的故事类型: {story_type}",

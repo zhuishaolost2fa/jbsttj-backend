@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
 
@@ -566,6 +566,21 @@ class StoryListResult(BaseModel):
     items: List[StoryItem] = Field(default_factory=list, description="当前页条目")
 
 
+class SynthesisAnchor(BaseModel):
+    """合成文章某一节引用的原 StoryItem 引用。
+
+    保存时（``_run_synthesis``）会把 LLM 输出的 title 解析成 ``{id, title}``：
+    ``id`` 让前端能精准拉取这几张卡片（``GET /stories?ids=...``），而不是在
+    上百张碎片里做标题字符串匹配 —— 后者在标题相近或分页未加载时会定位失败。
+    ``id`` 可能为 None（老数据 / purge 重跑后旧 id 失效），此时前端按 title 兜底。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    id: Optional[str] = Field(default=None, description="关联的 StoryItem id，老数据可能为 null")
+    title: str = Field(default="", description="StoryItem 标题（id 失效时的兜底匹配键）")
+
+
 class SynthesisOverview(BaseModel):
     """「整本剧本脉络」的合成文章 —— 与 script_dm_stories（碎片卡片）互补。
 
@@ -581,10 +596,40 @@ class SynthesisOverview(BaseModel):
     timeline: str = Field(default="", description="时间线：案发前 → 案发 → 后续")
     roles: str = Field(default="", description="角色命运：每个角色的关键抉择与归宿")
     ending: str = Field(default="", description="结局：剧本落幕时的整体收束")
-    anchor_stories: Dict[str, List[str]] = Field(
+    anchor_stories: Dict[str, List[SynthesisAnchor]] = Field(
         default_factory=dict,
-        description="每节引用的 StoryItem title 列表（前端做「展开细节」跳转用）",
+        description="每节引用的 StoryItem（{id, title}），前端据此只展示关联的几张卡片",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_anchors(cls, data: Any) -> Any:
+        """兼容老格式：anchor 元素可能是裸 title 字符串（v1 早期存的）。
+
+        库里 jsonb 是 ``{synopsis: ["标题A", ...]}`` 时，转成 ``[{id: null, title: "标题A"}]``，
+        避免 pydantic 校验直接把整个 synthesis 读接口打挂。
+        """
+        if not isinstance(data, dict):
+            return data
+        # mode="before" 跑在 alias 转换之前，入参键名可能是 snake_case 或 camelCase
+        key = "anchor_stories" if "anchor_stories" in data else "anchorStories"
+        raw = data.get(key)
+        if not isinstance(raw, dict):
+            return data
+        fixed: Dict[str, Any] = {}
+        for k, value in raw.items():
+            if not isinstance(value, list):
+                fixed[k] = []
+                continue
+            fixed[k] = [
+                {"id": None, "title": str(item)}
+                if isinstance(item, str)
+                else item
+                for item in value
+            ]
+        data = dict(data)
+        data[key] = fixed
+        return data
 
 
 class SynthesisResult(BaseModel):
