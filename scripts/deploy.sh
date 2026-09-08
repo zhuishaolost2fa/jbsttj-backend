@@ -7,6 +7,7 @@
 #
 # 前置：/opt/jbs 必须是 git 仓库（git clone 出来的），且 .env 已在 .gitignore 里。
 # 运行时状态文件 .last_good_sha 也在 .gitignore 里，不会污染 git status。
+# 本文件在 git 里为 100755 可执行位，clone 后直接可运行，无需再 chmod +x。
 
 set -euo pipefail
 
