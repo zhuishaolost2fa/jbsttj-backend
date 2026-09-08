@@ -1,0 +1,545 @@
+{
+  "files": [
+    {
+      "match_key": "众念成形",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\众念成形.docx",
+      "file_name": "众念成形.docx",
+      "ext": ".docx",
+      "size": 2867833,
+      "size_mb": 2.7,
+      "variants": {
+        ".docx": "众念成形.docx",
+        ".pdf": "众念成形.pdf"
+      },
+      "candidates": [
+        {
+          "id": "4313d539-ead1-4b9f-a2d0-c2511689ba62",
+          "title": "众念成形",
+          "code": "zhong-nian-cheng-xing",
+          "chunks": 84,
+          "qa": 278,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "六角馆的谋杀鉴赏",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\六角馆的谋杀鉴赏.pdf",
+      "file_name": "六角馆的谋杀鉴赏.pdf",
+      "ext": ".pdf",
+      "size": 301413410,
+      "size_mb": 287.5,
+      "variants": {
+        ".pdf": "六角馆的谋杀鉴赏.pdf"
+      },
+      "candidates": [
+        {
+          "id": "0460e827-7043-4598-8bb6-84b582572180",
+          "title": "六角馆的谋杀鉴赏",
+          "code": "liu-jiao-guan-de-mou-sha-jian-shang",
+          "chunks": 113,
+          "qa": 368,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "六角馆的谋杀鉴赏1",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\六角馆的谋杀鉴赏1.docx",
+      "file_name": "六角馆的谋杀鉴赏1.docx",
+      "ext": ".docx",
+      "size": 8320194,
+      "size_mb": 7.9,
+      "variants": {
+        ".docx": "六角馆的谋杀鉴赏1.docx",
+        ".pdf": "六角馆的谋杀鉴赏1.pdf"
+      },
+      "candidates": [
+        {
+          "id": "0460e827-7043-4598-8bb6-84b582572180",
+          "title": "六角馆的谋杀鉴赏",
+          "code": "liu-jiao-guan-de-mou-sha-jian-shang",
+          "chunks": 113,
+          "qa": 368,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "六角馆的谋杀鉴赏2",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\六角馆的谋杀鉴赏2.docx",
+      "file_name": "六角馆的谋杀鉴赏2.docx",
+      "ext": ".docx",
+      "size": 9931775,
+      "size_mb": 9.5,
+      "variants": {
+        ".docx": "六角馆的谋杀鉴赏2.docx",
+        ".pdf": "六角馆的谋杀鉴赏2.pdf"
+      },
+      "candidates": [
+        {
+          "id": "0460e827-7043-4598-8bb6-84b582572180",
+          "title": "六角馆的谋杀鉴赏",
+          "code": "liu-jiao-guan-de-mou-sha-jian-shang",
+          "chunks": 113,
+          "qa": 368,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "六角馆的谋杀鉴赏完整",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\六角馆的谋杀鉴赏完整.docx",
+      "file_name": "六角馆的谋杀鉴赏完整.docx",
+      "ext": ".docx",
+      "size": 21964678,
+      "size_mb": 20.9,
+      "variants": {
+        ".docx": "六角馆的谋杀鉴赏完整.docx"
+      },
+      "candidates": [
+        {
+          "id": "0460e827-7043-4598-8bb6-84b582572180",
+          "title": "六角馆的谋杀鉴赏",
+          "code": "liu-jiao-guan-de-mou-sha-jian-shang",
+          "chunks": 113,
+          "qa": 368,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "如是我观",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\如是我观主持人手册.docx",
+      "file_name": "如是我观主持人手册.docx",
+      "ext": ".docx",
+      "size": 97730,
+      "size_mb": 0.1,
+      "variants": {
+        ".docx": "如是我观主持人手册.docx",
+        ".pdf": "如是我观主持人手册.pdf"
+      },
+      "candidates": [
+        {
+          "id": "1ed847e0-ec30-452b-9126-c12b95b385f7",
+          "title": "如是我观",
+          "code": "script-b9b23fe6",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        },
+        {
+          "id": "a59f0bd0-622d-43d7-ae4b-340fa5412fdb",
+          "title": "如是我观",
+          "code": "ru-shi-wo-guan",
+          "chunks": 67,
+          "qa": 209,
+          "stories": 56,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "撕裂2愚者的无冕之作",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\撕裂2愚者的无冕之作.docx",
+      "file_name": "撕裂2愚者的无冕之作.docx",
+      "ext": ".docx",
+      "size": 366467,
+      "size_mb": 0.3,
+      "variants": {
+        ".docx": "撕裂2愚者的无冕之作.docx"
+      },
+      "candidates": [
+        {
+          "id": "97e68fa6-52de-4034-a277-0e44c4acf7c9",
+          "title": "撕裂2愚者的无冕之作",
+          "code": "si-lie-2-yu-zhe-de-wu-mian-zhi-zuo",
+          "chunks": 113,
+          "qa": 363,
+          "stories": 87,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "无相人考古奇案",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\无相人考古奇案 .docx",
+      "file_name": "无相人考古奇案 .docx",
+      "ext": ".docx",
+      "size": 13085675,
+      "size_mb": 12.5,
+      "variants": {
+        ".docx": "无相人考古奇案 .docx",
+        ".pdf": "无相人考古奇案 .pdf"
+      },
+      "candidates": [
+        {
+          "id": "848ea663-9bd4-4cbc-8c2b-9501f9e054ce",
+          "title": "无相人考古奇案",
+          "code": "script-46f9638e",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        },
+        {
+          "id": "45021d96-5be9-4310-a4a2-2a0699fc2b95",
+          "title": "无相人考古奇案",
+          "code": "wu-xiang-ren-kao-gu-qi-an",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": false
+        }
+      ]
+    },
+    {
+      "match_key": "月落洼",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\月落洼.docx",
+      "file_name": "月落洼.docx",
+      "ext": ".docx",
+      "size": 517283,
+      "size_mb": 0.5,
+      "variants": {
+        ".docx": "月落洼.docx",
+        ".pdf": "月落洼.pdf"
+      },
+      "candidates": [
+        {
+          "id": "6b630de6-faed-48ff-93fb-b5265151005a",
+          "title": "月落洼",
+          "code": "yue-luo-wa",
+          "chunks": 19,
+          "qa": 80,
+          "stories": 18,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "木夕僧之戏",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\木夕僧之戏.docx",
+      "file_name": "木夕僧之戏.docx",
+      "ext": ".docx",
+      "size": 161071,
+      "size_mb": 0.2,
+      "variants": {
+        ".docx": "木夕僧之戏.docx",
+        ".pdf": "木夕僧之戏.pdf"
+      },
+      "candidates": [
+        {
+          "id": "4aa23a61-b796-48e9-b095-8213771fd8e1",
+          "title": "木夕僧之戏",
+          "code": "mu-xi-seng-zhi-xi",
+          "chunks": 33,
+          "qa": 201,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "樱再会霜汐子",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\《樱再会霜汐子》手册.docx",
+      "file_name": "《樱再会霜汐子》手册.docx",
+      "ext": ".docx",
+      "size": 4772384,
+      "size_mb": 4.6,
+      "variants": {
+        ".docx": "《樱再会霜汐子》手册.docx",
+        ".pdf": "《樱再会霜汐子》手册.pdf"
+      },
+      "candidates": [
+        {
+          "id": "94de9957-7392-411a-8c7a-62a735335af9",
+          "title": "樱再会霜汐子",
+          "code": "ying-zai-hui-shuang-xi-zi",
+          "chunks": 226,
+          "qa": 679,
+          "stories": 192,
+          "has_guide": true
+        },
+        {
+          "id": "83ba9467-00ce-42a0-a0f9-c93a4be55603",
+          "title": "樱再会霜汐子",
+          "code": "ying-zai-hui-shuang-xi-zi-2",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "死者在幻夜中醒来",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\死者在幻夜中醒来.docx",
+      "file_name": "死者在幻夜中醒来.docx",
+      "ext": ".docx",
+      "size": 1791415,
+      "size_mb": 1.7,
+      "variants": {
+        ".docx": "死者在幻夜中醒来.docx",
+        ".pdf": "死者在幻夜中醒来.pdf"
+      },
+      "candidates": [
+        {
+          "id": "11267665-48a5-4135-8972-f5bd21ffca2d",
+          "title": "死者在幻夜中醒来",
+          "code": "si-zhe-zai-huan-ye-zhong-xing-lai",
+          "chunks": 63,
+          "qa": 193,
+          "stories": 0,
+          "has_guide": true
+        },
+        {
+          "id": "d0c0dec1-d286-4acf-b382-5aef839e0326",
+          "title": "死者在幻夜中醒来",
+          "code": "script-07a4e1c4",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "猫岛",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\1_猫岛主持人手册.docx",
+      "file_name": "1_猫岛主持人手册.docx",
+      "ext": ".docx",
+      "size": 6738381,
+      "size_mb": 6.4,
+      "variants": {
+        ".docx": "1_猫岛主持人手册.docx",
+        ".pdf": "1_猫岛主持人手册.pdf"
+      },
+      "candidates": [
+        {
+          "id": "979b2e35-75e9-4a67-8e78-2016f5bfa3f5",
+          "title": "猫岛谋杀循环",
+          "code": "mao-dao-mou-sha-xun-huan",
+          "chunks": 128,
+          "qa": 402,
+          "stories": 105,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "王不见王",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\王不见王.pdf",
+      "file_name": "王不见王.pdf",
+      "ext": ".pdf",
+      "size": 281471490,
+      "size_mb": 268.4,
+      "variants": {
+        ".pdf": "王不见王.pdf"
+      },
+      "candidates": [
+        {
+          "id": "7828f8f4-0bcc-4d87-ac2c-870f303762a0",
+          "title": "王不见王",
+          "code": "script-4b3ab598",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "病娇男孩的精分日记",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\病娇男孩的精分日记..docx",
+      "file_name": "病娇男孩的精分日记..docx",
+      "ext": ".docx",
+      "size": 4100070,
+      "size_mb": 3.9,
+      "variants": {
+        ".docx": "病娇男孩的精分日记..docx",
+        ".pdf": "病娇男孩的精分日记..pdf"
+      },
+      "candidates": [
+        {
+          "id": "e5aef168-3de2-4166-9e7f-d490c1eee160",
+          "title": "病娇男孩的精分日记",
+          "code": "bing-jiao-nan-hai-de-jing-fen-ri-ji",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": false
+        }
+      ]
+    },
+    {
+      "match_key": "神乐汤",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\神乐汤-组织者手册.docx",
+      "file_name": "神乐汤-组织者手册.docx",
+      "ext": ".docx",
+      "size": 1042890,
+      "size_mb": 1.0,
+      "variants": {
+        ".docx": "神乐汤-组织者手册.docx",
+        ".pdf": "神乐汤-组织者手册.pdf"
+      },
+      "candidates": [
+        {
+          "id": "b81951ff-11ba-43fa-a59d-5765c937b7bf",
+          "title": "神乐汤",
+          "code": "shen-le-tang",
+          "chunks": 38,
+          "qa": 121,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "紫藤夫人",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\紫藤夫人.docx",
+      "file_name": "紫藤夫人.docx",
+      "ext": ".docx",
+      "size": 125204,
+      "size_mb": 0.1,
+      "variants": {
+        ".docx": "紫藤夫人.docx"
+      },
+      "candidates": [
+        {
+          "id": "7e017a81-a4cb-47ae-8db3-47ce3039bbda",
+          "title": "紫藤夫人",
+          "code": "zi-teng-fu-ren",
+          "chunks": 11,
+          "qa": 43,
+          "stories": 4,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "豪门46山鬼母",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\豪门46山鬼母.docx",
+      "file_name": "豪门46山鬼母.docx",
+      "ext": ".docx",
+      "size": 2662766,
+      "size_mb": 2.5,
+      "variants": {
+        ".docx": "豪门46山鬼母.docx",
+        ".pdf": "豪门46山鬼母.pdf"
+      },
+      "candidates": [
+        {
+          "id": "2f8d2d64-5c4e-4bd9-8336-68efdb166f6a",
+          "title": "山鬼母",
+          "code": "shan-gui-mu-2",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        },
+        {
+          "id": "2b197314-6aa2-4729-bcc8-d72a63416302",
+          "title": "山鬼母",
+          "code": "shan-gui-mu",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "雪乡连环杀人事件",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\雪乡连环杀人事件.docx",
+      "file_name": "雪乡连环杀人事件.docx",
+      "ext": ".docx",
+      "size": 673910,
+      "size_mb": 0.6,
+      "variants": {
+        ".docx": "雪乡连环杀人事件.docx",
+        ".pdf": "雪乡连环杀人事件.pdf"
+      },
+      "candidates": [
+        {
+          "id": "c2439d48-f42f-40dd-bb46-d50c7f70138d",
+          "title": "雪乡连环杀人事件",
+          "code": "xue-xiang-lian-huan-sha-ren-shi-jian",
+          "chunks": 38,
+          "qa": 110,
+          "stories": 0,
+          "has_guide": true
+        },
+        {
+          "id": "df9ef12d-9728-4583-b0af-3688302a952b",
+          "title": "雪乡连环杀人事件",
+          "code": "xue-xiang-lian-huan-sha-ren-shi-jian-2",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        },
+        {
+          "id": "00bbfd6e-875c-4055-b3d1-67e375d0b37a",
+          "title": "雪乡连环杀人事件",
+          "code": "xue-xiang-lian-huan-sha-ren-shi-jian-3",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    },
+    {
+      "match_key": "风的误算1",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\风的误算(1).docx",
+      "file_name": "风的误算(1).docx",
+      "ext": ".docx",
+      "size": 45152770,
+      "size_mb": 43.1,
+      "variants": {
+        ".docx": "风的误算(1).docx"
+      },
+      "candidates": [
+        {
+          "id": "6e8e8664-820d-41b5-a00f-c32092757a31",
+          "title": "风的误算",
+          "code": "feng-de-wu-suan",
+          "chunks": 0,
+          "qa": 0,
+          "stories": 0,
+          "has_guide": false
+        }
+      ]
+    },
+    {
+      "match_key": "鬼河怒放红花镇求生指南",
+      "file": "C:\\Users\\Administrator\\Desktop\\剧本杀文档\\鬼河怒放红花镇求生指南（组织者手册）.docx",
+      "file_name": "鬼河怒放红花镇求生指南（组织者手册）.docx",
+      "ext": ".docx",
+      "size": 19979213,
+      "size_mb": 19.1,
+      "variants": {
+        ".docx": "鬼河怒放红花镇求生指南（组织者手册）.docx",
+        ".pdf": "鬼河怒放红花镇求生指南（组织者手册）.pdf"
+      },
+      "candidates": [
+        {
+          "id": "a8b0a9c5-98df-4801-974a-25e74f124c62",
+          "title": "鬼河怒放",
+          "code": "gui-he-nu-fang",
+          "chunks": 181,
+          "qa": 551,
+          "stories": 0,
+          "has_guide": true
+        }
+      ]
+    }
+  ],
+  "script_count": 56
+}

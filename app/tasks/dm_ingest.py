@@ -1001,7 +1001,8 @@ def _run_synthesis(
         「合成文章生成中」「已生成」徽标（v1 暂未在前端展示，但状态机已就位）。
     """
     if not script_title:
-        # 兼容老剧本：script_title 不在 finalize 入参里时，从 scripts 表反查
+        # finalize 的 chord 回调签名是固定的、不带标题，所以常规流水线走这里反查；
+        # 手动补跑（docker exec 调本函数）时可以直接传 script_title 省一次查询。
         script_title = store.get_script_title(script_id)
 
     try:
@@ -1179,12 +1180,13 @@ def finalize(
     # finalize 后的标准步骤，不是可选项；没故事条目的手册直接跳过。
     if story_count:
         try:
+            # 注意：finalize 的入参里没有 script_title（chord 回调签名是固定的），
+            # 这里不要引用不存在的变量 —— 标题由 _run_synthesis 内部按 script_id 反查。
             _run_synthesis(
                 store,
                 document_id=document_id,
                 script_id=script_id,
                 script_code=script_code,
-                script_title=script_title,
             )
         except Exception as exc:  # noqa: BLE001 - 合成失败绝不能把已完成的 job 拖成失败
             logger.warning("合成文章生成失败（不影响解析结果）doc=%s: %s", document_id, exc)
