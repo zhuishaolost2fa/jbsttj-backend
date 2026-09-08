@@ -273,7 +273,7 @@ services:
       # 备案后上 Caddy 做 HTTPS 时，把这里改成 127.0.0.1 绑定、让 Caddy 占 80/443。
       - "80:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./frontend:/usr/share/nginx/html:ro
     depends_on:
       api:
