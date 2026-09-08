@@ -25,3 +25,6 @@ env/
 # 部署脚本运行时产物（服务器本地状态，不进仓库）
 .last_good_sha
 .last_good_image
+
+# 前端 H5 构建产物（jbsttj-frontend 单独构建部署，不进后端仓库）
+frontend/
