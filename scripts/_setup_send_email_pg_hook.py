@@ -1,15 +1,20 @@
-"""把 Supabase 的 Send Email Hook 接到自建后端（Postgres Hook + pg_net 转发）。
+"""把 Supabase 的 Send Email Hook 接到自建后端（发件箱 + 反向拉取）。
 
-为什么是 Postgres Hook 而不是 HTTP Hook：
-  服务器域名未备案，腾讯云对**国际链路**的域名访问做了拦截（Let's Encrypt 境外
-  验证被重定向到 dnspod.qcloud.com/static/webblock.html），国内访问却正常。
-  Supabase 在新加坡，HTTP Hook 必然走国际链路 → 不可达。Postgres Hook 从库内
-  用 pg_net 直接 POST 到 **http://<IP>**（IP 不带域名，不受备案拦截）。
+为什么不是「Supabase 推给我们」：
+  1. 服务器域名未备案，国际链路上的域名访问会被腾讯云重定向到
+     dnspod.qcloud.com/static/webblock.html（Let's Encrypt 境外验证实测）。
+  2. 更致命的是 Supabase 所在区域到服务器 80 端口 **TCP 握手就超时**
+     （pg_net 实测：DNS 0.02ms、TCP handshake 12000ms）。
+     HTTP Hook / Edge Function / pg_net 转发都会撞上同一堵墙。
+
+所以改成：Postgres Hook 把事件写进 public.auth_email_outbox，我们的服务
+（出网方向本来就通）定时拉取并投递。延迟 = 轮询间隔（默认 3 秒）。
 
 用法：
-  python scripts/_setup_send_email_pg_hook.py --relay-token <TOKEN>
-  python scripts/_setup_send_email_pg_hook.py --enable        # 打开 hook
-  python scripts/_setup_send_email_pg_hook.py --test          # 手工触发一次
+  python scripts/_setup_send_email_pg_hook.py --init           # 建表 + 建函数
+  python scripts/_setup_send_email_pg_hook.py --enable         # 打开 hook
+  python scripts/_setup_send_email_pg_hook.py --disable
+  python scripts/_setup_send_email_pg_hook.py --test           # 插一条测试事件
   python scripts/_setup_send_email_pg_hook.py --status
 """
 
@@ -69,35 +74,31 @@ def sql(query: str) -> object:
     return body
 
 
-CREATE_FUNCTION = """
-create or replace function public.send_email_hook(event jsonb)
-returns jsonb
-language plpgsql
-security definer
-set search_path = public, extensions
-as $fn$
-declare
-  v_token text := '{token}';
-begin
-  -- pg_net 是异步的：入队后立即返回，GoTrue 不会卡住等投递结果
-  perform net.http_post(
-    url := '{upstream}',
-    body := event,
-    headers := jsonb_build_object(
-      'Content-Type', 'application/json',
-      'X-Relay-Token', v_token
-    ),
-    timeout_milliseconds := 4000
-  );
-  -- 返回原事件：send_email hook 的返回值即最终使用的邮件数据，不能返回 null
-  return event;
-end;
-$fn$;
-
--- GoTrue 用 supabase_auth_admin 调这个函数，必须给它执行权限
-grant execute on function public.send_email_hook(jsonb) to supabase_auth_admin;
-revoke execute on function public.send_email_hook(jsonb) from anon, authenticated;
-"""
+INIT_STATEMENTS = [
+    """create table if not exists public.auth_email_outbox (
+         id bigserial primary key,
+         payload jsonb not null,
+         created_at timestamptz not null default now(),
+         sent_at timestamptz,
+         attempts int not null default 0,
+         error text
+       )""",
+    "alter table public.auth_email_outbox enable row level security",
+    """create index if not exists idx_auth_email_outbox_pending
+         on public.auth_email_outbox (id) where sent_at is null""",
+    # 只写入发件箱，不做任何网络调用 —— Supabase 侧网络根本到不了我们服务器
+    """create or replace function public.send_email_hook(event jsonb)
+       returns jsonb language plpgsql security definer set search_path = public as $fn$
+       begin
+         insert into public.auth_email_outbox (payload) values (event);
+         return event;   -- 返回值即最终使用的邮件数据，不能返回 null
+       end;
+       $fn$""",
+    "grant execute on function public.send_email_hook(jsonb) to supabase_auth_admin",
+    "revoke execute on function public.send_email_hook(jsonb) from anon, authenticated",
+    "grant select, update on public.auth_email_outbox to service_role",
+    "grant insert on public.auth_email_outbox to postgres",
+]
 
 TEST_EVENT = {
     "user": {"id": "00000000-0000-0000-0000-000000000000", "email": "relay-selftest@example.com"},
@@ -113,20 +114,21 @@ TEST_EVENT = {
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--relay-token", help="写入 SQL 函数的共享令牌")
+    ap.add_argument("--init", action="store_true", help="建发件箱表 + hook 函数")
     ap.add_argument("--enable", action="store_true", help="打开 GoTrue 的 send_email hook")
     ap.add_argument("--disable", action="store_true")
     ap.add_argument("--test", action="store_true", help="手工调用一次函数")
     ap.add_argument("--status", action="store_true")
     args = ap.parse_args()
 
-    if args.relay_token:
-        print(sql(CREATE_FUNCTION.format(token=args.relay_token, upstream=UPSTREAM)))
-        print("函数已创建")
+    if args.init:
+        for stmt in INIT_STATEMENTS:
+            sql(stmt)
+        print("发件箱表与 hook 函数已就绪")
 
     if args.test:
         print(sql("select public.send_email_hook('" + json.dumps(TEST_EVENT) + "'::jsonb)"))
-        print("已入队，去服务器看日志：docker compose logs --tail=40 api | grep 'send-email hook'")
+        print("已写入发件箱，去服务器看日志：docker compose logs --tail=40 api | grep -E 'send-email hook|已投递'")
 
     if args.enable:
         code, body = _req("PATCH", "/config/auth", {
