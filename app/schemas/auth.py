@@ -82,6 +82,18 @@ class EmailVerifyRequest(BaseModel):
     type: str = Field(default="email", pattern="^(signup|recovery|magiclink|email_change|email)$")
 
 
+class ResendEmailRequest(BaseModel):
+    """重发邮件验证码。
+
+    与 /auth/register **分开**是必要的：对已注册的邮箱再调 signup，GoTrue 会
+    返回 200 但**不发信**（防用户枚举的模糊响应），前端就会停在「已发送」的
+    假象里，用户永远等不到邮件。重发必须走 GoTrue 的 /resend 端点。
+    """
+
+    email: EmailStr
+    type: str = Field(default="signup", pattern="^(signup|recovery|magiclink|email_change|email)$")
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: Optional[str] = None

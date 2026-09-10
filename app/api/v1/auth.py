@@ -37,6 +37,7 @@ from app.schemas.auth import (
     ProfileUpdate,
     RefreshRequest,
     RegisterRequest,
+    ResendEmailRequest,
     SetPasswordRequest,
     TokenResponse,
     WechatBindRequest,
@@ -80,9 +81,54 @@ async def register(
     payload: RegisterRequest,
     auth: SupabaseAuth = Depends(get_supabase_auth),
 ) -> TokenResponse:
-    data = await auth.sign_up(payload.email, payload.password)
+    # 已注册邮箱不能再走 signup：GoTrue 会返回 200 但**不发信**（防用户枚举的
+    # 模糊响应），前端会停在「验证码已发送」的假象里，用户永远等不到邮件。
+    # 只有已验证的才拦截；未验证的允许重发（signup 会刷新 OTP 并重新发信）。
+    email = payload.email.strip().lower()
+    existing = await _find_user(auth, email)
+    if existing and (existing.get("email_confirmed_at") or existing.get("confirmed_at")):
+        raise ConflictError("该邮箱已注册并完成验证，请直接登录", code="email_already_verified")
+
+    data = await auth.sign_up(email, payload.password)
     # 开启邮箱验证时不会立刻返回 token，此处 access_token 可能为空
     return _to_token(data)
+
+
+async def _find_user(auth: SupabaseAuth, email: str) -> Optional[Dict[str, Any]]:
+    """查一次 GoTrue 用户；查不到 / 查询失败一律返回 None（不阻断注册）。"""
+    try:
+        return await auth.admin_find_user_by_email(email)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("注册前查询用户失败（email=%s）：%s", email, exc)
+        return None
+
+
+@router.post("/resend-email", response_model=MessageResponse, summary="重发邮件验证码")
+async def resend_email(
+    payload: ResendEmailRequest,
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+) -> MessageResponse:
+    """重新发送注册 / 找回密码的邮件验证码。
+
+    为什么不复用 /auth/register：注册接口对已存在的邮箱是「静默成功但不发信」，
+    点重发时再调它等于什么都没做。这里走 GoTrue 的 /resend 才是真重发。
+
+    ⚠️ 别指望 GoTrue 会替我们兜底：实测 /resend 对**已验证的邮箱**同样返回
+    200 + `{}`（防用户枚举），只是不写发件箱、不发信。所以「到底有没有发出去」
+    必须在调 /resend 之前自己查用户状态，否则前端又会停在假成功里。
+    """
+    email = payload.email.strip().lower()
+    user = await _find_user(auth, email)
+    if user is not None:
+        if user.get("email_confirmed_at") or user.get("confirmed_at"):
+            raise ConflictError("该邮箱已完成验证，请直接登录", code="email_already_verified")
+    else:
+        # 查不到有两种可能：真没注册，或 admin 查询失败。前者不该继续白等一封
+        # 永远不会来的邮件；后者 _find_user 已吞掉异常，这里宁可放行。
+        logger.warning("重发验证码但查不到用户（email=%s），仍尝试下发", email)
+
+    await auth.resend_email(email, resend_type=payload.type)
+    return MessageResponse(message="验证码已重新发送，请查收邮件")
 
 
 @router.post("/verify-email", response_model=TokenResponse, summary="用邮件验证码完成验证")
@@ -104,6 +150,11 @@ async def verify_email(
         )
     except AuthError as exc:
         logger.warning("邮箱验证码校验失败（email=%s type=%s）", payload.email, payload.type)
+        # 最常见的一种「验证码错误」其实是**邮箱早就验证过了**，用户又拿旧邮件
+        # 里的码来兑。只回「错误或过期」会让人反复重发，必须区分出来。
+        user = await _find_user(auth, payload.email)
+        if user and (user.get("email_confirmed_at") or user.get("confirmed_at")):
+            raise ConflictError("该邮箱已完成验证，请直接登录", code="email_already_verified") from exc
         raise ValidationError("验证码错误或已过期，请重新获取") from exc
     return _to_token(data)
 

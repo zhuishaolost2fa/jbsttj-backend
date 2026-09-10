@@ -625,6 +625,48 @@ class SupabaseAuth:
             )
             raise AuthError(str(message), status_code=resp.status_code)
 
+    async def admin_find_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """按邮箱精确查找 GoTrue 用户，不存在返回 None。
+
+        为什么需要它：对**已存在的邮箱**调 /signup，GoTrue 出于防用户枚举会
+        返回 200 但**不发验证邮件**。前端因此以为「验证码已发送」，用户永远
+        等不到邮件，只能反复点重发 —— 线上已经真实踩到（已验证账号重复注册，
+        验证码是上一封过期邮件里的旧码，兑换必然 422）。
+
+        注册前先查一次，才能给出「该邮箱已注册，请直接登录」的明确引导。
+        """
+        target = email.strip().lower()
+        url = f"{self._settings.supabase_auth_url}/admin/users"
+        try:
+            resp = await self.auth_client.get(
+                url, params={"email": target}, headers=self._admin_headers(),
+                timeout=AUTH_REQUEST_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("查询 GoTrue 用户失败（%s）：%s", target, exc)
+            return None
+        if resp.status_code >= 400:
+            return None
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            return None
+        users = data.get("users") if isinstance(data, dict) else data
+        if not isinstance(users, list):
+            return None
+        for user in users:
+            if (user.get("email") or "").strip().lower() == target:
+                return user
+        return None
+
+    async def resend_email(self, email: str, *, resend_type: str = "signup") -> Dict[str, Any]:
+        """重发邮件验证码（GoTrue /resend）。
+
+        与 /signup 的区别：/signup 对已注册的邮箱是「静默成功但不发信」，
+        /resend 才是真正的重发，且对已验证的邮箱会明确报错，可引导用户去登录。
+        """
+        return await self._post("/resend", {"email": email.strip().lower(), "type": resend_type})
+
     async def verify_email_otp(
         self, email: str, token: str, *, verify_type: str = "email"
     ) -> Dict[str, Any]:
