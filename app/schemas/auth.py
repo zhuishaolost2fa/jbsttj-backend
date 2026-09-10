@@ -70,6 +70,18 @@ class EmailBindConfirmRequest(BaseModel):
     code: str = Field(min_length=4, max_length=12)
 
 
+class EmailVerifyRequest(BaseModel):
+    """提交邮件里的验证码完成验证。
+
+    type 决定兑换成什么：signup=注册确认、recovery=找回密码、magiclink=免密登录、
+    email_change=改邮箱、email=绑定邮箱（默认，与历史行为一致）。
+    """
+
+    email: EmailStr
+    code: str = Field(min_length=4, max_length=12)
+    type: str = Field(default="email", pattern="^(signup|recovery|magiclink|email_change|email)$")
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: Optional[str] = None

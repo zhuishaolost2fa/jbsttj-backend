@@ -199,6 +199,49 @@ class SupabaseClient:
 # 认证代理出网超时：宁可快速失败返回明确错误，也不要卡 15s 后冒泡成 500。
 AUTH_REQUEST_TIMEOUT = 5.0
 
+# GoTrue 有两种完全不同的 429，文案接近但解法天差地别，必须分开：
+#  1) 邮件配额（error_code=over_email_send_rate_limit / "email rate limit exceeded"）
+#     是**项目级**的：注册确认、找回密码、magiclink、OTP、改邮箱全部共用一个池子。
+#     内置 SMTP 固定 2 封/小时且不可调 —— 只能在 Supabase 后台配自定义 SMTP 或
+#     Send Email hook 才是唯一的解法（配完之后 rate_limit_email_sent 才可调）。
+#  2) 重发冷却（"you can only request this once every 60 seconds"）
+#     只是同一动作的防刷窗口，等 60 秒即可。
+_EMAIL_QUOTA_HINTS = ("email rate limit exceeded", "over_email_send_rate_limit")
+_COOLDOWN_HINTS = ("you can only request this once every",)
+
+
+def _describe_rate_limit(message: str, error_code: str) -> Tuple[str, str, str]:
+    """把 GoTrue 的 429 文案翻译成不改语义的中文提示。
+
+    返回 ``(message, code, hint)``。hint 给前端做分支，不参与用户可见文案。
+    """
+    low = f"{message} {error_code}".lower()
+    if any(h in low for h in _EMAIL_QUOTA_HINTS):
+        return (
+            "邮件发送额度已用尽，请稍后再试",
+            "auth_email_rate_limited",
+            "smtp_quota_exhausted",
+        )
+    if any(h in low for h in _COOLDOWN_HINTS) or "over_request_rate_limit" in low:
+        return (
+            "操作过于频繁，同一邮箱请间隔 60 秒后重试",
+            "auth_rate_limited",
+            "cooldown_60s",
+        )
+    return ("操作过于频繁，请稍后再试", "auth_rate_limited", "unknown")
+
+
+def _parse_retry_after(raw: Optional[str]) -> Optional[int]:
+    """GoTrue 的 Retry-After 有时给秒数、有时给 HTTP 日期，这里只取秒数。"""
+    if not raw:
+        return None
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 class SupabaseAuth:
     """GoTrue 代理：仅用于方便调试与轻量前端，正式前端建议直接用 supabase-js。"""
 
@@ -271,6 +314,21 @@ class SupabaseAuth:
             data = resp.json()
         except Exception:  # noqa: BLE001
             data = {"message": resp.text}
+        if resp.status_code == 429:
+            # 429 必须原样返回，不能被当成上游故障降级成 502 —— 那是另一种故障语义，
+            # 前端会误判成「服务挂了」而不是「等一会儿就好」。
+            message = data.get("error_description") or data.get("msg") or data.get("message") or "操作过于频繁"
+            friendly, code, hint = _describe_rate_limit(
+                str(message), str(data.get("error_code") or data.get("code") or "")
+            )
+            retry_after = _parse_retry_after(resp.headers.get("retry-after"))
+            logger.warning("GoTrue 限流（%s hint=%s retry_after=%s）", path, hint, retry_after)
+            raise AuthError(
+                friendly,
+                code=code,
+                status_code=429,
+                details={"hint": hint, "retry_after": retry_after},
+            )
         if resp.status_code >= 400:
             message = data.get("error_description") or data.get("msg") or data.get("message") or "认证失败"
             raise AuthError(str(message), status_code=resp.status_code if resp.status_code < 500 else 502)
@@ -288,8 +346,15 @@ class SupabaseAuth:
     async def sign_in(self, email: str, password: str) -> Dict[str, Any]:
         return await self._post("/token?grant_type=password", {"email": email, "password": password})
 
-    async def sign_up(self, email: str, password: str) -> Dict[str, Any]:
-        return await self._post("/signup", {"email": email, "password": password})
+    async def sign_up(self, email: str, password: str, *, redirect_to: str | None = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"email": email, "password": password}
+        redirect = redirect_to or self._settings.auth_email_redirect_url
+        if redirect:
+            # 不传时 GoTrue 用项目后台的 Site URL（默认 localhost:3000），
+            # 生产环境点开就是死链。传了还必须同时出现在后台的
+            # Authentication → URL Configuration → Redirect URLs 白名单里。
+            payload["email_redirect_to"] = redirect
+        return await self._post("/signup", payload)
 
     async def refresh(self, refresh_token: str) -> Dict[str, Any]:
         return await self._post("/token?grant_type=refresh_token", {"refresh_token": refresh_token})
@@ -560,9 +625,15 @@ class SupabaseAuth:
             )
             raise AuthError(str(message), status_code=resp.status_code)
 
-    async def verify_email_otp(self, email: str, token: str) -> Dict[str, Any]:
-        """校验 6 位邮箱验证码，成功返回会话。"""
-        payload = {"email": email, "token": token, "type": "email"}
+    async def verify_email_otp(
+        self, email: str, token: str, *, verify_type: str = "email"
+    ) -> Dict[str, Any]:
+        """校验 6 位邮箱验证码，成功返回会话。
+
+        verify_type 决定这次兑换的语义：signup / recovery / magiclink /
+        email_change / email，必须与发验证码时的场景一致，否则 GoTrue 会拒绝。
+        """
+        payload = {"email": email, "token": token, "type": verify_type}
         url = f"{self._settings.supabase_auth_url}/verify"
         resp = await self.auth_client.post(url, json=payload, headers=self._headers())
         if resp.status_code >= 400:

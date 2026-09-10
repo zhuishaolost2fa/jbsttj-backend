@@ -44,3 +44,7 @@ alibabacloud-ocr-api20210707>=3.1.2
 # pillow>=10.0.0                # 本地 OCR 解码图片用
 # Word / Office 文档（.docx）文本提取：自带文字层，无需 OCR，流水线直接复用 PDF 的分块逻辑
 python-docx>=1.1.0
+
+# 腾讯云 SES：Supabase Send Email Hook 的可选投递通道（MAIL_PROVIDER=tencentcloud）。
+# 走 API 而非 SMTP，因为腾讯云邮件推送自 2026-03-02 起不再给个人实名账号开 SMTP。
+tencentcloud-sdk-python-ses>=3.0.0

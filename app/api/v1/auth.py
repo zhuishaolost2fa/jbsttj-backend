@@ -30,6 +30,7 @@ from app.schemas.auth import (
     ChangePasswordRequest,
     EmailBindConfirmRequest,
     EmailBindStartRequest,
+    EmailVerifyRequest,
     LoginRequest,
     MessageResponse,
     ProfileResponse,
@@ -81,6 +82,29 @@ async def register(
 ) -> TokenResponse:
     data = await auth.sign_up(payload.email, payload.password)
     # 开启邮箱验证时不会立刻返回 token，此处 access_token 可能为空
+    return _to_token(data)
+
+
+@router.post("/verify-email", response_model=TokenResponse, summary="用邮件验证码完成验证")
+async def verify_email(
+    payload: EmailVerifyRequest,
+    auth: SupabaseAuth = Depends(get_supabase_auth),
+) -> TokenResponse:
+    """把邮件里的 6 位验证码兑换成正式会话。
+
+    为什么要这个接口：腾讯云 SES 的模板审核规范不接受「整条链接做成变量」，
+    通过审核的验证码模板只能展示 6 位数字（没有可点击链接）。所以注册确认
+    这条路由前端收一个验证码输入框，用它换 token —— 效果与点开验证链接等价。
+
+    成功后 GoTrue 会签发 access_token / refresh_token，前端直接落库即可登录。
+    """
+    try:
+        data = await auth.verify_email_otp(
+            payload.email.strip().lower(), payload.code.strip(), verify_type=payload.type
+        )
+    except AuthError as exc:
+        logger.warning("邮箱验证码校验失败（email=%s type=%s）", payload.email, payload.type)
+        raise ValidationError("验证码错误或已过期，请重新获取") from exc
     return _to_token(data)
 
 

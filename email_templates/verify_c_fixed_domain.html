@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>邮箱验证</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f5f7;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px; width:96%; background-color:#ffffff; border-radius:12px; padding:36px 40px; font-family:'PingFang SC','Microsoft YaHei',Arial,sans-serif;">
+          <tr>
+            <td style="font-size:20px; font-weight:bold; color:#1f2329; padding-bottom:8px;">邮箱验证</td>
+          </tr>
+          <tr>
+            <td style="font-size:14px; color:#4e5969; line-height:1.8; padding-bottom:20px;">
+              您正在验证【剧本杀复盘助手】账号的邮箱，本次操作的验证码为：
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding-bottom:24px;">
+              <span style="display:inline-block; font-size:30px; font-weight:bold; letter-spacing:8px; color:#1f2329; background-color:#f2f3f5; border-radius:8px; padding:14px 28px;">{{code}}</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:14px; color:#4e5969; line-height:1.8; padding-bottom:8px;">
+              您也可以点击下方按钮完成验证：
+            </td>
+          </tr>
+          <tr>
+            <td style="padding-bottom:24px;">
+              <a href="https://ratcjkjvynubglofrvkt.supabase.co/auth/v1/verify?{{url_query}}"
+                 style="display:inline-block; font-size:15px; color:#ffffff; background-color:#2456f0; text-decoration:none; border-radius:8px; padding:12px 28px;">完成邮箱验证</a>
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:13px; color:#86909c; line-height:1.8; padding-bottom:6px;">
+              若按钮无法点击，请复制以下链接到浏览器打开：
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:13px; color:#86909c; line-height:1.8; word-break:break-all; padding-bottom:20px;">
+              https://ratcjkjvynubglofrvkt.supabase.co/auth/v1/verify?{{url_query}}
+            </td>
+          </tr>
+          <tr>
+            <td style="font-size:13px; color:#86909c; line-height:1.8; border-top:1px solid #e5e6eb; padding-top:20px;">
+              验证码 30 分钟内有效。如果这不是您本人的操作，请忽略本邮件，您的账号不会受到任何影响。
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

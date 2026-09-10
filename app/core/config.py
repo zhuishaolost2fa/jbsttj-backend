@@ -52,6 +52,42 @@ class Settings(BaseSettings):
     # PyJWT 直接抛 ImmatureSignatureError，所有带 token 的请求全部 401。
     # 30 秒的常规取值扛不住这种偏移，故默认放宽到 120 秒。
     jwt_leeway_seconds: int = 120
+    # 注册确认邮件 / 找回密码邮件里的跳转地址。留空则回退到 Supabase 项目
+    # 后台配置的 Site URL（默认 http://localhost:3000，生产环境点开就是死链）。
+    # 填前端首页即可，GoTrue 会把 token 以 hash 片段拼在后面（#access_token=...）。
+    auth_email_redirect_url: str = ""
+
+    # ---------------- Supabase Auth Send Email Hook ----------------
+    # 在 Supabase 后台 Authentication → Hooks → Send Email 启用后，GoTrue 不再走
+    # SMTP，而是把 {user, email_data} POST 到本服务的 hook 端点，由我们自己投递。
+    # 这是绕开「内置 SMTP 2 封/小时」以及「腾讯云个人账号禁用 SMTP」的唯一途径。
+    send_email_hook_secrets: str = ""
+    # none = 不启用（收到 hook 也只记录日志）；smtp = 通用 SMTP；tencentcloud = 腾讯云 SES API
+    mail_provider: str = "none"
+    mail_from: str = ""
+    mail_from_name: str = ""
+    # 邮件标题/正文里展示的产品名，如「【剧本杀复盘助手】请验证你的邮箱」
+    mail_brand_name: str = "剧本杀复盘助手"
+    mail_smtp_host: str = ""
+    mail_smtp_port: int = 465
+    mail_smtp_user: str = ""
+    mail_smtp_pass: str = ""
+    # 465 = 隐式 SSL，587 = STARTTLS。腾讯云/阿里云都支持，先看服务商给的值。
+    mail_smtp_use_ssl: bool = True
+    tencentcloud_secret_id: str = ""
+    tencentcloud_secret_key: str = ""
+    # 腾讯云 SendEmail 只支持 ap-guangzhou / ap-hongkong 两个region
+    tencentcloud_ses_region: str = "ap-guangzhou"
+    # ⚠️ 腾讯云 SES **默认只允许模板发信**：Simple 字段已于 2026 年起对未申请特殊配置的
+    # 账号废弃（传了会报 WithOutPermission）。模板需在控制台建并通过审核（工作日 1 天），
+    # 模板里的变量名取下面这两个（控制台模板正文里要写成 {{code}} / {{url}}，双花括号）。
+    tencentcloud_ses_template_id: int = 0
+    # url_query = 去掉域名和 "?" 之后的查询串。腾讯云模板审核要求「链接必须保留确定域名」，
+    # 整条 URL 做成变量会被拒（"变量可填入任意 URL，违反链接规范"），所以模板里要写死域名，
+    # 形如 https://<supabase>.supabase.co/auth/v1/verify?{{url_query}}。
+    tencentcloud_ses_template_var_code: str = "code"
+    tencentcloud_ses_template_var_url: str = "url"
+    tencentcloud_ses_template_var_url_query: str = "url_query"
 
     # ---------------- 微信小程序登录 ----------------
     # 微信公众平台 → 开发管理 → 开发信息 里拿。留空则 /auth/wechat/login 直接
