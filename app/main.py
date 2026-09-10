@@ -16,6 +16,7 @@ from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import RequestContextMiddleware, setup_logging
+from app.services.email_outbox import start_email_outbox_poller, stop_email_outbox_poller
 from app.services.supabase import supabase, supabase_auth
 from app.services.vector_store import reset_vector_store
 
@@ -72,7 +73,10 @@ async def lifespan(app: FastAPI):
         logger.warning("以下关键配置缺失，相关功能不可用: %s", ", ".join(missing))
 
     await supabase.startup()
+    # 认证邮件发件箱：Supabase 网络不通时改由我们反向拉取（详见模块 docstring）
+    await start_email_outbox_poller()
     yield
+    await stop_email_outbox_poller()
     await supabase.shutdown()
     # GoTrue 连接池是懒创建的，只有真正调用过鉴权接口才存在
     await supabase_auth.aclose()

@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     # jsonb，原始字节丢失），改用共享令牌：Supabase 侧函数带上 X-Relay-Token 头。
     # 与 SEND_EMAIL_HOOK_SECRETS 二选一即可，两者都没配时端点返回 503。
     send_email_relay_token: str = ""
+    # 发件箱轮询（Supabase 网络不通时的兜底链路）：间隔秒数与每批条数
+    auth_email_poll_interval_seconds: int = 3
+    auth_email_poll_batch_size: int = 10
     # none = 不启用（收到 hook 也只记录日志）；smtp = 通用 SMTP；tencentcloud = 腾讯云 SES API
     mail_provider: str = "none"
     mail_from: str = ""

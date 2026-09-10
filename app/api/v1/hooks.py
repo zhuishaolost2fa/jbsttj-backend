@@ -43,7 +43,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi import status as http_status
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import ConfigError
+from app.core.exceptions import ConfigError, ValidationError
 
 logger = logging.getLogger("app.hooks")
 
@@ -335,11 +335,50 @@ async def supabase_send_email(request: Request) -> Response:
     if not send_to:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="missing recipient")
 
+    try:
+        await deliver_email_payload(settings, payload)
+    except ConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.error("投递 auth 邮件失败：%s", exc)
+        # GoTrue 只等 5 秒；投递失败必须抛出来让它重试，绝不能静默吞掉
+        raise HTTPException(status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail="投递失败")
+
+    return Response(status_code=200, content="{}", media_type="application/json")
+
+
+async def deliver_email_payload(settings: Settings, payload: Dict[str, Any]) -> None:
+    """把一条 hook 事件真正发出去。
+
+    抽成独立函数是因为有两个入口：HTTP Hook（本文件）和发件箱轮询器
+    （app/services/email_outbox.py，Supabase 网络不通时用它反向拉取）。
+    """
+    user = payload.get("user") or {}
+    email_data = payload.get("email_data") or {}
+    action = email_data.get("email_action_type") or "signup"
+
+    send_to = user.get("email") or ""
+    token = email_data.get("token") or ""
+    token_hash = email_data.get("token_hash") or ""
+
+    if action == "email_change":
+        # ⚠️ Supabase 的字段名是反的（历史兼容）：Secure Email Change 开启时
+        # token_hash_new 对应**当前**邮箱，token_hash 才是新邮箱。
+        new_email = user.get("new_email") or email_data.get("new_email") or ""
+        if new_email and email_data.get("token_new"):
+            send_to = new_email
+            token = email_data["token_new"]
+            token_hash = email_data.get("token_hash") or token_hash
+
+    if not send_to:
+        raise ValidationError("邮件事件缺少收件地址")
+
     # 诊断用：只有看到真实 token 形态，才能确定该用「验证码模板」还是「链接模板」
     logger.info(
         "send-email hook action=%s to=%s token_len=%s token_is_otp=%s keys=%s",
         action, send_to, len(token), bool(_OTP_TOKEN_RE.match(token)), sorted(email_data.keys()),
     )
+
     verify_url = _verify_url(email_data, token_hash, action)
     subject, body_text = _render_email(action, token, verify_url, brand=settings.mail_brand_name)
 
@@ -352,14 +391,5 @@ async def supabase_send_email(request: Request) -> Response:
         settings.tencentcloud_ses_template_var_url_query: url_query,
     }
 
-    # GoTrue 只等 5 秒；投递失败必须抛出来让它重试，绝不能静默吞掉
-    try:
-        await _dispatch(settings, send_to, subject, body_text, template_data=template_data)
-    except ConfigError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.error("投递 auth 邮件失败（action=%s to=%s）：%s", action, send_to, exc)
-        raise HTTPException(status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR, detail="投递失败")
-
+    await _dispatch(settings, send_to, subject, body_text, template_data=template_data)
     logger.info("已投递 auth 邮件（action=%s to=%s provider=%s）", action, send_to, settings.mail_provider)
-    return Response(status_code=200, content="{}", media_type="application/json")
