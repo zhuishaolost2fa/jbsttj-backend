@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from app.core.config import Settings, get_settings
@@ -25,6 +27,25 @@ from app.services.supabase import SupabaseClient, get_supabase
 logger = logging.getLogger("app.email_outbox")
 
 TABLE = "auth_email_outbox"
+
+# payload 里这些字段能直接兑换登录态 / 篡改账号，投递完必须立刻抹掉。
+# 其余字段（收件邮箱、动作类型）留着，方便事后查「某封邮件到底发没发」。
+_SECRET_FIELDS = ("token", "token_hash", "token_new", "token_hash_new")
+_REDACTED = "***redacted***"
+
+
+def _redact(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """去掉凭证后返回一份新的 payload（不修改入参）。"""
+    out: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "email_data" and isinstance(value, dict):
+            out[key] = {
+                k: (_REDACTED if k in _SECRET_FIELDS and v else v)
+                for k, v in value.items()
+            }
+        else:
+            out[key] = value
+    return out
 
 
 class EmailOutboxPoller:
@@ -35,6 +56,7 @@ class EmailOutboxPoller:
         self._task: Optional[asyncio.Task] = None
         self._stopped = asyncio.Event()
         self._consecutive_errors = 0
+        self._last_purge: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -87,12 +109,24 @@ class EmailOutboxPoller:
     async def _drain(self, db: SupabaseClient) -> None:
         if not db.available:
             return
+        settings = self._settings
         rows: List[Dict[str, Any]] = await db.select(
             TABLE,
-            filters={"sent_at": "is.null"},
+            filters={
+                "sent_at": "is.null",
+                # PostgREST 不支持「列 < 常量」以外的表达式，所以这里用字面阈值
+                "attempts": f"lt.{max(1, settings.auth_email_max_attempts)}",
+            },
             order="id.asc",
-            limit=self._settings.auth_email_poll_batch_size,
+            limit=settings.auth_email_poll_batch_size,
         )
+
+        # 每天一次：清掉超过保留期的历史记录（含那些已被抹除但仍留着收件邮箱的行）
+        if rows or time.time() - self._last_purge > 86400:
+            if time.time() - self._last_purge > 86400:
+                await self._purge_old(db)
+                self._last_purge = time.time()
+
         if not rows:
             return
 
@@ -102,19 +136,45 @@ class EmailOutboxPoller:
         for row in rows:
             row_id = row.get("id")
             payload = row.get("payload") or {}
+            attempts = int(row.get("attempts") or 0) + 1
             try:
-                await deliver_email_payload(self._settings, payload)
-                await db.update(TABLE, filters={"id": f"eq.{row_id}"}, data={"sent_at": "now()"})
+                await deliver_email_payload(settings, payload)
             except Exception as exc:  # noqa: BLE001
-                logger.error("发件箱 %s 投递失败：%s", row_id, exc)
+                logger.error("发件箱 %s 第 %s 次投递失败：%s", row_id, attempts, exc)
                 try:
                     await db.update(
                         TABLE,
                         filters={"id": f"eq.{row_id}"},
-                        data={"error": str(exc)[:500]},
+                        data={"attempts": attempts, "error": str(exc)[:500]},
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning("回写发件箱错误失败（id=%s）", row_id)
+                continue
+
+            try:
+                # 成功后立刻抹掉验证码：表里不该长期躺着能直接兑换会话的凭证
+                await db.update(
+                    TABLE,
+                    filters={"id": f"eq.{row_id}"},
+                    data={
+                        "sent_at": datetime.now(timezone.utc).isoformat(),
+                        "attempts": attempts,
+                        "payload": _redact(payload),
+                        "error": None,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("回写发件箱 sent_at 失败（id=%s）", row_id)
+
+    async def _purge_old(self, db: SupabaseClient) -> None:
+        """清理超过保留期的记录。失败不影响主流程，只记日志。"""
+        days = max(1, self._settings.auth_email_retention_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        try:
+            await db.delete(TABLE, filters={"created_at": f"lt.{cutoff.isoformat()}"})
+            logger.info("已清理 %s 天前的发件箱记录", days)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清理发件箱历史失败（%s 天）：%s", days, exc)
 
 
 _poller: Optional[EmailOutboxPoller] = None

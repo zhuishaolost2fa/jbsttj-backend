@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # 发件箱轮询（Supabase 网络不通时的兜底链路）：间隔秒数与每批条数
     auth_email_poll_interval_seconds: int = 3
     auth_email_poll_batch_size: int = 10
+    # 单条最多重试几次，超过后放弃（防止死信被无限捞起重发）
+    auth_email_max_attempts: int = 5
+    # 已邮件里那些能直接兑换登录态的凭证必须尽快从库里抹掉；保留 N 天后清理整行。
+    auth_email_retention_days: int = 7
     # none = 不启用（收到 hook 也只记录日志）；smtp = 通用 SMTP；tencentcloud = 腾讯云 SES API
     mail_provider: str = "none"
     mail_from: str = ""
