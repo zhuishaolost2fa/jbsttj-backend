@@ -320,6 +320,11 @@ async def supabase_send_email(request: Request) -> Response:
     if not send_to:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="missing recipient")
 
+    # 诊断用：只有看到真实 token 形态，才能确定该用「验证码模板」还是「链接模板」
+    logger.info(
+        "send-email hook action=%s to=%s token_len=%s token_is_otp=%s keys=%s",
+        action, send_to, len(token), bool(_OTP_TOKEN_RE.match(token)), sorted(email_data.keys()),
+    )
     verify_url = _verify_url(email_data, token_hash, action)
     subject, body_text = _render_email(action, token, verify_url, brand=settings.mail_brand_name)
 
