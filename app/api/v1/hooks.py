@@ -283,9 +283,11 @@ async def supabase_send_email(request: Request) -> Response:
     """
     settings = get_settings()
     secrets = _load_hook_secrets(settings)
-    if not secrets:
-        # 宁可 503 也不裸奔：没配 secret 的 hook 端点是个开放转发器
-        logger.error("收到 Send Email Hook，但 SEND_EMAIL_HOOK_SECRETS 未配置")
+    relay_token = settings.send_email_relay_token
+
+    if not secrets and not relay_token:
+        # 宁可 503 也不裸奔：没配任何凭据的 hook 端点是个开放转发器
+        logger.error("收到 Send Email Hook，但 SEND_EMAIL_HOOK_SECRETS / SEND_EMAIL_RELAY_TOKEN 均未配置")
         raise HTTPException(
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Send Email Hook 未配置",
@@ -293,9 +295,22 @@ async def supabase_send_email(request: Request) -> Response:
 
     body = await request.body()
     headers = {k.lower(): v for k, v in request.headers.items()}
-    ok, reason = verify_standard_webhook(body, headers, secrets)
-    if not ok:
-        logger.warning("Send Email Hook 验签失败（%s），来源 %s", reason, request.client.host if request.client else "-")
+
+    # 两种鉴权方式二选一：
+    #  1) Standard Webhooks 签名 —— 直连 HTTP Hook 时 GoTrue 会签名原始 body
+    #  2) 共享令牌 —— Postgres Hook（pg_net 转发）时，事件已被解析成 jsonb，
+    #     原始字节流不可复现，签不出来，只能靠令牌（见 send_email_hook SQL 函数）
+    if relay_token and hmac.compare_digest(headers.get("x-relay-token", ""), relay_token):
+        pass
+    elif secrets:
+        ok, reason = verify_standard_webhook(body, headers, secrets)
+        if not ok:
+            logger.warning(
+                "Send Email Hook 鉴权失败（%s），来源 %s",
+                reason, request.client.host if request.client else "-",
+            )
+            raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="invalid signature")
+    else:
         raise HTTPException(status_code=http_status.HTTP_401_UNAUTHORIZED, detail="invalid signature")
 
     payload: Dict[str, Any] = await request.json()

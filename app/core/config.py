@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # SMTP，而是把 {user, email_data} POST 到本服务的 hook 端点，由我们自己投递。
     # 这是绕开「内置 SMTP 2 封/小时」以及「腾讯云个人账号禁用 SMTP」的唯一途径。
     send_email_hook_secrets: str = ""
+    # Postgres Hook 走 pg_net 转发时无法复现 Standard Webhooks 签名（body 已被解析成
+    # jsonb，原始字节丢失），改用共享令牌：Supabase 侧函数带上 X-Relay-Token 头。
+    # 与 SEND_EMAIL_HOOK_SECRETS 二选一即可，两者都没配时端点返回 503。
+    send_email_relay_token: str = ""
     # none = 不启用（收到 hook 也只记录日志）；smtp = 通用 SMTP；tencentcloud = 腾讯云 SES API
     mail_provider: str = "none"
     mail_from: str = ""
