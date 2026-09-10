@@ -19,6 +19,7 @@ TABLE_OPTIONS = "script_options"
 TABLE_SCRIPTS = "scripts"
 TABLE_SCRIPT_REQUESTS = "script_requests"
 TABLE_DM_DOCUMENTS = "script_dm_documents"
+TABLE_USER_MESSAGES = "user_messages"
 
 
 def _now() -> str:
@@ -807,3 +808,107 @@ class ScriptRequestRepository:
             data={"status": "completed", "completed_at": completed_at},
         )
         return len(rows)
+
+
+class MessageRepository:
+    """站内消息（收件箱）的读写。
+
+    - **写入只走 RPC** ``push_user_message``：幂等判定在数据库里（dedup_key
+      部分唯一索引），API 侧与同步侧的调用都不会重复发同一件事；
+    - 读取一律带 ``user_id`` 过滤 —— 后端用 service_role 绕过 RLS，
+      这个过滤是「只能看自己的消息」的唯一防线。
+    """
+
+    def __init__(self, db: Optional[SupabaseClient] = None) -> None:
+        self.db = db or get_supabase()
+
+    # ---------------- 读 ----------------
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        msg_type: Optional[str] = None,
+        unread_only: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        filters = {"user_id": f"eq.{user_id}"}
+        if msg_type:
+            filters["type"] = f"eq.{msg_type}"
+        if unread_only:
+            filters["read_at"] = "is.null"
+        return await self.db.select_with_count(
+            TABLE_USER_MESSAGES,
+            filters=filters,
+            order="created_at.desc",
+            limit=limit,
+            offset=offset,
+        )
+
+    async def count_unread(self, user_id: str) -> int:
+        """未读条数：只数 ``read_at is null`` 的行，走部分索引。"""
+        _, total = await self.db.select_with_count(
+            TABLE_USER_MESSAGES,
+            filters={"user_id": f"eq.{user_id}", "read_at": "is.null"},
+            columns="id",
+            limit=1,
+        )
+        return total
+
+    async def get(
+        self, message_id: str, user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        filters = {"id": f"eq.{message_id}"}
+        if user_id:
+            filters["user_id"] = f"eq.{user_id}"
+        return await self.db.select_one(TABLE_USER_MESSAGES, filters=filters)
+
+    # ---------------- 写 ----------------
+    async def push(
+        self,
+        *,
+        user_id: str,
+        msg_type: str,
+        title: str,
+        content: str = "",
+        actor_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None,
+        dedup_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """幂等推送一条消息，返回新消息 id；命中去重（重复事件）返回 None。"""
+        if not user_id:
+            return None
+        payload = {
+            "p_user_id": str(user_id),
+            "p_type": msg_type,
+            "p_title": title,
+            "p_content": content or "",
+            "p_actor_id": str(actor_id) if actor_id else None,
+            "p_data": data or {},
+            "p_dedup_key": dedup_key,
+        }
+        result = await self.db.rpc("push_user_message", payload)
+        return str(result) if result else None
+
+    async def mark_read(
+        self, user_id: str, message_ids: Optional[Sequence[str]] = None
+    ) -> int:
+        """标记已读；``message_ids`` 为空表示全部已读。
+
+        只对 ``read_at is null`` 的行做更新，返回的 representation 条数
+        即真正从未读翻成已读的数量（幂等，重复点已读返回 0）。
+        """
+        filters = {"user_id": f"eq.{user_id}", "read_at": "is.null"}
+        ids = [str(i) for i in dict.fromkeys(message_ids or []) if i]
+        if ids:
+            filters["id"] = f"in.({','.join(ids)})"
+        rows = await self.db.update(
+            TABLE_USER_MESSAGES, filters=filters, data={"read_at": _now()}
+        )
+        return len(rows)
+
+    async def delete(self, user_id: str, message_id: str) -> None:
+        await self.db.delete(
+            TABLE_USER_MESSAGES,
+            filters={"id": f"eq.{message_id}", "user_id": f"eq.{user_id}"},
+        )

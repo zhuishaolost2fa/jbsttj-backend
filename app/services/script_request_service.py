@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from app.core.config import get_settings
 from app.core.exceptions import ConflictError, DatabaseError, NotFoundError, ValidationError
 from app.services.notifier import get_notifier
+from app.services.message_service import get_message_service
 from app.schemas.common import Pagination
 from app.schemas.script_request import (
     ScriptRequestCreate,
@@ -456,13 +457,17 @@ class ScriptRequestService:
                 return
 
             # 1) 直接按 script_id 批量完成
-            direct_ids = [
-                str(r["script_id"])
-                for r in pending
+            direct = [
+                r for r in pending
                 if r.get("script_id") and str(r["script_id"]) in indexed_ids
             ]
-            if direct_ids:
-                await self.repo.mark_completed_by_script_ids(direct_ids, _now())
+            if direct:
+                await self.repo.mark_completed_by_script_ids(
+                    [str(r["script_id"]) for r in direct], _now()
+                )
+                # 站内消息：告诉求解析的人「你要的剧本已解析」。
+                # worker（dm.finalize）也会投一次，dedup_key 保证只留一条。
+                await self._notify_completed(direct)
 
             # 2) 库外诉求：按标题匹配已解析剧本，命中则回填并完成
             unlinked = [r for r in pending if not r.get("script_id")]
@@ -506,6 +511,25 @@ class ScriptRequestService:
                 logger.info(
                     "库外诉求回填完成 request=%s -> script=%s", r["id"], script.get("id")
                 )
+                await self._notify_completed([updated])
+
+    async def _notify_completed(self, rows: List[Dict[str, Any]]) -> None:
+        """给已完成诉求的发起人投「剧本已解析」站内消息。
+
+        只在这里读一次行数据（list_pending 已经取了 user_id / 标题等），
+        不额外查库；投递失败由 message_service 内部吞掉并记日志。
+        """
+        if not rows:
+            return
+        service = get_message_service()
+        for r in rows:
+            await service.notify_script_parsed(
+                request_id=str(r.get("id") or ""),
+                user_id=str(r.get("user_id") or ""),
+                script_id=str(r.get("script_id") or ""),
+                script_code=r.get("script_code") or "",
+                script_title=r.get("script_title") or "",
+            )
 
     # ================= 出参组装 =================
     async def _to_items(self, rows: List[Dict[str, Any]]) -> List[ScriptRequestItem]:

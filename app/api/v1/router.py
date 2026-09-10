@@ -7,6 +7,7 @@ from app.api.v1 import (
     dm_guides,
     files,
     hooks,
+    messages,
     script_options,
     script_requests,
     scripts,
@@ -20,6 +21,8 @@ api_router.include_router(uploads.router)
 api_router.include_router(files.router)
 api_router.include_router(sts.router)
 api_router.include_router(script_options.router)
+# 站内消息（收件箱）：/messages，独立前缀，与剧本路由无冲突
+api_router.include_router(messages.router)
 # 求解析挂 /scripts/requests 前缀，必须先于 /scripts（含 /{id_or_code}）注册，
 # 避免 "requests" 被单段路由误匹配成剧本 ID
 api_router.include_router(script_requests.router)

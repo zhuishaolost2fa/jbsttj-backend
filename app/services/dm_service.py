@@ -65,6 +65,7 @@ from app.schemas.dm_guide import (
 )
 from app.services import dm_store as store_mod
 from app.services import redis_cache as cache
+from app.services.message_service import get_message_service
 from app.services.repository import UploadTaskRepository
 from app.services.script_service import slugify
 
@@ -1113,7 +1114,43 @@ class DMGuideService:
         await self._attach_profiles([record])
         # 引导问题取的就是「已解答」的提问，解答后必须让这两份缓存立即失效
         await self._invalidate_question_caches(record.script_code)
+
+        # 站内消息：告诉提问者「你的问题有答案了」。旁路能力，失败只记日志。
+        await self._notify_question_answered(record, answer=answer, answered_by=answered_by)
         return record
+
+    async def _notify_question_answered(
+        self, record: QuestionRecord, *, answer: str, answered_by: str
+    ) -> None:
+        """问题被解答 → 给提问者投一条站内消息。
+
+        **自己答自己的问题不通知**（自问自答没有收件价值）。
+        剧名只是让消息更好读，取不到就退化成不带剧名的文案。
+        """
+        asker = record.created_by
+        if not asker or asker == answered_by:
+            return
+
+        script_title = ""
+        if record.script_id:
+            try:
+                store = store_mod.get_dm_store()
+                script_title = (
+                    await run_in_threadpool(store.get_script_title, record.script_id) or ""
+                )
+            except Exception as exc:  # noqa: BLE001 - 剧名只是文案润色，拿不到就算了
+                logger.warning("读取剧本标题失败（消息退化为不带剧名）: %s", exc)
+
+        await get_message_service().notify_question_answered(
+            question_id=record.id,
+            asker_id=asker,
+            answered_by=answered_by,
+            question=record.question,
+            answer=answer,
+            script_id=record.script_id,
+            script_code=record.script_code,
+            script_title=script_title,
+        )
 
     async def guide_questions(
         self, *, script_code: str, script_title: str = "", limit: Optional[int] = None

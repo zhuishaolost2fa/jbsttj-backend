@@ -84,6 +84,7 @@ from app.services.dm_store import (
     to_pgvector,
 )
 from app.services.llm import QAPair, StoryItem, SynthesisOverview, get_llm_client
+from app.services.message_service import notify_script_parsed_sync
 from app.services.script_service import slugify
 from app.services.pdf_extract import (
     ShardResult,
@@ -1163,6 +1164,19 @@ def finalize(
     # 全部 QA 落库、旧版本下线完毕，该剧本可见的 QA 集合定格 —— 缓存就此失效重建
     _invalidate_content_caches(script_code)
 
+    # 站内消息：剧本解析完成 → 结算「求解析」诉求并逐个通知发起人。
+    # 同步 RPC（worker 里不开 event loop），失败只记日志 ——
+    # 通知是旁路能力，绝不能把已经解析成功的 job 拖成失败。
+    script_title = ""
+    if script_id:
+        try:
+            script_title = store.get_script_title(script_id) or ""
+            notify_script_parsed_sync(
+                script_id=script_id, script_code=script_code, script_title=script_title
+            )
+        except Exception as exc:  # noqa: BLE001 - 同上：通知失败不影响解析结果
+            logger.warning("投递「剧本已解析」消息失败 doc=%s: %s", document_id, exc)
+
     # force 重跑 / 换新版本手册时，旧 story 被 purge 删掉、用户划线落入 orphaned；
     # 新 story 就绪后在这里重锚定（quote 精确匹配 → prefix/suffix 上下文模糊匹配）。
     # 首次入库没有 orphaned 划线，RPC 快速空转，成本可忽略。
@@ -1187,6 +1201,7 @@ def finalize(
                 document_id=document_id,
                 script_id=script_id,
                 script_code=script_code,
+                script_title=script_title,
             )
         except Exception as exc:  # noqa: BLE001 - 合成失败绝不能把已完成的 job 拖成失败
             logger.warning("合成文章生成失败（不影响解析结果）doc=%s: %s", document_id, exc)
