@@ -217,10 +217,14 @@ def _describe_rate_limit(message: str, error_code: str) -> Tuple[str, str, str]:
     """
     low = f"{message} {error_code}".lower()
     if any(h in low for h in _EMAIL_QUOTA_HINTS):
+        # ⚠️ GoTrue 把「同一邮箱 60 秒只能发一封」也报成 over_email_send_rate_limit
+        # + "email rate limit exceeded"，和真正的小时配额（内置 SMTP 2 封/小时）
+        # 共用一套文案，从报文上无法区分。实测等 60 秒后重发即成功，所以按
+        # **冷却**处理 —— 若说成「额度已用尽」，用户会白等一小时。
         return (
-            "邮件发送额度已用尽，请稍后再试",
+            "发送过于频繁，请稍后再试",
             "auth_email_rate_limited",
-            "smtp_quota_exhausted",
+            "cooldown_60s",
         )
     if any(h in low for h in _COOLDOWN_HINTS) or "over_request_rate_limit" in low:
         return (
